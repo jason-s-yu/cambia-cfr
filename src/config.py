@@ -12,12 +12,13 @@ class ApiConfig:
 class CfrTrainingConfig:
     num_iterations: int = 10000
     save_interval: int = 1000
-    pruning_enabled: bool = True # Recommend enabling RBP
+    pruning_enabled: bool = True # Enable Regret-Based Pruning
+    pruning_threshold: float = 1e-6 # Regrets below this are considered zero for pruning
 
 @dataclass
 class CfrPlusParamsConfig:
     weighted_averaging_enabled: bool = True
-    averaging_delay: int = 0 # Start averaging from iteration 0 (weight = t)
+    averaging_delay: int = 0 # Start averaging from iteration 0 (weight = max(0, t - d))
 
 @dataclass
 class AgentParamsConfig:
@@ -44,7 +45,9 @@ class PersistenceConfig:
 @dataclass
 class LoggingConfig:
     log_level: str = "INFO"
-    log_file: Optional[str] = "cfr_training.log"
+    log_dir: str = "logs" # Directory to store log files
+    log_file_prefix: str = "cambia" # Prefix for timestamped log files
+    # log_file is now dynamically generated
 
 @dataclass
 class Config:
@@ -62,9 +65,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
         with open(config_path, 'r') as f:
             config_dict = yaml.safe_load(f)
             if config_dict is None: config_dict = {} # Handle empty config file
-            # Note: This simple loading assumes YAML structure matches the dataclasses.
-            # For more robustness, consider using a library like OmegaConf or Pydantic
-            # that handles validation and default merging better.
 
             # Basic manual reconstruction for nested dataclasses
             return Config(
@@ -72,7 +72,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
                 cfr_training=CfrTrainingConfig(**config_dict.get('cfr_training', {})),
                 cfr_plus_params=CfrPlusParamsConfig(**config_dict.get('cfr_plus_params', {})),
                 agent_params=AgentParamsConfig(**config_dict.get('agent_params', {})),
-                # Ensure CambiaRulesConfig uses get with default values
                 cambia_rules=CambiaRulesConfig(
                      allowDrawFromDiscardPile=config_dict.get('cambia_rules', {}).get('allowDrawFromDiscardPile', False),
                      allowReplaceAbilities=config_dict.get('cambia_rules', {}).get('allowReplaceAbilities', False),

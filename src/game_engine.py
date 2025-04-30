@@ -25,6 +25,21 @@ class PlayerState:
      hand: List[Card] = field(default_factory=list)
      initial_peek_indices: Tuple[int, ...] = (0, 1) # Default peek indices
 
+     # Custom deepcopy might be needed if Card references become complex
+     def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            # Deepcopy the hand list and its Card contents
+            if k == 'hand':
+                 setattr(result, k, [copy.deepcopy(card, memo) for card in v])
+            # Copy other attributes (like tuples) normally or deepcopy if needed
+            else:
+                 setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
+
 @dataclass
 class CambiaGameState:
     """Represents the true, objective state of a 1v1 Cambia game."""
@@ -125,6 +140,10 @@ class CambiaGameState:
         # --- Snap Phase Actions ---
         if self.snap_phase_active:
             snapper_hand = self.players[acting_player].hand
+            # Ensure snap_discarded_card is not None before accessing rank
+            if self.snap_discarded_card is None:
+                 logger.error("Snap phase active but snap_discarded_card is None.")
+                 return legal_actions # Cannot determine snap actions
             target_rank = self.snap_discarded_card.rank
 
             # Always allow passing the snap opportunity
@@ -246,17 +265,24 @@ class CambiaGameState:
         # --- Snap Phase Action Handling ---
         if new_state.snap_phase_active:
             # Verify action came from the correct snapper
-            if acting_player != self.snap_potential_snappers[self.snap_current_snapper_idx]:
+            if acting_player != new_state.snap_potential_snappers[new_state.snap_current_snapper_idx]:
                 logger.error(f"Action {action} received, but expected snap action from P{self.snap_potential_snappers[self.snap_current_snapper_idx]}. Ignoring.")
                 return new_state # Return unchanged state if wrong player acts
 
             logger.debug(f"Snap Phase (Turn {new_state._turn_number}): Player {acting_player} choosing action: {action}")
+            if new_state.snap_discarded_card is None:
+                logger.error("Apply action in snap phase, but snap_discarded_card is None. Cannot proceed.")
+                new_state._end_snap_phase() # Attempt to recover
+                return new_state
             target_rank = new_state.snap_discarded_card.rank
+
             snap_success = False
             snap_penalty = False
             removed_index = None
             snapped_card_object = None # Store the actual card
+            attempted_card = None # Store attempted card for penalty log
             action_type_str = type(action).__name__
+
 
             if isinstance(action, ActionPassSnap):
                  logger.debug(f"Player {acting_player} passes snap.")
@@ -372,9 +398,14 @@ class CambiaGameState:
                       logger.debug(f"Player {player} discards drawn {drawn_card}. Use ability: {action.use_ability}")
                       new_state.discard_pile.append(drawn_card)
                       discard_for_snap_check = drawn_card
-                      new_state._clear_pending_action() # Clear before ability trigger
+                      # Clear pending *before* triggering ability to avoid loop if ability also needs choice
+                      new_state._clear_pending_action()
                       if action.use_ability and new_state._card_has_discard_ability(drawn_card):
                            new_state._trigger_discard_ability(player, drawn_card)
+                           # If ability requires further choice, return state here
+                           if new_state.pending_action: return new_state
+                      # else: (No ability or ability doesn't require choice) Proceed to snap check/turn end
+
                  elif isinstance(action, ActionReplace):
                       target_idx = action.target_hand_index
                       hand = new_state.players[player].hand
@@ -385,60 +416,88 @@ class CambiaGameState:
                            new_state.discard_pile.append(replaced_card)
                            discard_for_snap_check = replaced_card
                            new_state._clear_pending_action()
-                      else: logger.error(f"Invalid REPLACE action index: {target_idx}"); new_state._clear_pending_action()
+                      else:
+                           logger.error(f"Invalid REPLACE action index: {target_idx}")
+                           new_state._clear_pending_action() # Clear pending even on error
 
-            # Resolve Ability Selections (simplified logging, clear pending state)
+            # Resolve Ability Selections
             elif isinstance(pending_type, ActionAbilityPeekOwnSelect) and isinstance(action, ActionAbilityPeekOwnSelect):
                   target_idx = action.target_hand_index; hand = new_state.players[player].hand
                   if 0 <= target_idx < len(hand): logger.info(f"P{player} uses 7/8, peeks own {target_idx}: {hand[target_idx]}")
                   else: logger.error(f"Invalid PEEK_OWN index {target_idx}");
-                  discard_for_snap_check = new_state.discard_pile[-1]; new_state._clear_pending_action()
+                  discard_for_snap_check = new_state.discard_pile[-1] if new_state.discard_pile else None
+                  new_state._clear_pending_action()
             elif isinstance(pending_type, ActionAbilityPeekOtherSelect) and isinstance(action, ActionAbilityPeekOtherSelect):
                   opp_idx = new_state.get_opponent_index(player); target_opp_idx = action.target_opponent_hand_index; opp_hand = new_state.players[opp_idx].hand
                   if 0 <= target_opp_idx < len(opp_hand): logger.info(f"P{player} uses 9/T, peeks opp {target_opp_idx}: {opp_hand[target_opp_idx]}")
                   else: logger.error(f"Invalid PEEK_OTHER index {target_opp_idx}")
-                  discard_for_snap_check = new_state.discard_pile[-1]; new_state._clear_pending_action()
+                  discard_for_snap_check = new_state.discard_pile[-1] if new_state.discard_pile else None
+                  new_state._clear_pending_action()
             elif isinstance(pending_type, ActionAbilityBlindSwapSelect) and isinstance(action, ActionAbilityBlindSwapSelect):
                   own_h_idx, opp_h_idx = action.own_hand_index, action.opponent_hand_index; opp_idx = new_state.get_opponent_index(player); hand, opp_hand = new_state.players[player].hand, new_state.players[opp_idx].hand
                   if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand): hand[own_h_idx], opp_hand[opp_h_idx] = opp_hand[opp_h_idx], hand[own_h_idx]; logger.info(f"P{player} uses J/Q, blind swaps own {own_h_idx} with opp {opp_h_idx}.")
                   else: logger.error(f"Invalid BLIND_SWAP indices: own {own_h_idx}, opp {opp_h_idx}")
-                  discard_for_snap_check = new_state.discard_pile[-1]; new_state._clear_pending_action()
+                  discard_for_snap_check = new_state.discard_pile[-1] if new_state.discard_pile else None
+                  new_state._clear_pending_action()
             elif isinstance(pending_type, ActionAbilityKingLookSelect) and isinstance(action, ActionAbilityKingLookSelect):
                   own_h_idx, opp_h_idx = action.own_hand_index, action.opponent_hand_index; opp_idx = new_state.get_opponent_index(player); hand, opp_hand = new_state.players[player].hand, new_state.players[opp_idx].hand
                   if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand):
                       card1, card2 = hand[own_h_idx], opp_hand[opp_h_idx]; logger.info(f"P{player} uses K, looks at own {own_h_idx} ({card1}) and opp {opp_h_idx} ({card2}).")
+                      # Set up next pending step: KingSwapDecision
                       new_state.pending_action = ActionAbilityKingSwapDecision(perform_swap=False); new_state.pending_action_player = player
-                      new_state.pending_action_data = {"own_idx": own_h_idx, "opp_idx": opp_h_idx, "card1": card1, "card2": card2} # Store context
-                  else: logger.error(f"Invalid KING_LOOK indices: own {own_h_idx}, opp {opp_h_idx}. Ability fizzles."); discard_for_snap_check = new_state.discard_pile[-1]; new_state._clear_pending_action()
+                      new_state.pending_action_data = {"own_idx": own_h_idx, "opp_idx": opp_h_idx, "card1": card1, "card2": card2} # Store context for swap
+                      return new_state # Return intermediate state waiting for swap decision
+                  else:
+                      logger.error(f"Invalid KING_LOOK indices: own {own_h_idx}, opp {opp_h_idx}. Ability fizzles.");
+                      discard_for_snap_check = new_state.discard_pile[-1] if new_state.discard_pile else None
+                      new_state._clear_pending_action()
             elif isinstance(pending_type, ActionAbilityKingSwapDecision) and isinstance(action, ActionAbilityKingSwapDecision):
                   perform_swap = action.perform_swap; look_data = new_state.pending_action_data
-                  if perform_swap:
-                      own_h_idx, opp_h_idx = look_data["own_idx"], look_data["opp_idx"]; opp_idx = new_state.get_opponent_index(player); hand, opp_hand = new_state.players[player].hand, new_state.players[opp_idx].hand
-                      if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand): card1, card2 = look_data["card1"], look_data["card2"]; hand[own_h_idx], opp_hand[opp_h_idx] = card2, card1; logger.info(f"P{player} King ability: Swapped own {own_h_idx} ({card1}) with opp {opp_h_idx} ({card2}).")
-                      else: logger.error("Indices invalid at King Swap decision.")
+                  own_h_idx, opp_h_idx = look_data.get("own_idx"), look_data.get("opp_idx")
+                  card1, card2 = look_data.get("card1"), look_data.get("card2")
+                  if own_h_idx is None or opp_h_idx is None or card1 is None or card2 is None:
+                      logger.error("Missing data for King Swap decision. Fizzling.")
+                  elif perform_swap:
+                      opp_idx = new_state.get_opponent_index(player); hand, opp_hand = new_state.players[player].hand, new_state.players[opp_idx].hand
+                      if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand):
+                           hand[own_h_idx], opp_hand[opp_h_idx] = card2, card1 # Perform the swap
+                           logger.info(f"P{player} King ability: Swapped own {own_h_idx} ({card1}) with opp {opp_h_idx} ({card2}).")
+                      else: logger.error(f"Indices invalid at King Swap decision ({own_h_idx}, {opp_h_idx}).")
                   else: logger.info(f"P{player} King ability: Chose not to swap.")
-                  discard_for_snap_check = new_state.discard_pile[-1]; new_state._clear_pending_action()
+                  discard_for_snap_check = new_state.discard_pile[-1] if new_state.discard_pile else None
+                  new_state._clear_pending_action()
             elif isinstance(pending_type, ActionSnapOpponentMove) and isinstance(action, ActionSnapOpponentMove):
                  snapper_idx = player; own_card_idx, target_slot_idx = action.own_card_to_move_hand_index, action.target_empty_slot_index
                  hand = new_state.players[snapper_idx].hand; opp_idx = new_state.get_opponent_index(snapper_idx); opp_hand = new_state.players[opp_idx].hand
                  if 0 <= own_card_idx < len(hand):
                       moved_card = hand.pop(own_card_idx)
-                      if 0 <= target_slot_idx <= len(opp_hand):
+                      if 0 <= target_slot_idx <= len(opp_hand): # Allow inserting at the end
                           opp_hand.insert(target_slot_idx, moved_card)
                           logger.info(f"P{snapper_idx} completes Snap Opponent: Moves {moved_card} (from own idx {own_card_idx}) to opp idx {target_slot_idx}.")
                           # Note: Snap log was already written during the snap attempt.
                           new_state._clear_pending_action()
                           new_state._advance_turn() # Turn advances after move completes
-                      else: logger.error(f"Invalid target slot index {target_slot_idx} for SnapOpponentMove."); new_state._clear_pending_action(); new_state._advance_turn()
-                 else: logger.error(f"Invalid own card index {own_card_idx} for SnapOpponentMove."); new_state._clear_pending_action(); new_state._advance_turn()
-            else: logger.warning(f"Unhandled pending action ({pending_type}) vs received action ({action})"); new_state._clear_pending_action(); new_state._advance_turn()
+                          return new_state # Return after advancing turn
+                      else:
+                           logger.error(f"Invalid target slot index {target_slot_idx} (Opp hand size {len(opp_hand)}) for SnapOpponentMove.");
+                           hand.insert(own_card_idx, moved_card) # Put card back on error? Risky.
+                           new_state._clear_pending_action(); new_state._advance_turn()
+                           return new_state # Return after advancing turn
+                 else:
+                      logger.error(f"Invalid own card index {own_card_idx} (Hand size {len(hand)}) for SnapOpponentMove.");
+                      new_state._clear_pending_action(); new_state._advance_turn()
+                      return new_state # Return after advancing turn
+            else:
+                logger.warning(f"Unhandled pending action ({pending_type}) vs received action ({action})")
+                new_state._clear_pending_action() # Clear pending to avoid getting stuck
 
             # After resolving pending action (except ongoing King/Snap Move), check for snaps or advance turn
             if not new_state.pending_action: # If ability/choice fully resolved
                 if discard_for_snap_check and new_state._initiate_snap_phase(discarded_card=discard_for_snap_check):
-                    pass # Snap phase started, next action will be snap action
-                elif not new_state.snap_phase_active: # Ensure snap phase didn't start
-                    new_state._advance_turn()
+                    # Snap phase started, next action will be snap action
+                    return new_state # Return state waiting for snap action
+                elif not new_state.snap_phase_active: # Ensure snap phase didn't start AND not pending
+                    new_state._advance_turn() # Advance if no snaps and no further pending steps
 
 
         # --- Handle Standard Start-of-Turn Actions ---
@@ -467,7 +526,7 @@ class CambiaGameState:
         else:
              logger.warning(f"Unhandled action type at start of turn: {type(action)}")
 
-        # Final checks
+        # Final checks (only if turn didn't already advance and return)
         new_state._check_game_end()
         return new_state
 
@@ -507,12 +566,16 @@ class CambiaGameState:
         for p_idx in range(self.num_players):
             if p_idx == self.cambia_caller_id: continue # Cambia caller cannot snap
 
-            can_snap_own = any(card.rank == target_rank for card in self.players[p_idx].hand)
+            hand = self.players[p_idx].hand
+            can_snap_own = any(card.rank == target_rank for card in hand)
+
             can_snap_opponent = False
             if self.house_rules.allowOpponentSnapping:
                  opp_idx = self.get_opponent_index(p_idx)
-                 if self.cambia_caller_id != opp_idx: # Cannot snap Cambia caller's cards either? Assume yes.
-                      can_snap_opponent = any(card.rank == target_rank for card in self.players[opp_idx].hand)
+                 # Check opponent exists and is not the cambia caller
+                 if opp_idx != self.cambia_caller_id:
+                      opp_hand = self.players[opp_idx].hand
+                      can_snap_opponent = any(card.rank == target_rank for card in opp_hand)
 
             if can_snap_own or can_snap_opponent:
                  potential_indices.append(p_idx)
@@ -539,16 +602,19 @@ class CambiaGameState:
              logger.debug(f"Potential snappers (ordered): {ordered_snappers}. P{self.get_acting_player()} acts first.")
              return True
         else:
+             logger.debug(f"No potential snappers found for rank {target_rank}.")
              return False # No snaps possible
 
     def _end_snap_phase(self):
          """Cleans up snap phase state and advances the main game turn."""
          logger.debug("Ending snap phase.")
          self.snap_phase_active = False
-         # Keep snap_discarded_card and snap_results_log for observation creation
-         # self.snap_discarded_card = None
-         # self.snap_potential_snappers = []
+         # Keep snap_discarded_card and snap_results_log for observation creation?
+         # Clear them if they are not needed after snap phase. Let's clear for now.
+         self.snap_discarded_card = None
+         self.snap_potential_snappers = []
          self.snap_current_snapper_idx = 0
+         # Do NOT clear snap_results_log here, needed for observation in CFR
          self._advance_turn() # Advance turn AFTER snap phase concludes
 
     def _attempt_reshuffle(self):
@@ -601,12 +667,18 @@ class CambiaGameState:
             self._game_over = True
 
         # 2. Draw required but impossible
-        # This is checked within apply_action for DRAW_STOCKPILE when stockpile/discard empty.
+        # Check if it's start of turn, no pending action, no snap phase, and DRAW action is required but impossible
+        if not self._game_over and not self.pending_action and not self.snap_phase_active:
+            player = self.current_player_index
+            is_draw_required = not any(isinstance(act, ActionCallCambia) for act in self.get_legal_actions()) # Draw required if Cambia not legal/chosen
+            if is_draw_required and not self.stockpile and not (self.discard_pile and len(self.discard_pile) > 1):
+                logger.info(f"Game ends: Player {player} requires draw, but stockpile and discard cannot be replenished.")
+                self._game_over = True
 
-        # 3. Explicit check if start of turn and no actions possible
+        # 3. Explicit check if start of turn and no actions possible (covers non-draw end conditions)
         if not self._game_over and not self.pending_action and not self.snap_phase_active:
              if not self.get_legal_actions():
-                   logger.info("Game ends: No legal actions available at start of turn (likely deck empty).")
+                   logger.info("Game ends: No legal actions available at start of turn.")
                    self._game_over = True
 
         if self._game_over:
@@ -653,33 +725,61 @@ class CambiaGameState:
              if self.snap_current_snapper_idx < len(self.snap_potential_snappers):
                   return self.snap_potential_snappers[self.snap_current_snapper_idx]
              else: logger.error("Snap phase active but index out of bounds."); return -1
-         elif self.pending_action: return self.pending_action_player
+         elif self.pending_action and self.pending_action_player is not None:
+             return self.pending_action_player
          elif not self._game_over: return self.current_player_index
          else: return -1 # Game over
 
+
     def clone(self) -> 'CambiaGameState':
-        """Creates a deep copy of the game state."""
-        cloned_players = [copy.deepcopy(p) for p in self.players]
-        cloned_state = CambiaGameState(
-            players=cloned_players, stockpile=list(self.stockpile), discard_pile=list(self.discard_pile),
-            current_player_index=self.current_player_index, num_players=self.num_players,
-            cambia_caller_id=self.cambia_caller_id, turns_after_cambia=self.turns_after_cambia,
-            house_rules=copy.deepcopy(self.house_rules), _game_over=self._game_over,
-            _winner=self._winner, _utilities=list(self._utilities), _turn_number=self._turn_number,
-            pending_action=self.pending_action, pending_action_player=self.pending_action_player,
-            pending_action_data=copy.deepcopy(self.pending_action_data),
-            snap_phase_active=self.snap_phase_active, snap_discarded_card=self.snap_discarded_card,
-            snap_potential_snappers=list(self.snap_potential_snappers),
-            snap_current_snapper_idx=self.snap_current_snapper_idx,
-            snap_results_log=copy.deepcopy(self.snap_results_log) # Deep copy results log
-        )
-        return cloned_state
+        """Creates a deep copy of the game state, handling potential recursion issues."""
+        memo = {} # Memoization dictionary for deepcopy
+
+        # Attempt deepcopy first, fall back to manual if RecursionError occurs
+        try:
+            cloned_state = copy.deepcopy(self, memo)
+            return cloned_state
+        except RecursionError:
+            logger.warning("RecursionError during deepcopy, attempting manual clone.", exc_info=False) # Log only once per attempt
+            # --- Manual Cloning ---
+            new_state = CambiaGameState.__new__(CambiaGameState)
+            memo[id(self)] = new_state # Add self to memo
+
+            # Copy attributes, deep copying mutable objects carefully
+            new_state.players = [copy.deepcopy(p, memo) for p in self.players]
+            new_state.stockpile = [copy.deepcopy(c, memo) for c in self.stockpile]
+            new_state.discard_pile = [copy.deepcopy(c, memo) for c in self.discard_pile]
+            new_state.current_player_index = self.current_player_index
+            new_state.num_players = self.num_players
+            new_state.cambia_caller_id = self.cambia_caller_id
+            new_state.turns_after_cambia = self.turns_after_cambia
+            new_state.house_rules = copy.deepcopy(self.house_rules, memo)
+            new_state._game_over = self._game_over
+            new_state._winner = self._winner
+            new_state._utilities = list(self._utilities) # List of floats is fine with shallow copy
+            new_state._turn_number = self._turn_number
+            # Deepcopy pending action structures (NamedTuples are immutable, data dict needs deepcopy)
+            new_state.pending_action = self.pending_action # NamedTuples immutable
+            new_state.pending_action_player = self.pending_action_player
+            new_state.pending_action_data = copy.deepcopy(self.pending_action_data, memo)
+            # Deepcopy snap state
+            new_state.snap_phase_active = self.snap_phase_active
+            new_state.snap_discarded_card = copy.deepcopy(self.snap_discarded_card, memo)
+            new_state.snap_potential_snappers = list(self.snap_potential_snappers)
+            new_state.snap_current_snapper_idx = self.snap_current_snapper_idx
+            new_state.snap_results_log = copy.deepcopy(self.snap_results_log, memo)
+
+            return new_state
+        except Exception as e:
+            logger.exception(f"Unexpected error during game state cloning: {e}")
+            raise # Re-raise other exceptions
+
 
     def __str__(self) -> str:
         state_desc = ""
         actor = self.get_acting_player()
         actor_str = f"P{actor}" if actor != -1 else "N/A"
-        if self.snap_phase_active: state_desc = f"SnapPhase(Actor: {actor_str}, Target: {self.snap_discarded_card.rank})"
+        if self.snap_phase_active: state_desc = f"SnapPhase(Actor: {actor_str}, Target: {self.snap_discarded_card.rank if self.snap_discarded_card else 'N/A'})"
         elif self.pending_action: state_desc = f"Pending(Actor: {actor_str}, Action: {type(self.pending_action).__name__})"
         elif self._game_over: state_desc = "GameOver"
         else: state_desc = f"Turn: {actor_str}"

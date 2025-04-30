@@ -1,37 +1,87 @@
+# src/main_train.py
 import logging
+import logging.handlers
 import argparse
 import os
+import datetime
+import sys # For checking platform
+import shutil # For copying latest.log on Windows
 
 from .config import load_config
 from .cfr_trainer import CFRTrainer
 
-def setup_logging(config):
-    """Configures logging based on the loaded configuration."""
-    level = getattr(logging, config.logging.log_level.upper(), logging.INFO)
+# Global logger instance (initialized after setup)
+logger = logging.getLogger(__name__)
+
+def setup_logging(config, verbose: bool):
+    """Configures logging to console, timestamped file, and latest.log link."""
+    log_level_str = config.logging.log_level.upper()
+    file_log_level = getattr(logging, log_level_str, logging.INFO)
+    # Set console level based on verbose flag
+    console_log_level = file_log_level if verbose else logging.ERROR
+
+    log_dir = config.logging.log_dir
+    log_prefix = config.logging.log_file_prefix
+    os.makedirs(log_dir, exist_ok=True) # Ensure log directory exists
+
+    # --- Create Timestamped File Name ---
+    timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
+    log_filename = os.path.join(log_dir, f"{log_prefix}_{timestamp}.log")
+
+    # --- Formatter ---
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    handlers = []
-    # Console Handler
+    # --- Root Logger Configuration ---
+    root_logger = logging.getLogger()
+    # Set root logger level to the lowest level used by handlers (e.g., DEBUG if file is DEBUG)
+    root_logger.setLevel(min(file_log_level, console_log_level))
+
+    # Remove existing handlers to avoid duplicates if script is re-run
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # --- Console Handler ---
     ch = logging.StreamHandler()
-    ch.setLevel(level)
+    ch.setLevel(console_log_level)
     ch.setFormatter(formatter)
-    handlers.append(ch)
+    root_logger.addHandler(ch)
 
-    # File Handler (Optional)
-    if config.logging.log_file:
-        try:
-            log_dir = os.path.dirname(config.logging.log_file)
-            if log_dir:
-                os.makedirs(log_dir, exist_ok=True)
-            fh = logging.FileHandler(config.logging.log_file, mode='a') # Append mode
-            fh.setLevel(level)
-            fh.setFormatter(formatter)
-            handlers.append(fh)
-        except Exception as e:
-            print(f"Warning: Could not set up file logging at {config.logging.log_file}: {e}")
+    # --- Timestamped File Handler ---
+    try:
+        fh = logging.FileHandler(log_filename, mode='a') # Append mode
+        fh.setLevel(file_log_level)
+        fh.setFormatter(formatter)
+        root_logger.addHandler(fh)
+        # Use the logger configured *after* adding handlers
+        logger.info(f"Command: {' '.join(sys.argv)}")
+        logger.info(f"Logging to timestamped file: {log_filename} (Level: {logging.getLevelName(file_log_level)})")
+        logger.info(f"Console logging level: {logging.getLevelName(console_log_level)}")
+    except Exception as e:
+        # Use print as logger might not be fully functional yet
+        print(f"ERROR: Could not set up timestamped file logging at {log_filename}: {e}")
 
-    logging.basicConfig(level=level, handlers=handlers)
-    logging.getLogger("asyncio").setLevel(logging.WARNING) # Reduce verbosity from libraries
+
+    # --- Create/Update latest.log ---
+    latest_log_path = os.path.join(log_dir, "latest.log")
+    try:
+        # Use absolute path for symlink target for robustness
+        absolute_log_filename = os.path.abspath(log_filename)
+        if sys.platform == 'win32':
+            # Windows: Use copy (symlinks require admin privileges)
+            shutil.copy2(absolute_log_filename, latest_log_path)
+            logger.info(f"Copied latest log to: {latest_log_path}")
+        else:
+            # Unix-like: Use symlink
+            if os.path.exists(latest_log_path) or os.path.islink(latest_log_path):
+                os.remove(latest_log_path)
+            os.symlink(absolute_log_filename, latest_log_path) # Absolute symlink
+            logger.info(f"Updated latest.log symlink -> {absolute_log_filename}")
+    except Exception as e:
+        logger.error(f"Could not create/update latest.log link/copy: {e}")
+
+
+    # --- Reduce Verbosity from Libraries ---
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 def main():
@@ -59,16 +109,22 @@ def main():
          default=None,
          help="Override save path for agent data (from config)"
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose console logging (uses level from config)",
+    )
 
 
     args = parser.parse_args()
 
-    # Load configuration
+    # Load configuration *before* setting up logging
     config = load_config(args.config)
 
-    # Setup logging
-    setup_logging(config)
-    logger = logging.getLogger(__name__)
+    # Setup logging using loaded config and verbose flag
+    setup_logging(config, args.verbose)
+    # Logger is now configured globally
+
     logger.info("--- Starting Cambia CFR+ Training ---")
     logger.info(f"Configuration loaded from: {args.config}")
 
@@ -101,7 +157,8 @@ def main():
         trainer.save_data()
         logger.info("Progress saved.")
     except Exception as e:
-        logger.exception("An unexpected error occurred during training:") # Logs traceback
+        # Use logger.exception to include traceback
+        logger.exception("An unexpected error occurred during training:")
         logger.info("Attempting to save current progress before exiting...")
         try:
             trainer.save_data()
