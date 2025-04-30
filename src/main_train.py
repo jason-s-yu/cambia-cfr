@@ -1,10 +1,11 @@
 # src/main_train.py
 import logging
+import logging.handlers # Import handlers
 import argparse
 import os
 import datetime
-import sys # For checking platform, exit
-import shutil # For copying latest.log on Windows
+import sys
+from tqdm import tqdm # Import tqdm
 
 from .config import load_config
 from .cfr_trainer import CFRTrainer
@@ -12,97 +13,130 @@ from .cfr_trainer import CFRTrainer
 # Global logger instance (initialized after setup)
 logger = logging.getLogger(__name__)
 
+# Progress bar handler
+class TqdmLoggingHandler(logging.Handler):
+    """Passes log records to tqdm.write(), ensuring they don't interfere with the progress bar."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stderr) # Write to stderr to avoid interfering with stdout if needed
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 def setup_logging(config, verbose: bool):
-    """Configures logging to console, timestamped file, and latest.log link."""
+    """Configures logging to console, timestamped+chunked file, and latest log dir link."""
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
     file_log_level = getattr(logging, log_level_file_str, logging.DEBUG)
     default_console_log_level = getattr(logging, log_level_console_str, logging.WARNING)
 
-    # Set console level: Use specified console level if verbose, otherwise use default console level
-    console_log_level = file_log_level if verbose else default_console_log_level # Use file level if verbose, else default console.
+    # Set console level: Use file level if verbose, otherwise use default console level.
+    console_log_level = file_log_level if verbose else default_console_log_level
 
-    log_dir = config.logging.log_dir
+    main_log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
-    # Check if log_dir is valid before creating
-    if not log_dir or not isinstance(log_dir, str):
-        print(f"ERROR: Invalid log directory '{log_dir}' in config. Logging disabled.")
-        return False # Indicate failure
+
+    if not main_log_dir or not isinstance(main_log_dir, str):
+        print(f"ERROR: Invalid log directory '{main_log_dir}' in config. Logging disabled.")
+        return None, None # Indicate failure
 
     try:
-        os.makedirs(log_dir, exist_ok=True) # Ensure log directory exists
+        os.makedirs(main_log_dir, exist_ok=True)
     except OSError as e:
-        print(f"ERROR: Could not create log directory '{log_dir}': {e}. Logging disabled.")
-        return False # Indicate failure
+        print(f"ERROR: Could not create main log directory '{main_log_dir}': {e}. Logging disabled.")
+        return None, None # Indicate failure
 
-
-    # --- Create Timestamped File Name ---
+    # Create timestamped dir for this run
     timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
-    log_filename = os.path.join(log_dir, f"{log_prefix}_{timestamp}.log")
+    run_log_dir = os.path.join(main_log_dir, f"run_{timestamp}")
+    try:
+        os.makedirs(run_log_dir, exist_ok=True)
+    except OSError as e:
+        print(f"ERROR: Could not create run-specific log directory '{run_log_dir}': {e}. Logging disabled.")
+        return None, None
 
-    # --- Formatter ---
+    # Base log file path inside run dir
+    log_filename_base = os.path.join(run_log_dir, f"{log_prefix}.log")
+
+    # Formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # --- Root Logger Configuration ---
+    # Root Logger Config
     root_logger = logging.getLogger()
-    # Set root logger level to the lowest level used by handlers
-    root_logger.setLevel(min(file_log_level, console_log_level))
+    root_logger.setLevel(min(file_log_level, console_log_level)) # Set root level to lowest required
 
+    # Remove existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    # --- Console Handler ---
-    ch = logging.StreamHandler()
+    # Display progress bar at base
+    # Use Tqdm handler IF we have a TTY, otherwise standard StreamHandler
+    if sys.stderr.isatty():
+        ch = TqdmLoggingHandler()
+    else:
+        ch = logging.StreamHandler(sys.stderr) # Log to stderr
     ch.setLevel(console_log_level)
     ch.setFormatter(formatter)
     root_logger.addHandler(ch)
 
-    # --- Timestamped File Handler ---
+    # File chunking / rotating log file handler
     try:
-        fh = logging.FileHandler(log_filename, mode='a') # Append mode
+        # Rotate logs within the timestamped directory
+        max_bytes = config.logging.log_max_bytes # ~10MB
+        backup_count = config.logging.log_backup_count # Number of backup files
+        fh = logging.handlers.RotatingFileHandler(
+            log_filename_base,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
         root_logger.addHandler(fh)
-        # Use the logger configured *after* adding handlers
+
+        # Log initial messages *after* handlers are set up
+        logger.info("-" * 50)
+        logger.info(f"Logging initialized for run: {timestamp}")
+        logger.info(f"Log Directory: {run_log_dir}")
+        logger.info(f"Base Log File: {log_filename_base}")
+        logger.info(f"Log Chunk Size: {max_bytes / (1024*1024):.1f} MB")
+        logger.info(f"Max Log Chunks: {backup_count}")
+        logger.info(f"File Log Level: {logging.getLevelName(file_log_level)}")
+        logger.info(f"Console Log Level: {logging.getLevelName(console_log_level)}")
         logger.info(f"Command: {' '.join(sys.argv)}")
-        logger.info(f"Logging to timestamped file: {log_filename} (Level: {logging.getLevelName(file_log_level)})")
-        logger.info(f"Console logging level: {logging.getLevelName(console_log_level)}")
+        logger.info("-" * 50)
+
     except Exception as e:
-        # Use print as logger might not be fully functional yet
-        print(f"ERROR: Could not set up timestamped file logging at {log_filename}: {e}")
-        return False # Indicate failure
+        print(f"ERROR: Could not set up rotating file logging at {log_filename_base}: {e}")
+        # Remove console handler if file handler failed? Maybe not, console might still be useful.
+        return None, None # Indicate failure
 
-
-    # --- Create/Update latest.log ---
-    latest_log_path = os.path.join(log_dir, "latest.log")
+    # Create/Update latest log directory link/copy
+    latest_log_link_path = os.path.join(main_log_dir, "latest_run")
     try:
-        # Use absolute path for symlink target for robustness
-        absolute_log_filename = os.path.abspath(log_filename)
+        absolute_run_log_dir = os.path.abspath(run_log_dir)
         if sys.platform == 'win32':
-            # Windows: Use copy (symlinks require admin privileges)
-            if os.path.exists(absolute_log_filename): # Ensure source file exists before copying
-                 shutil.copy2(absolute_log_filename, latest_log_path)
-                 logger.info(f"Copied latest log to: {latest_log_path}")
-            else:
-                 logger.error(f"Source log file '{absolute_log_filename}' not found for copying to latest.log")
+            # Windows: Cannot easily "link" directories without special tools/permissions.
+            # Create a simple text file pointing to the latest run dir.
+            with open(latest_log_link_path + ".txt", "w") as f:
+                f.write(f"Latest run directory: {absolute_run_log_dir}\n")
+            logger.info(f"Updated latest run marker file: {latest_log_link_path}.txt")
         else:
-            # Unix-like: Use symlink
-            if os.path.exists(latest_log_path) or os.path.islink(latest_log_path):
-                os.remove(latest_log_path)
-            if os.path.exists(absolute_log_filename): # Ensure source file exists before linking
-                os.symlink(absolute_log_filename, latest_log_path) # Absolute symlink
-                logger.info(f"Updated latest.log symlink -> {absolute_log_filename}")
-            else:
-                 logger.error(f"Source log file '{absolute_log_filename}' not found for creating symlink latest.log")
+            # Unix-like: Use symlink to the directory
+            if os.path.lexists(latest_log_link_path): # Use lexists for links
+                os.remove(latest_log_link_path)
+            os.symlink(absolute_run_log_dir, latest_log_link_path, target_is_directory=True)
+            logger.info(f"Updated latest_run symlink -> {absolute_run_log_dir}")
     except Exception as e:
-        logger.error(f"Could not create/update latest.log link/copy: {e}")
+        logger.error(f"Could not create/update latest_run link/marker: {e}")
 
-
-    # --- Reduce Verbosity from Libraries ---
+    # Reduce Verbosity from Libraries
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-    return True # Indicate success
+    # Return the run_log_dir for potential use elsewhere (like saving analysis)
+    return run_log_dir, timestamp # Indicate success
 
 def main():
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
@@ -135,17 +169,17 @@ def main():
         help="Enable verbose console logging (uses level specified in config's log_level_file)",
     )
 
-
     args = parser.parse_args()
 
     # Load configuration *before* setting up logging
     config = load_config(args.config)
-    if not config: # Check if config loading failed
+    if not config:
          print("ERROR: Failed to load configuration. Exiting.")
          sys.exit(1)
 
-    # Setup logging using loaded config and verbose flag
-    if not setup_logging(config, args.verbose):
+    # Setup logging
+    run_log_dir, run_timestamp = setup_logging(config, args.verbose)
+    if not run_log_dir:
          print("ERROR: Failed to set up logging. Exiting.")
          sys.exit(1)
     # Logger is now configured globally
@@ -163,18 +197,20 @@ def main():
 
     # Set the system recursion limit
     if config.system.recursion_limit:
-         sys.setrecursionlimit(config.system.recursion_limit)
-         logger.info(f"Recursion limit set to: {config.system.recursion_limit}")
+         try:
+             sys.setrecursionlimit(config.system.recursion_limit)
+             logger.info(f"System recursion limit set to: {config.system.recursion_limit}")
+         except Exception as e:
+             logger.error(f"Failed to set recursion limit: {e}")
 
     logger.info(f"Confirm recursion limit: {sys.getrecursionlimit()}")
 
     # Initialize trainer
     try:
-         trainer = CFRTrainer(config)
+         trainer = CFRTrainer(config, run_log_dir=run_log_dir) # Pass run_log_dir to trainer
     except Exception as e:
          logger.exception("Failed to initialize CFRTrainer:")
          sys.exit(1)
-
 
     # Load existing data if requested
     if args.load:
@@ -188,12 +224,12 @@ def main():
 
     # Run training
     try:
-        trainer.train() # Uses iterations from config (potentially overridden)
+        # trainer.train() now handles the tqdm loop internally
+        trainer.train()
         logger.info("Training completed successfully.")
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user (KeyboardInterrupt).")
         logger.info("Attempting to save current progress...")
-        # Validate save path before saving on interrupt
         if not trainer.config.persistence.agent_data_save_path or not os.path.basename(trainer.config.persistence.agent_data_save_path):
             logger.error("Cannot save progress: Agent data save path is invalid or not configured.")
         else:
@@ -203,10 +239,8 @@ def main():
             except Exception as save_e:
                 logger.error(f"Failed to save progress after interrupt: {save_e}")
     except Exception as e:
-        # Use logger.exception to include traceback
         logger.exception("An unexpected error occurred during training:")
         logger.info("Attempting to save current progress before exiting...")
-        # Validate save path before saving on error
         if not trainer.config.persistence.agent_data_save_path or not os.path.basename(trainer.config.persistence.agent_data_save_path):
             logger.error("Cannot save progress: Agent data save path is invalid or not configured.")
         else:
@@ -215,7 +249,6 @@ def main():
                 logger.info("Progress saved.")
             except Exception as save_e:
                 logger.error(f"Failed to save progress after error: {save_e}")
-
 
 if __name__ == "__main__":
     main()
