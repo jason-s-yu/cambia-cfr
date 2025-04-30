@@ -51,6 +51,14 @@ class DecayCategory(enum.Enum):
     LIKELY_HIGH = 102 # PEEK_OTHER, SWAP_BLIND, HIGH_KING
     UNKNOWN = CardBucket.UNKNOWN # Re-use UNKNOWN state
 
+class DecisionContext(enum.Enum):
+    START_TURN = 0      # Choosing Draw Stockpile / Draw Discard / Call Cambia
+    POST_DRAW = 1       # Choosing Discard (Ability/No) / Replace
+    SNAP_DECISION = 2   # Choosing Pass Snap / Snap Own / Snap Opponent
+    ABILITY_SELECT = 3  # Choosing target/decision for 7/8/9/T/J/Q/K ability
+    SNAP_MOVE = 4       # Choosing which card to move after successful Snap Opponent
+    TERMINAL = 5        # Although CFR stops before this, useful for completeness
+
 # --- Game Phases / State Estimates ---
 class GamePhase(enum.Enum):
     # Simplified phases based on stockpile for now

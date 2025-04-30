@@ -1,7 +1,21 @@
 # src/config.py
 from dataclasses import dataclass, field
 import yaml
-from typing import Optional, Dict, Any
+from typing import List, Dict, TypeVar
+
+T = TypeVar('T')
+
+# Helper to get nested dict values safely
+def get_nested(data: Dict, keys: List[str], default: T) -> T:
+     """Safely retrieve a nested value from a dict."""
+     current = data
+     for key in keys:
+          if isinstance(current, dict) and key in current:
+               current = current.get(key)
+          else:
+               return default
+     return current
+
 
 @dataclass
 class ApiConfig:
@@ -18,6 +32,7 @@ class CfrTrainingConfig:
     save_interval: int = 1000
     pruning_enabled: bool = True # Enable Regret-Based Pruning
     pruning_threshold: float = 1e-6 # Regrets below this are considered zero for pruning
+    exploitability_interval: int = 1000 # How often (in iterations) to calculate exploitability
 
 @dataclass
 class CfrPlusParamsConfig:
@@ -69,60 +84,63 @@ def load_config(config_path: str = "config.yaml") -> Config:
     try:
         with open(config_path, 'r') as f:
             config_dict = yaml.safe_load(f)
-            if config_dict is None: config_dict = {} # Handle empty config file
+            if config_dict is None: config_dict = {}
 
-            # Reconstruct nested dataclasses, ensuring all keys are handled
-            system_cfg = config_dict.get('system', {})
-            cfr_training_cfg = config_dict.get('cfr_training', {})
-            cambia_rules_cfg = config_dict.get('cambia_rules', {})
-            logging_cfg = config_dict.get('logging', {})
-            api_cfg = config_dict.get('api', {})
-            cfr_plus_cfg = config_dict.get('cfr_plus_params', {})
-            agent_params_cfg = config_dict.get('agent_params', {})
-            persistence_cfg = config_dict.get('persistence', {})
-
+            # Using helper for safer nested access with defaults
             return Config(
-                api=ApiConfig(**api_cfg),
+                api=ApiConfig(
+                    base_url=get_nested(config_dict, ['api', 'base_url'], "http://localhost:8080"),
+                    auth=get_nested(config_dict, ['api', 'auth'], {})
+                ),
                 system=SystemConfig(
-                    recursion_limit=system_cfg.get('recursion_limit', 1000)
+                    recursion_limit=get_nested(config_dict, ['system', 'recursion_limit'], 1000)
                 ),
                 cfr_training=CfrTrainingConfig(
-                    num_iterations=cfr_training_cfg.get('num_iterations', 10000),
-                    save_interval=cfr_training_cfg.get('save_interval', 1000),
-                    pruning_enabled=cfr_training_cfg.get('pruning_enabled', True),
-                    pruning_threshold=cfr_training_cfg.get('pruning_threshold', 1e-6)
+                    num_iterations=get_nested(config_dict, ['cfr_training', 'num_iterations'], 10000),
+                    save_interval=get_nested(config_dict, ['cfr_training', 'save_interval'], 1000),
+                    pruning_enabled=get_nested(config_dict, ['cfr_training', 'pruning_enabled'], True),
+                    pruning_threshold=get_nested(config_dict, ['cfr_training', 'pruning_threshold'], 1e-6),
+                    exploitability_interval=get_nested(config_dict, ['cfr_training', 'exploitability_interval'], 1000)
                 ),
-                cfr_plus_params=CfrPlusParamsConfig(**cfr_plus_cfg),
-                agent_params=AgentParamsConfig(**agent_params_cfg),
+                cfr_plus_params=CfrPlusParamsConfig(
+                     weighted_averaging_enabled=get_nested(config_dict, ['cfr_plus_params', 'weighted_averaging_enabled'], True),
+                     averaging_delay=get_nested(config_dict, ['cfr_plus_params', 'averaging_delay'], 0)
+                ),
+                agent_params=AgentParamsConfig(
+                     memory_level=get_nested(config_dict, ['agent_params', 'memory_level'], 0),
+                     time_decay_turns=get_nested(config_dict, ['agent_params', 'time_decay_turns'], 3)
+                ),
                 cambia_rules=CambiaRulesConfig(
-                     allowDrawFromDiscardPile=cambia_rules_cfg.get('allowDrawFromDiscardPile', False),
-                     allowReplaceAbilities=cambia_rules_cfg.get('allowReplaceAbilities', False),
-                     snapRace=cambia_rules_cfg.get('snapRace', False),
-                     penaltyDrawCount=cambia_rules_cfg.get('penaltyDrawCount', 2),
-                     use_jokers=cambia_rules_cfg.get('use_jokers', 2),
-                     cards_per_player=cambia_rules_cfg.get('cards_per_player', 4),
-                     initial_view_count=cambia_rules_cfg.get('initial_view_count', 2),
-                     cambia_allowed_round=cambia_rules_cfg.get('cambia_allowed_round', 0),
-                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False),
-                     max_game_turns=cambia_rules_cfg.get('max_game_turns', 300)
+                     allowDrawFromDiscardPile=get_nested(config_dict, ['cambia_rules', 'allowDrawFromDiscardPile'], False),
+                     allowReplaceAbilities=get_nested(config_dict, ['cambia_rules', 'allowReplaceAbilities'], False),
+                     snapRace=get_nested(config_dict, ['cambia_rules', 'snapRace'], False),
+                     penaltyDrawCount=get_nested(config_dict, ['cambia_rules', 'penaltyDrawCount'], 2),
+                     use_jokers=get_nested(config_dict, ['cambia_rules', 'use_jokers'], 2),
+                     cards_per_player=get_nested(config_dict, ['cambia_rules', 'cards_per_player'], 4),
+                     initial_view_count=get_nested(config_dict, ['cambia_rules', 'initial_view_count'], 2),
+                     cambia_allowed_round=get_nested(config_dict, ['cambia_rules', 'cambia_allowed_round'], 0),
+                     allowOpponentSnapping=get_nested(config_dict, ['cambia_rules', 'allowOpponentSnapping'], False),
+                     max_game_turns=get_nested(config_dict, ['cambia_rules', 'max_game_turns'], 300)
                 ),
-                persistence=PersistenceConfig(**persistence_cfg),
+                persistence=PersistenceConfig(
+                     agent_data_save_path=get_nested(config_dict, ['persistence', 'agent_data_save_path'], "cfr_agent_data.joblib")
+                ),
                 logging=LoggingConfig(
-                     log_level_file=logging_cfg.get('log_level_file', 'DEBUG'),
-                     log_level_console=logging_cfg.get('log_level_console', 'WARNING'),
-                     log_dir=logging_cfg.get('log_dir', 'logs'),
-                     log_file_prefix=logging_cfg.get('log_file_prefix', 'cambia')
+                     log_level_file=get_nested(config_dict, ['logging', 'log_level_file'], 'DEBUG'),
+                     log_level_console=get_nested(config_dict, ['logging', 'log_level_console'], 'WARNING'),
+                     log_dir=get_nested(config_dict, ['logging', 'log_dir'], 'logs'),
+                     log_file_prefix=get_nested(config_dict, ['logging', 'log_file_prefix'], 'cambia')
                 )
             )
 
     except FileNotFoundError:
         print(f"Warning: Config file '{config_path}' not found. Using default configuration.")
-        return Config()
-    except TypeError as e:
-        print(f"Error loading config file '{config_path}': {e}. Check config keys and structure.")
+        return Config() # Return default config object
+    except (TypeError, KeyError, AttributeError) as e: # Catch more specific errors from get_nested/dataclass init
+        print(f"Error loading config file '{config_path}': {e}. Check config structure/types.")
         print("Using default configuration.")
-        return Config()
+        return Config() # Return default config object
     except Exception as e:
         print(f"Unexpected error loading config file '{config_path}': {e}")
         print("Using default configuration.")
-        return Config()
+        return Config() # Return default config object

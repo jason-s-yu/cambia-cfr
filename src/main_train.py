@@ -1,6 +1,5 @@
 # src/main_train.py
 import logging
-import logging.handlers
 import argparse
 import os
 import datetime

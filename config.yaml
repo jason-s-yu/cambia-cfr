@@ -13,6 +13,7 @@ cfr_training:
   save_interval: 5000
   pruning_enabled: true
   pruning_threshold: 1.0e-6
+  exploitability_interval: 1000
 
 cfr_plus_params:
   weighted_averaging_enabled: true
@@ -39,6 +40,6 @@ persistence:
 
 logging:
   log_level_file: "DEBUG"      # Logging level for the file (e.g., DEBUG, INFO, WARNING)
-  log_level_console: "WARNING" # Logging level for the console (e.g., DEBUG, INFO, WARNING)
+  log_level_console: "ERROR" # Logging level for the console (e.g., DEBUG, INFO, WARNING)
   log_dir: "logs"
   log_file_prefix: "cambia"
