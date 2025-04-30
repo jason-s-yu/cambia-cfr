@@ -36,7 +36,6 @@ class CambiaRulesConfig:
     initial_view_count: int = 2
     cambia_allowed_round: int = 0 # 0 means allowed immediately
     allowOpponentSnapping: bool = False # Default to False
-    # Add any other house rules relevant to the engine here
 
 @dataclass
 class PersistenceConfig:
@@ -44,10 +43,9 @@ class PersistenceConfig:
 
 @dataclass
 class LoggingConfig:
-    log_level: str = "INFO"
+    log_level: str = "INFO" # Changed from log_level_file
     log_dir: str = "logs" # Directory to store log files
     log_file_prefix: str = "cambia" # Prefix for timestamped log files
-    # log_file is now dynamically generated
 
 @dataclass
 class Config:
@@ -66,29 +64,37 @@ def load_config(config_path: str = "config.yaml") -> Config:
             config_dict = yaml.safe_load(f)
             if config_dict is None: config_dict = {} # Handle empty config file
 
-            # Basic manual reconstruction for nested dataclasses
+            # Reconstruct nested dataclasses, ensuring all keys are handled
+            cfr_training_cfg = config_dict.get('cfr_training', {})
+            cambia_rules_cfg = config_dict.get('cambia_rules', {})
+            logging_cfg = config_dict.get('logging', {})
+
             return Config(
                 api=ApiConfig(**config_dict.get('api', {})),
-                cfr_training=CfrTrainingConfig(**config_dict.get('cfr_training', {})),
+                cfr_training=CfrTrainingConfig(
+                    num_iterations=cfr_training_cfg.get('num_iterations', 10000),
+                    save_interval=cfr_training_cfg.get('save_interval', 1000),
+                    pruning_enabled=cfr_training_cfg.get('pruning_enabled', True),
+                    pruning_threshold=cfr_training_cfg.get('pruning_threshold', 1e-6) # Added
+                ),
                 cfr_plus_params=CfrPlusParamsConfig(**config_dict.get('cfr_plus_params', {})),
                 agent_params=AgentParamsConfig(**config_dict.get('agent_params', {})),
                 cambia_rules=CambiaRulesConfig(
-                     allowDrawFromDiscardPile=config_dict.get('cambia_rules', {}).get('allowDrawFromDiscardPile', False),
-                     allowReplaceAbilities=config_dict.get('cambia_rules', {}).get('allowReplaceAbilities', False),
-                     snapRace=config_dict.get('cambia_rules', {}).get('snapRace', False),
-                     penaltyDrawCount=config_dict.get('cambia_rules', {}).get('penaltyDrawCount', 2),
-                     use_jokers=config_dict.get('cambia_rules', {}).get('use_jokers', 2),
-                     cards_per_player=config_dict.get('cambia_rules', {}).get('cards_per_player', 4),
-                     initial_view_count=config_dict.get('cambia_rules', {}).get('initial_view_count', 2),
-                     cambia_allowed_round=config_dict.get('cambia_rules', {}).get('cambia_allowed_round', 0),
-                     allowOpponentSnapping=config_dict.get('cambia_rules', {}).get('allowOpponentSnapping', False)
+                     allowDrawFromDiscardPile=cambia_rules_cfg.get('allowDrawFromDiscardPile', False),
+                     allowReplaceAbilities=cambia_rules_cfg.get('allowReplaceAbilities', False),
+                     snapRace=cambia_rules_cfg.get('snapRace', False),
+                     penaltyDrawCount=cambia_rules_cfg.get('penaltyDrawCount', 2),
+                     use_jokers=cambia_rules_cfg.get('use_jokers', 2), # Added
+                     cards_per_player=cambia_rules_cfg.get('cards_per_player', 4), # Added
+                     initial_view_count=cambia_rules_cfg.get('initial_view_count', 2), # Added
+                     cambia_allowed_round=cambia_rules_cfg.get('cambia_allowed_round', 0), # Added
+                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False) # Added
                 ),
                 persistence=PersistenceConfig(**config_dict.get('persistence', {})),
-                # Correctly pass keyword arguments for LoggingConfig
                 logging=LoggingConfig(
-                     log_level=config_dict.get('logging', {}).get('log_level', 'INFO'),
-                     log_dir=config_dict.get('logging', {}).get('log_dir', 'logs'),
-                     log_file_prefix=config_dict.get('logging', {}).get('log_file_prefix', 'cambia')
+                     log_level=logging_cfg.get('log_level', 'INFO'), # Changed key
+                     log_dir=logging_cfg.get('log_dir', 'logs'), # Added
+                     log_file_prefix=logging_cfg.get('log_file_prefix', 'cambia') # Added
                 )
             )
 
@@ -96,7 +102,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
         print(f"Warning: Config file '{config_path}' not found. Using default configuration.")
         return Config()
     except TypeError as e:
-        # Catch TypeError specifically and print more helpful message
         print(f"Error loading config file '{config_path}': {e}. Check config keys and structure.")
         print("Using default configuration.")
         return Config()

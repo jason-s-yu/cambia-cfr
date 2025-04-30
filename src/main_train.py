@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(config, verbose: bool):
     """Configures logging to console, timestamped file, and latest.log link."""
-    log_level_str = config.logging.log_level_file.upper()
+    log_level_str = config.logging.log_level.upper() # Use log_level
     file_log_level = getattr(logging, log_level_str, logging.INFO)
-    # Set console level based on verbose flag
-    console_log_level = file_log_level if verbose else logging.ERROR
+    # Set console level based on verbose flag, but not lower than file level
+    console_log_level = file_log_level if verbose else logging.WARNING # Default console to WARNING unless verbose
 
     log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
@@ -43,7 +43,7 @@ def setup_logging(config, verbose: bool):
 
     # --- Root Logger Configuration ---
     root_logger = logging.getLogger()
-    # Set root logger level to the lowest level used by handlers (e.g., DEBUG if file is DEBUG)
+    # Set root logger level to the lowest level used by handlers
     root_logger.setLevel(min(file_log_level, console_log_level))
 
     # Remove existing handlers to avoid duplicates if script is re-run
@@ -69,7 +69,6 @@ def setup_logging(config, verbose: bool):
     except Exception as e:
         # Use print as logger might not be fully functional yet
         print(f"ERROR: Could not set up timestamped file logging at {log_filename}: {e}")
-        # Remove console handler if file logging failed? Optional.
         return False # Indicate failure
 
 
@@ -80,14 +79,20 @@ def setup_logging(config, verbose: bool):
         absolute_log_filename = os.path.abspath(log_filename)
         if sys.platform == 'win32':
             # Windows: Use copy (symlinks require admin privileges)
-            shutil.copy2(absolute_log_filename, latest_log_path)
-            logger.info(f"Copied latest log to: {latest_log_path}")
+            if os.path.exists(absolute_log_filename): # Ensure source file exists before copying
+                 shutil.copy2(absolute_log_filename, latest_log_path)
+                 logger.info(f"Copied latest log to: {latest_log_path}")
+            else:
+                 logger.error(f"Source log file '{absolute_log_filename}' not found for copying to latest.log")
         else:
             # Unix-like: Use symlink
             if os.path.exists(latest_log_path) or os.path.islink(latest_log_path):
                 os.remove(latest_log_path)
-            os.symlink(absolute_log_filename, latest_log_path) # Absolute symlink
-            logger.info(f"Updated latest.log symlink -> {absolute_log_filename}")
+            if os.path.exists(absolute_log_filename): # Ensure source file exists before linking
+                os.symlink(absolute_log_filename, latest_log_path) # Absolute symlink
+                logger.info(f"Updated latest.log symlink -> {absolute_log_filename}")
+            else:
+                 logger.error(f"Source log file '{absolute_log_filename}' not found for creating symlink latest.log")
     except Exception as e:
         logger.error(f"Could not create/update latest.log link/copy: {e}")
 
