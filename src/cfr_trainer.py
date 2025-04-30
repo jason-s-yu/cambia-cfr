@@ -40,8 +40,8 @@ class CFRTrainer:
         self.current_iteration = 0
         # Store the average strategy computed periodically or at the end
         self.average_strategy: Optional[PolicyDict] = None
-        # Analysis tools instance
-        self.analysis = AnalysisTools(config) # Instantiate analysis tools
+        # Analysis tools instance (pass log dir/prefix from config)
+        self.analysis = AnalysisTools(config, config.logging.log_dir, config.logging.log_file_prefix)
 
 
     def load_data(self, filepath: Optional[str] = None):
@@ -97,9 +97,12 @@ class CFRTrainer:
             self.current_iteration = t + 1 # Current iteration number (1-based)
 
             # Initialize game state for this simulation run
-            # Wrap in try-except block for better error isolation during game setup
+            initial_game_state = None # For logging initial hands
+            game_state = None
             try:
                 game_state = CambiaGameState(house_rules=self.config.cambia_rules)
+                # Clone initial state immediately to preserve initial hands for logging
+                initial_game_state = game_state.clone()
             except Exception as e:
                 logger.exception(f"Error initializing game state on iteration {self.current_iteration}: {e}")
                 continue # Skip iteration if game setup fails
@@ -109,6 +112,8 @@ class CFRTrainer:
 
             # Initialize agent states (one per player)
             initial_agent_states = []
+            action_log_for_game: List[Dict] = [] # List to store action details for this game
+
             if not game_state.is_terminal():
                  initial_obs = self._create_observation(None, None, game_state, -1, []) # Initial state obs
                  for i in range(self.num_players):
@@ -141,10 +146,22 @@ class CFRTrainer:
             final_utilities = None
             try:
                  # Pass iteration number t+1 for CFR+ weighting calculations
-                 final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration)
-                 # Log game history after the recursive call completes for this iteration
-                 game_details = self.analysis.format_game_details_for_log(game_state, initial_agent_states, self.current_iteration)
-                 self.analysis.log_game_history(game_details)
+                 # Also pass the action log list to be populated during recursion
+                 final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration, action_log_for_game)
+
+                 # Log game history after the recursive call completes
+                 if initial_game_state: # Check if initial state was captured
+                    initial_hands_log = [p.hand for p in initial_game_state.players] # Get hands from initial state
+                    game_details = self.analysis.format_game_details_for_log(
+                         game_state=game_state,
+                         iteration=self.current_iteration,
+                         initial_hands=initial_hands_log,
+                         action_sequence=action_log_for_game # Pass the populated log
+                     )
+                    self.analysis.log_game_history(game_details)
+                 else:
+                    logger.warning("Could not log game history: Initial game state was not available.")
+
 
             except RecursionError:
                 logger.error(f"Recursion depth exceeded on iteration {self.current_iteration}! Saving progress and stopping.")
@@ -182,7 +199,7 @@ class CFRTrainer:
         logger.info("Final average strategy computed.")
 
 
-    def _cfr_recursive(self, game_state: CambiaGameState, agent_states: List[AgentState], reach_probs: np.ndarray, iteration: int) -> np.ndarray:
+    def _cfr_recursive(self, game_state: CambiaGameState, agent_states: List[AgentState], reach_probs: np.ndarray, iteration: int, action_log: List[Dict]) -> np.ndarray:
         """
         Recursive CFR+ function. Operates on copies of states.
         Args:
@@ -190,6 +207,7 @@ class CFRTrainer:
             agent_states: List of current subjective agent states (will be cloned).
             reach_probs: Numpy array of reach probabilities for [player0, player1].
             iteration: The current training iteration number (1-based).
+            action_log: A list to append action details to for game history logging.
 
         Returns:
             Numpy array of expected node values (utilities) for [player0, player1].
@@ -316,6 +334,18 @@ class CFRTrainer:
             # Skip recursion if probability is negligible (avoids potential float precision issues)
             if action_prob < 1e-9: continue
 
+            # --- Action Logging ---
+            # Log action *before* applying it to capture state before action
+            action_log_entry = {
+                "player": player,
+                "turn": game_state.get_turn_number(),
+                "state_desc_before": str(game_state), # Capture basic string rep
+                "infoset_key": infoset_key, # Capture infoset key
+                "action": action, # Store action object (will be serialized later)
+                "action_prob": action_prob, # Store action probability from strategy
+                "reach_prob": player_reach # Store player reach probability
+            }
+
 
             # --- State Transition ---
             # Wrap state cloning and action application in try-except
@@ -327,6 +357,9 @@ class CFRTrainer:
                  logger.error(f"Error applying action {action} in state {game_state} at infoset {infoset_key} (Iter {iteration}): {e}", exc_info=True)
                  action_utilities[i] = np.zeros(self.num_players) # Assign 0 utility on error
                  node_value += action_prob * action_utilities[i] # Update node value with 0 utility
+                 # Log the failed action attempt
+                 action_log_entry["outcome"] = "ERROR applying action"
+                 action_log.append(action_log_entry)
                  continue # Skip to next action
 
             # --- Observation Creation ---
@@ -357,6 +390,9 @@ class CFRTrainer:
             if agent_update_failed:
                 action_utilities[i] = np.zeros(self.num_players)
                 node_value += action_prob * action_utilities[i]
+                # Log the failed agent update
+                action_log_entry["outcome"] = "ERROR updating agent state"
+                action_log.append(action_log_entry)
                 continue
 
             # --- Reach Probability Update ---
@@ -372,12 +408,19 @@ class CFRTrainer:
                       pass # next_reach_probs[p_idx] = reach_probs[p_idx] (already copied)
 
             # --- Recursive Call ---
+            # Pass the action_log down the recursion
             action_utilities[i] = self._cfr_recursive(
-                next_game_state, next_agent_states, next_reach_probs, iteration
+                next_game_state, next_agent_states, next_reach_probs, iteration, action_log
             )
 
             # --- Update Node Value ---
             node_value += action_prob * action_utilities[i]
+
+            # --- Finalize Action Log Entry ---
+            # Add outcome/utility after recursive call returns
+            action_log_entry["outcome_utilities"] = action_utilities[i].tolist() # Convert ndarray to list
+            action_log_entry["state_desc_after"] = str(next_game_state)
+            action_log.append(action_log_entry)
 
 
         # 7. Calculate and Update Regrets (CFR+)

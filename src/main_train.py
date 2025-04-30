@@ -4,7 +4,7 @@ import logging.handlers
 import argparse
 import os
 import datetime
-import sys # For checking platform
+import sys # For checking platform, exit
 import shutil # For copying latest.log on Windows
 
 from .config import load_config
@@ -22,7 +22,17 @@ def setup_logging(config, verbose: bool):
 
     log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
-    os.makedirs(log_dir, exist_ok=True) # Ensure log directory exists
+    # Check if log_dir is valid before creating
+    if not log_dir or not isinstance(log_dir, str):
+        print(f"ERROR: Invalid log directory '{log_dir}' in config. Logging disabled.")
+        return False # Indicate failure
+
+    try:
+        os.makedirs(log_dir, exist_ok=True) # Ensure log directory exists
+    except OSError as e:
+        print(f"ERROR: Could not create log directory '{log_dir}': {e}. Logging disabled.")
+        return False # Indicate failure
+
 
     # --- Create Timestamped File Name ---
     timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
@@ -59,6 +69,8 @@ def setup_logging(config, verbose: bool):
     except Exception as e:
         # Use print as logger might not be fully functional yet
         print(f"ERROR: Could not set up timestamped file logging at {log_filename}: {e}")
+        # Remove console handler if file logging failed? Optional.
+        return False # Indicate failure
 
 
     # --- Create/Update latest.log ---
@@ -83,6 +95,7 @@ def setup_logging(config, verbose: bool):
     # --- Reduce Verbosity from Libraries ---
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
+    return True # Indicate success
 
 def main():
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
@@ -120,9 +133,14 @@ def main():
 
     # Load configuration *before* setting up logging
     config = load_config(args.config)
+    if not config: # Check if config loading failed
+         print("ERROR: Failed to load configuration. Exiting.")
+         sys.exit(1)
 
     # Setup logging using loaded config and verbose flag
-    setup_logging(config, args.verbose)
+    if not setup_logging(config, args.verbose):
+         print("ERROR: Failed to set up logging. Exiting.")
+         sys.exit(1)
     # Logger is now configured globally
 
     logger.info("--- Starting Cambia CFR+ Training ---")
@@ -138,12 +156,20 @@ def main():
 
 
     # Initialize trainer
-    trainer = CFRTrainer(config)
+    try:
+         trainer = CFRTrainer(config)
+    except Exception as e:
+         logger.exception("Failed to initialize CFRTrainer:")
+         sys.exit(1)
+
 
     # Load existing data if requested
     if args.load:
-        logger.info(f"Attempting to load agent data from: {config.persistence.agent_data_save_path}")
-        trainer.load_data()
+        if not config.persistence.agent_data_save_path:
+             logger.error("Cannot load data: Agent data save path is not configured.")
+        else:
+             logger.info(f"Attempting to load agent data from: {config.persistence.agent_data_save_path}")
+             trainer.load_data()
     else:
         logger.info("Starting training from scratch (no data loaded).")
 
@@ -154,17 +180,28 @@ def main():
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user (KeyboardInterrupt).")
         logger.info("Attempting to save current progress...")
-        trainer.save_data()
-        logger.info("Progress saved.")
+        # Validate save path before saving on interrupt
+        if not trainer.config.persistence.agent_data_save_path or not os.path.basename(trainer.config.persistence.agent_data_save_path):
+            logger.error("Cannot save progress: Agent data save path is invalid or not configured.")
+        else:
+            try:
+                trainer.save_data()
+                logger.info("Progress saved.")
+            except Exception as save_e:
+                logger.error(f"Failed to save progress after interrupt: {save_e}")
     except Exception as e:
         # Use logger.exception to include traceback
         logger.exception("An unexpected error occurred during training:")
         logger.info("Attempting to save current progress before exiting...")
-        try:
-            trainer.save_data()
-            logger.info("Progress saved.")
-        except Exception as save_e:
-            logger.error(f"Failed to save progress after error: {save_e}")
+        # Validate save path before saving on error
+        if not trainer.config.persistence.agent_data_save_path or not os.path.basename(trainer.config.persistence.agent_data_save_path):
+            logger.error("Cannot save progress: Agent data save path is invalid or not configured.")
+        else:
+            try:
+                trainer.save_data()
+                logger.info("Progress saved.")
+            except Exception as save_e:
+                logger.error(f"Failed to save progress after error: {save_e}")
 
 
 if __name__ == "__main__":

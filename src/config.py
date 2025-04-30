@@ -84,13 +84,23 @@ def load_config(config_path: str = "config.yaml") -> Config:
                      allowOpponentSnapping=config_dict.get('cambia_rules', {}).get('allowOpponentSnapping', False)
                 ),
                 persistence=PersistenceConfig(**config_dict.get('persistence', {})),
-                logging=LoggingConfig(**config_dict.get('logging', {}))
+                # Correctly pass keyword arguments for LoggingConfig
+                logging=LoggingConfig(
+                     log_level=config_dict.get('logging', {}).get('log_level', 'INFO'),
+                     log_dir=config_dict.get('logging', {}).get('log_dir', 'logs'),
+                     log_file_prefix=config_dict.get('logging', {}).get('log_file_prefix', 'cambia')
+                )
             )
 
     except FileNotFoundError:
         print(f"Warning: Config file '{config_path}' not found. Using default configuration.")
         return Config()
+    except TypeError as e:
+        # Catch TypeError specifically and print more helpful message
+        print(f"Error loading config file '{config_path}': {e}. Check config keys and structure.")
+        print("Using default configuration.")
+        return Config()
     except Exception as e:
-        print(f"Error loading config file '{config_path}': {e}")
+        print(f"Unexpected error loading config file '{config_path}': {e}")
         print("Using default configuration.")
         return Config()
