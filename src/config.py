@@ -43,7 +43,8 @@ class PersistenceConfig:
 
 @dataclass
 class LoggingConfig:
-    log_level: str = "INFO" # Changed from log_level_file
+    log_level_file: str = "DEBUG" # Logging level for the file
+    log_level_console: str = "WARNING" # Logging level for the console
     log_dir: str = "logs" # Directory to store log files
     log_file_prefix: str = "cambia" # Prefix for timestamped log files
 
@@ -75,7 +76,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
                     num_iterations=cfr_training_cfg.get('num_iterations', 10000),
                     save_interval=cfr_training_cfg.get('save_interval', 1000),
                     pruning_enabled=cfr_training_cfg.get('pruning_enabled', True),
-                    pruning_threshold=cfr_training_cfg.get('pruning_threshold', 1e-6) # Added
+                    pruning_threshold=cfr_training_cfg.get('pruning_threshold', 1e-6)
                 ),
                 cfr_plus_params=CfrPlusParamsConfig(**config_dict.get('cfr_plus_params', {})),
                 agent_params=AgentParamsConfig(**config_dict.get('agent_params', {})),
@@ -84,17 +85,18 @@ def load_config(config_path: str = "config.yaml") -> Config:
                      allowReplaceAbilities=cambia_rules_cfg.get('allowReplaceAbilities', False),
                      snapRace=cambia_rules_cfg.get('snapRace', False),
                      penaltyDrawCount=cambia_rules_cfg.get('penaltyDrawCount', 2),
-                     use_jokers=cambia_rules_cfg.get('use_jokers', 2), # Added
-                     cards_per_player=cambia_rules_cfg.get('cards_per_player', 4), # Added
-                     initial_view_count=cambia_rules_cfg.get('initial_view_count', 2), # Added
-                     cambia_allowed_round=cambia_rules_cfg.get('cambia_allowed_round', 0), # Added
-                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False) # Added
+                     use_jokers=cambia_rules_cfg.get('use_jokers', 2),
+                     cards_per_player=cambia_rules_cfg.get('cards_per_player', 4),
+                     initial_view_count=cambia_rules_cfg.get('initial_view_count', 2),
+                     cambia_allowed_round=cambia_rules_cfg.get('cambia_allowed_round', 0),
+                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False)
                 ),
                 persistence=PersistenceConfig(**config_dict.get('persistence', {})),
                 logging=LoggingConfig(
-                     log_level=logging_cfg.get('log_level', 'INFO'), # Changed key
-                     log_dir=logging_cfg.get('log_dir', 'logs'), # Added
-                     log_file_prefix=logging_cfg.get('log_file_prefix', 'cambia') # Added
+                     log_level_file=logging_cfg.get('log_level_file', 'DEBUG'), # New key
+                     log_level_console=logging_cfg.get('log_level_console', 'WARNING'), # New key
+                     log_dir=logging_cfg.get('log_dir', 'logs'),
+                     log_file_prefix=logging_cfg.get('log_file_prefix', 'cambia')
                 )
             )
 

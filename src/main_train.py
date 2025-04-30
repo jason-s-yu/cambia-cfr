@@ -15,10 +15,14 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(config, verbose: bool):
     """Configures logging to console, timestamped file, and latest.log link."""
-    log_level_str = config.logging.log_level.upper() # Use log_level
-    file_log_level = getattr(logging, log_level_str, logging.INFO)
-    # Set console level based on verbose flag, but not lower than file level
-    console_log_level = file_log_level if verbose else logging.WARNING # Default console to WARNING unless verbose
+    log_level_file_str = config.logging.log_level_file.upper()
+    log_level_console_str = config.logging.log_level_console.upper()
+
+    file_log_level = getattr(logging, log_level_file_str, logging.DEBUG)
+    default_console_log_level = getattr(logging, log_level_console_str, logging.WARNING)
+
+    # Set console level: Use specified console level if verbose, otherwise use default console level
+    console_log_level = file_log_level if verbose else default_console_log_level # Use file level if verbose, else default console.
 
     log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
@@ -130,7 +134,7 @@ def main():
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable verbose console logging (uses level from config)",
+        help="Enable verbose console logging (uses level specified in config's log_level_file)",
     )
 
 

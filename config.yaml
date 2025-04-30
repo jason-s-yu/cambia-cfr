@@ -34,6 +34,7 @@ persistence:
   agent_data_save_path: "cambia_cfr_agent_level1.joblib"
 
 logging:
-  log_level: "DEBUG"
-  log_dir: "logs" 
+  log_level_file: "DEBUG"      # Logging level for the file (e.g., DEBUG, INFO, WARNING)
+  log_level_console: "WARNING" # Logging level for the console (e.g., DEBUG, INFO, WARNING)
+  log_dir: "logs"
   log_file_prefix: "cambia"

@@ -2,8 +2,8 @@
 import numpy as np
 import time
 import logging
-from typing import Dict, List, Optional, Set, TypeAlias, Tuple # Added Tuple
-from collections import defaultdict
+from typing import Callable, Dict, List, Optional, Set, TypeAlias, Tuple # Added Tuple
+from collections import defaultdict, deque
 import copy
 import traceback
 
@@ -91,22 +91,21 @@ class CFRTrainer:
             initial_game_state_for_log = None
             game_state = None
             try:
+                # --- Store initial state BEFORE any modifications ---
                 game_state = CambiaGameState(house_rules=self.config.cambia_rules)
-                # Log initial state *if possible* - requires temporary clone or separate capture
-                try:
-                     initial_game_state_for_log = game_state._internal_clone() # Use internal clone for logging only
-                except Exception as log_clone_err:
-                     logger.warning(f"Could not clone initial state for logging: {log_clone_err}")
+                initial_state_str_for_log = str(game_state) # String representation
+                initial_hands_for_log = [list(p.hand) for p in game_state.players] # Copy hands
+                initial_peeks_for_log = [p.initial_peek_indices for p in game_state.players]
             except Exception as e:
                 logger.exception(f"Error initializing game state on iteration {self.current_iteration}: {e}")
                 continue
 
             reach_probs = np.ones(self.num_players, dtype=np.float64)
             initial_agent_states = []
-            action_log_for_game: List[Dict] = []
+            action_log_for_game: List[Dict] = [] # Log actions for this specific game simulation
 
             if not game_state.is_terminal():
-                 initial_obs = self._create_observation(None, None, game_state, -1, [])
+                 initial_obs = self._create_observation(None, None, game_state, -1, []) # Create initial obs from game state
                  for i in range(self.num_players):
                       try:
                            agent = AgentState(
@@ -114,13 +113,11 @@ class CFRTrainer:
                                opponent_id=game_state.get_opponent_index(i),
                                memory_level=self.config.agent_params.memory_level,
                                time_decay_turns=self.config.agent_params.time_decay_turns,
-                               initial_hand_size=game_state.get_player_card_count(i),
+                               initial_hand_size=len(initial_hands_for_log[i]), # Use logged initial hand size
                                config=self.config
                            )
-                           # Use logged initial state for hands if available
-                           initial_hand = initial_game_state_for_log.get_player_hand(i) if initial_game_state_for_log else game_state.get_player_hand(i)
-                           peek_indices = initial_game_state_for_log.players[i].initial_peek_indices if initial_game_state_for_log else game_state.players[i].initial_peek_indices
-                           agent.initialize(initial_obs, initial_hand, peek_indices)
+                           # Use logged initial state for hands/peeks
+                           agent.initialize(initial_obs, initial_hands_for_log[i], initial_peeks_for_log[i])
                            initial_agent_states.append(agent)
                       except Exception as e:
                            logger.exception(f"Error initializing AgentState {i} on iteration {self.current_iteration}: {e}")
@@ -135,29 +132,32 @@ class CFRTrainer:
 
             final_utilities = None
             try:
+                 # --- Run CFR Recursion ---
+                 # Pass the *mutable* game_state object down the recursion
                  final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration, action_log_for_game)
 
-                 # Log game history
-                 if initial_game_state_for_log:
-                    initial_hands_log = [p.hand for p in initial_game_state_for_log.players]
-                    game_details = self.analysis.format_game_details_for_log(
-                         game_state=game_state, # Use the final state after recursion
-                         iteration=self.current_iteration,
-                         initial_hands=initial_hands_log,
-                         action_sequence=action_log_for_game
-                     )
-                    self.analysis.log_game_history(game_details)
-                 else:
-                    logger.warning("Could not log game history: Initial game state was not available.")
+                 # --- Log Completed Game ---
+                 # Use the final state of game_state after recursion completes
+                 game_details = self.analysis.format_game_details_for_log(
+                      game_state=game_state, # Use the final state
+                      iteration=self.current_iteration,
+                      initial_hands=initial_hands_for_log, # Use the captured initial hands
+                      action_sequence=action_log_for_game
+                  )
+                 self.analysis.log_game_history(game_details)
 
             except RecursionError:
                 logger.error(f"Recursion depth exceeded on iteration {self.current_iteration}! Saving progress and stopping.")
+                # Log the game state *at the point of the error* if possible (difficult)
+                logger.error(f"State at RecursionError (approx): {game_state}")
                 logger.error("Traceback:\n%s", traceback.format_exc())
                 self.save_data()
-                raise
+                raise # Re-raise to stop execution
             except Exception as e:
                  logger.exception(f"Error during CFR recursion on iteration {self.current_iteration}: {e}")
-                 continue
+                 # Log the game state at the point of the error
+                 logger.error(f"State at Error: {game_state}")
+                 continue # Continue to the next iteration
 
             iter_time = time.time() - iter_start_time
             if self.current_iteration % 100 == 0 or self.current_iteration == end_iteration:
@@ -220,16 +220,25 @@ class CFRTrainer:
 
         num_actions = len(legal_actions)
         if num_actions == 0:
+             # If no actions but not terminal, it's an engine error or requires forcing game end
              if not game_state.is_terminal():
                   logger.warning(f"No legal actions found for P{player} at infoset {infoset_key} in *non-terminal* state {game_state}. Forcing game end check.")
-                  game_state._check_game_end()
+                  # Create an undo stack just for this check
+                  local_undo_stack: deque[Callable[[], None]] = deque()
+                  game_state._check_game_end(local_undo_stack)
+                  # Execute the undo stack for the check to revert any state changes made by it
+                  while local_undo_stack:
+                       try: local_undo_stack.popleft()()
+                       except Exception as undo_e: logger.error(f"Error undoing _check_game_end: {undo_e}")
+
+                  # Now re-check if the state *became* terminal after the check
                   if game_state.is_terminal():
                        logger.info(f"State confirmed terminal after no-action check for P{player}.")
                        return np.array([game_state.get_utility(i) for i in range(self.num_players)], dtype=np.float64)
                   else:
-                       logger.error(f"State still non-terminal after no-action check for P{player}. This indicates a potential engine bug.")
+                       logger.error(f"State still non-terminal after no-action check for P{player}. Engine/logic error. Returning 0 utility.")
                        return np.zeros(self.num_players, dtype=np.float64)
-             else:
+             else: # Already terminal, return utility
                   return np.array([game_state.get_utility(i) for i in range(self.num_players)], dtype=np.float64)
 
 
@@ -271,57 +280,63 @@ class CFRTrainer:
         use_pruning = self.config.cfr_training.pruning_enabled
         pruning_threshold = self.config.cfr_training.pruning_threshold
 
+        state_before_actions_str = str(game_state) # For logging errors across actions
+
         for i, action in enumerate(legal_actions):
             action_prob = strategy[i]
 
+            # --- Regret-Based Pruning ---
             should_prune = (use_pruning and
                            player_reach > 0 and
                            current_regrets[i] <= pruning_threshold and
-                           iteration > 1)
+                           iteration > 10) # Add small delay to pruning
 
             if should_prune:
-                 action_utilities[i] = np.zeros(self.num_players)
-                 node_value += action_prob * action_utilities[i]
-                 continue
+                 # If pruned, assume utility is same as node value (no regret update)
+                 # Need node value *without* this action first? Calculate later.
+                 # For now, just assign 0, regret update logic handles it.
+                 action_utilities[i] = np.zeros(self.num_players) # Store 0 util for pruned branch
+                 continue # Skip simulation for this action
 
-            if action_prob < 1e-9: continue
+            # Skip actions with negligible probability
+            if action_prob < 1e-9 and not use_pruning: continue # Don't skip if pruning might reconsider
 
             action_log_entry = {
                 "player": player, "turn": game_state.get_turn_number(),
-                "state_desc_before": str(game_state), "infoset_key": infoset_key,
+                "state_desc_before": str(game_state), # State *before* this specific action
+                "infoset_key": infoset_key,
                 "action": action, "action_prob": action_prob, "reach_prob": player_reach
             }
+            state_before_this_action_str = action_log_entry["state_desc_before"] # Copy for error logging
 
 
             # --- State Transition (Apply & Get Undo) ---
             state_delta: Optional[StateDelta] = None
             undo_info: Optional[UndoInfo] = None
             state_after_action_desc = "ERROR" # Default description
-            try:
-                 # --- Apply Action (modifies game_state) ---
-                 # Store state *before* applying for observation creation
-                 state_before_action_str = str(game_state) # Capture before modification
-                 snap_log_before_action = list(game_state.snap_results_log) # Copy log before action
+            snap_log_before_action = list(game_state.snap_results_log) # Copy log before action
 
+            try:
                  state_delta, undo_info = game_state.apply_action(action)
                  state_after_action_desc = str(game_state) # Capture after modification
 
-            except Exception as e:
-                 logger.error(f"Error applying action {action} in state {state_before_action_str} at infoset {infoset_key} (Iter {iteration}): {e}", exc_info=True)
+            except Exception as apply_err:
+                 logger.error(f"Error applying action {action} in state {state_before_this_action_str} at infoset {infoset_key} (Iter {iteration}): {apply_err}", exc_info=False) # Log only exception message initially
+                 # Add more detailed traceback if verbose needed
+                 if logger.isEnabledFor(logging.DEBUG): logger.exception("Full traceback for apply_action error:")
                  action_utilities[i] = np.zeros(self.num_players)
-                 node_value += action_prob * action_utilities[i]
-                 action_log_entry["outcome"] = "ERROR applying action"
+                 action_log_entry["outcome"] = f"ERROR applying action: {apply_err}"
                  action_log_entry["state_desc_after"] = state_after_action_desc # Log state after error if possible
                  action_log.append(action_log_entry)
-                 # Attempt to undo if possible? Risky if state is corrupt. Skip undo here.
-                 undo_info = None # Prevent undo attempt
-                 continue
+                 # Don't attempt undo if apply failed, state might be corrupt or unchanged
+                 undo_info = None # Prevent undo attempt later
+                 # If one action fails, maybe skip others in this infoset? For now, continue.
+                 continue # Skip recursion for this failed action
 
             # --- Observation Creation (using state *after* action) ---
-            # Need the snap log *generated by* the action, which should be in the modified game_state
-            current_snap_log = game_state.snap_results_log
+            current_snap_log = game_state.snap_results_log # Log from *after* action application
             observation = self._create_observation(
-                 prev_state=None, # No longer needed if using deltas directly? Pass state before?
+                 prev_state=None, # No longer tracking prev_state explicitly
                  action=action,
                  next_state=game_state, # Pass current (modified) state
                  acting_player=player,
@@ -332,40 +347,46 @@ class CFRTrainer:
             next_agent_states = []
             agent_update_failed = False
             for agent_idx, agent_state in enumerate(agent_states):
+                  # Clone agent state for this branch
                   cloned_agent = agent_state.clone()
                   try:
+                       # Filter observation for the specific agent
                        player_specific_obs = self._filter_observation(observation, agent_idx)
                        cloned_agent.update(player_specific_obs)
-                  except Exception as e:
+                  except Exception as agent_update_err:
                        logger.error(f"Error updating AgentState {agent_idx} for P{player} acting with {action}. Infoset: {infoset_key}. Obs: {observation}", exc_info=True)
                        agent_update_failed = True
-                       break
+                       break # Stop processing agents for this action branch
                   next_agent_states.append(cloned_agent)
 
             if agent_update_failed:
-                action_utilities[i] = np.zeros(self.num_players)
-                node_value += action_prob * action_utilities[i]
+                action_utilities[i] = np.zeros(self.num_players) # Assign zero utility
                 action_log_entry["outcome"] = "ERROR updating agent state"
                 action_log_entry["state_desc_after"] = state_after_action_desc
                 action_log.append(action_log_entry)
-                # Attempt to undo the game state change
+                # Attempt to undo the game state change before continuing
                 if undo_info:
                      try: undo_info()
                      except Exception as undo_e: logger.error(f"Error undoing action after agent update failure: {undo_e}")
-                continue
+                continue # Move to the next action
 
             # --- Reach Probability Update ---
             next_reach_probs = reach_probs.copy()
+            # Update reach prob using the probability of the action *taken*
             next_reach_probs[player] *= action_prob
 
             # --- Recursive Call (with modified game_state) ---
             try:
                  # Pass the modified game_state down
-                 action_utilities[i] = self._cfr_recursive(
+                 recursive_utilities = self._cfr_recursive(
                      game_state, next_agent_states, next_reach_probs, iteration, action_log
                  )
+                 action_utilities[i] = recursive_utilities
+
             except Exception as recursive_err:
-                  logger.error(f"Error during recursive call for action {action} from state {state_before_action_str}. Infoset: {infoset_key}", exc_info=True)
+                  # Simplify error message to avoid recursion in logging
+                  logger.error(f"Error in recursive call for action {type(action).__name__} from P{player} T#{game_state.get_turn_number()}. Infoset: {infoset_key}", exc_info=False)
+                  if logger.isEnabledFor(logging.DEBUG): logger.exception("Full traceback for recursion error:")
                   action_utilities[i] = np.zeros(self.num_players) # Assign zero utility on error
                   # Log the error in the action sequence
                   action_log_entry["outcome"] = f"ERROR in recursion: {recursive_err}"
@@ -378,76 +399,93 @@ class CFRTrainer:
                       except Exception as undo_e: logger.error(f"Error undoing action after recursion error: {undo_e}")
                   continue # Move to the next action
 
-            # --- Update Node Value ---
-            node_value += action_prob * action_utilities[i]
-
-            # --- Finalize Action Log Entry ---
+            # --- Finalize Action Log Entry (Success Case) ---
             action_log_entry["outcome_utilities"] = action_utilities[i].tolist()
             action_log_entry["state_desc_after"] = state_after_action_desc # Already captured
             action_log.append(action_log_entry)
 
             # --- Undo Action ---
-            # Crucial step: Restore game_state for the next action sibling
             if undo_info:
                  try:
                       undo_info()
-                      # Optional: Add verification step here to check if undo was successful
-                      # if str(game_state) != state_before_action_str: # Basic check
-                      #      logger.error(f"Undo failed to restore state correctly after action {action}. Before: '{state_before_action_str}', After Undo: '{str(game_state)}'")
+                      # # Optional: Verification step (can be expensive)
+                      # current_state_str = str(game_state)
+                      # if current_state_str != state_before_this_action_str:
+                      #      logger.error(f"Undo failed verification! Action: {action}")
+                      #      logger.error(f" State Before: {state_before_this_action_str}")
+                      #      logger.error(f" State After Undo: {current_state_str}")
+                      #      # Decide how to handle verification failure (e.g., raise, stop)
                  except Exception as undo_e:
-                      # If undo fails, the state is corrupt, cannot reliably continue this branch
-                      logger.exception(f"FATAL: Error undoing action {action} from state {state_before_action_str}. State may be corrupt. Stopping branch.")
-                      # Return a value indicating error or raise? Return 0 utility for now.
+                      logger.exception(f"FATAL: Error undoing action {action} from state {state_before_this_action_str}. State may be corrupt. Stopping branch.")
+                      # Return error utility or raise? Raising might stop training. Return 0 for now.
                       return np.zeros(self.num_players, dtype=np.float64)
             else:
-                 # This should not happen if apply_action always returns undo info
-                 logger.error(f"Missing undo information for action {action}. State may be corrupt.")
+                 # This case should ideally not be reached if apply_action worked
+                 logger.error(f"Missing undo information for successful action {action}. State corrupt.")
                  return np.zeros(self.num_players, dtype=np.float64)
 
 
-        # 7. Calculate and Update Regrets
+        # --- Calculate Node Value (after exploring all actions/pruning) ---
+        node_value = np.sum(strategy[:, np.newaxis] * action_utilities, axis=0)
+
+
+        # --- Update Regrets ---
         opponent_reach = reach_probs[opponent]
+        # Only update regrets if the player acting could reach this node
         if player_reach > 0:
+            # Calculate instantaneous regret for the acting player
             player_action_values = action_utilities[:, player]
             player_node_value = node_value[player]
             instantaneous_regret = player_action_values - player_node_value
-            update_weight = opponent_reach if opponent_reach > 0 else 1.0
 
-            current_regrets = self.regret_sum[infoset_key] # Fetch again
+            # Weight regret update by opponent's reach probability (counterfactual value)
+            update_weight = opponent_reach # Already includes traversing player's reach
+
+            current_regrets = self.regret_sum[infoset_key] # Fetch current regrets for the infoset
+            # Apply Regret Matching+ update: R += weighted_instantaneous_regret, then take max(0, R)
             self.regret_sum[infoset_key] = np.maximum(0.0, current_regrets + update_weight * instantaneous_regret)
 
 
-        # 8. Return Node Value
+        # --- Return Node Value ---
         return node_value
 
 
     def _filter_observation(self, obs: AgentObservation, observer_id: int) -> AgentObservation:
          """ Filters sensitive information from observation based on observer."""
-         filtered_obs = copy.copy(obs)
+         filtered_obs = copy.copy(obs) # Shallow copy is fine for dataclass
 
-         if obs.drawn_card and obs.acting_player != observer_id:
-              is_replace = isinstance(obs.action, ActionReplace)
-              if is_replace:
-                   filtered_obs.drawn_card = None
+         # Mask drawn card unless observer is the actor OR it was discarded (public)
+         if obs.drawn_card and obs.acting_player == observer_id:
+              pass # Observer drew it, they see it
+         elif obs.drawn_card and isinstance(obs.action, ActionDiscard):
+              pass # Drawn card was discarded, now public (via discard_top_card)
+         elif obs.drawn_card and isinstance(obs.action, ActionReplace):
+              # If observer didn't act, they don't see the card used for replacing
+              if obs.acting_player != observer_id:
+                  filtered_obs.drawn_card = None
+         elif obs.drawn_card:
+             # Default: if observer didn't act and card wasn't discarded/replaced, hide it
+             if obs.acting_player != observer_id:
+                  filtered_obs.drawn_card = None
 
-         if obs.peeked_cards and obs.acting_player != observer_id:
-              is_king_look = isinstance(obs.action, ActionAbilityKingLookSelect)
-              is_peek_other = isinstance(obs.action, ActionAbilityPeekOtherSelect)
 
-              if is_king_look:
-                  filtered_peek = {}
-                  for (p_idx, h_idx), card in obs.peeked_cards.items():
-                      if p_idx == observer_id:
-                           filtered_peek[(p_idx, h_idx)] = card
-                           break
-                  filtered_obs.peeked_cards = filtered_peek if filtered_peek else None
-              elif is_peek_other:
-                   filtered_obs.peeked_cards = None
+         # Mask peeked cards based on observer
+         if obs.peeked_cards:
+              filtered_peek = {}
+              for (p_idx, h_idx), card in obs.peeked_cards.items():
+                   # Observer sees peeks involving themselves or if they were the actor
+                   if p_idx == observer_id or obs.acting_player == observer_id:
+                        filtered_peek[(p_idx, h_idx)] = card
+              filtered_obs.peeked_cards = filtered_peek if filtered_peek else None
+
+         # Snap results log is public knowledge
+         # Hand sizes, discard top, stockpile size, game state flags are public
 
          return filtered_obs
 
     def _create_observation(self, prev_state: Optional[CambiaGameState], action: Optional[GameAction], next_state: CambiaGameState, acting_player: int, snap_results: List[Dict]) -> AgentObservation:
          """ Creates the observation object based on state change (uses next_state). """
+         # Information directly from the state *after* the action
          discard_top = next_state.get_discard_top()
          hand_sizes = [next_state.get_player_card_count(i) for i in range(self.num_players)]
          stock_size = next_state.get_stockpile_size()
@@ -456,40 +494,51 @@ class CFRTrainer:
          game_over = next_state.is_terminal()
          turn_num = next_state.get_turn_number()
 
+         # Information revealed *by* the action or resulting pending state
          drawn_card = None
          peeked_cards_dict = None
 
-         # Info extracted from the state *after* the action was applied
+         # Check pending state *after* action for revealed info
          if next_state.pending_action and next_state.pending_action_player == acting_player:
-              # Check if the pending action is the result of a draw
+              pending_data = next_state.pending_action_data
+              # If pending state resulted from a draw
               if isinstance(next_state.pending_action, ActionDiscard):
-                   drawn_card = next_state.pending_action_data.get("drawn_card")
-              # Check if the pending action is the result of a King Look
+                   drawn_card = pending_data.get("drawn_card")
+              # If pending state resulted from King Look (reveals cards before swap decision)
               elif isinstance(next_state.pending_action, ActionAbilityKingSwapDecision):
-                  data = next_state.pending_action_data
-                  if "own_idx" in data and "opp_idx" in data and "card1" in data and "card2" in data:
+                  if "own_idx" in pending_data and "opp_idx" in pending_data and "card1" in pending_data and "card2" in pending_data:
                       opp_idx = next_state.get_opponent_index(acting_player)
                       peeked_cards_dict = {
-                           (acting_player, data["own_idx"]): data["card1"],
-                           (opp_idx, data["opp_idx"]): data["card2"]
+                           (acting_player, pending_data["own_idx"]): pending_data["card1"],
+                           (opp_idx, pending_data["opp_idx"]): pending_data["card2"]
                       }
 
-         # Check the action itself for completed peeks (that don't lead to pending state)
+         # Check the action itself for reveals (e.g., immediate peeks)
+         # Need to check the hand state *after* the action but *before* potential state changes from recursion
+         # This logic is tricky with mutable state. Assume `next_state` reflects the state immediately after the action.
          if isinstance(action, ActionAbilityPeekOwnSelect):
               if 0 <= action.target_hand_index < next_state.get_player_card_count(acting_player):
-                   peeked_card = next_state.get_player_hand(acting_player)[action.target_hand_index]
-                   peeked_cards_dict = {(acting_player, action.target_hand_index): peeked_card}
+                   # Ensure hand access is safe
+                   hand = next_state.get_player_hand(acting_player)
+                   if hand and 0 <= action.target_hand_index < len(hand):
+                        peeked_card = hand[action.target_hand_index]
+                        peeked_cards_dict = {(acting_player, action.target_hand_index): peeked_card}
          elif isinstance(action, ActionAbilityPeekOtherSelect):
               opp_idx = next_state.get_opponent_index(acting_player)
               if 0 <= action.target_opponent_hand_index < next_state.get_player_card_count(opp_idx):
-                   peeked_card = next_state.get_player_hand(opp_idx)[action.target_opponent_hand_index]
-                   peeked_cards_dict = {(opp_idx, action.target_opponent_hand_index): peeked_card}
+                  opp_hand = next_state.get_player_hand(opp_idx)
+                  if opp_hand and 0 <= action.target_opponent_hand_index < len(opp_hand):
+                       peeked_card = opp_hand[action.target_opponent_hand_index]
+                       peeked_cards_dict = {(opp_idx, action.target_opponent_hand_index): peeked_card}
 
+         # Get snap results from the state *after* the action (apply_action updates this)
+         # If apply_action failed, snap_results might be stale, but pass what we have.
+         final_snap_results = next_state.snap_results_log
 
          obs = AgentObservation(
              acting_player=acting_player, action=action,
              discard_top_card=discard_top, player_hand_sizes=hand_sizes, stockpile_size=stock_size,
-             drawn_card=drawn_card, peeked_cards=peeked_cards_dict, snap_results=snap_results,
+             drawn_card=drawn_card, peeked_cards=peeked_cards_dict, snap_results=final_snap_results,
              did_cambia_get_called=cambia_called, who_called_cambia=who_called,
              is_game_over=game_over, current_turn=turn_num
          )
