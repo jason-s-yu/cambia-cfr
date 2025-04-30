@@ -28,5 +28,5 @@ persistence:
   agent_data_save_path: "cambia_cfr_agent_level1.joblib"
 
 logging:
-  log_level: "INFO"
+  log_level_file: "DEBUG"
   log_file: "cambia_cfr_training.log"

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(config, verbose: bool):
     """Configures logging to console, timestamped file, and latest.log link."""
-    log_level_str = config.logging.log_level.upper()
+    log_level_str = config.logging.log_level_file.upper()
     file_log_level = getattr(logging, log_level_str, logging.INFO)
     # Set console level based on verbose flag
     console_log_level = file_log_level if verbose else logging.ERROR
