@@ -5,8 +5,6 @@ from dataclasses import dataclass, field
 import logging
 import copy
 import numpy as np
-import os
-import sys
 from collections import deque
 
 from .card import Card, create_standard_deck
