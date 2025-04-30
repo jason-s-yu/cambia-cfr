@@ -1,0 +1,32 @@
+# Example config.yaml
+api:
+  base_url: "http://localhost:8080"
+  auth:
+    email: "agent@example.com"
+    password: "password123" # Store securely in practice!
+
+cfr_training:
+  num_iterations: 100000
+  save_interval: 5000
+  pruning_enabled: true
+
+cfr_plus_params:
+  weighted_averaging_enabled: true
+  averaging_delay: 100 # Start weighted averaging after 100 iterations (weight = max(0, t-d))
+
+agent_params:
+  memory_level: 1 # Use Event-Triggered Decay
+  # time_decay_turns: 3 # Only relevant if memory_level were 2
+
+cambia_rules:
+  allowDrawFromDiscardPile: false
+  allowReplaceAbilities: false
+  snapRace: false
+  penaltyDrawCount: 2
+
+persistence:
+  agent_data_save_path: "cambia_cfr_agent_level1.joblib"
+
+logging:
+  log_level: "INFO"
+  log_file: "cambia_cfr_training.log"
