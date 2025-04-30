@@ -2,10 +2,8 @@
 api:
   base_url: "http://localhost:8080"
   auth:
-    # Choose one method: email/password OR token_file
-    email: "agent@example.com"
-    password: "password123"
-    # token_file: "path/to/token.txt"
+    email: "someone@example.com"
+    password: "password"
 
 # System Settings
 system:
