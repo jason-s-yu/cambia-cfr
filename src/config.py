@@ -9,6 +9,10 @@ class ApiConfig:
     auth: Dict[str, str] = field(default_factory=dict) # e.g., {"email": "...", "password": "..."} or {"token_file": "..."}
 
 @dataclass
+class SystemConfig:
+    recursion_limit: int = 1000 # Limit for recursion depth
+
+@dataclass
 class CfrTrainingConfig:
     num_iterations: int = 10000
     save_interval: int = 1000
@@ -36,6 +40,7 @@ class CambiaRulesConfig:
     initial_view_count: int = 2
     cambia_allowed_round: int = 0 # 0 means allowed immediately
     allowOpponentSnapping: bool = False # Default to False
+    max_game_turns: int = 300 # Limit game length in simulation
 
 @dataclass
 class PersistenceConfig:
@@ -51,6 +56,7 @@ class LoggingConfig:
 @dataclass
 class Config:
     api: ApiConfig = field(default_factory=ApiConfig)
+    system: SystemConfig = field(default_factory=SystemConfig)
     cfr_training: CfrTrainingConfig = field(default_factory=CfrTrainingConfig)
     cfr_plus_params: CfrPlusParamsConfig = field(default_factory=CfrPlusParamsConfig)
     agent_params: AgentParamsConfig = field(default_factory=AgentParamsConfig)
@@ -66,20 +72,28 @@ def load_config(config_path: str = "config.yaml") -> Config:
             if config_dict is None: config_dict = {} # Handle empty config file
 
             # Reconstruct nested dataclasses, ensuring all keys are handled
+            system_cfg = config_dict.get('system', {})
             cfr_training_cfg = config_dict.get('cfr_training', {})
             cambia_rules_cfg = config_dict.get('cambia_rules', {})
             logging_cfg = config_dict.get('logging', {})
+            api_cfg = config_dict.get('api', {})
+            cfr_plus_cfg = config_dict.get('cfr_plus_params', {})
+            agent_params_cfg = config_dict.get('agent_params', {})
+            persistence_cfg = config_dict.get('persistence', {})
 
             return Config(
-                api=ApiConfig(**config_dict.get('api', {})),
+                api=ApiConfig(**api_cfg),
+                system=SystemConfig(
+                    recursion_limit=system_cfg.get('recursion_limit', 1000)
+                ),
                 cfr_training=CfrTrainingConfig(
                     num_iterations=cfr_training_cfg.get('num_iterations', 10000),
                     save_interval=cfr_training_cfg.get('save_interval', 1000),
                     pruning_enabled=cfr_training_cfg.get('pruning_enabled', True),
                     pruning_threshold=cfr_training_cfg.get('pruning_threshold', 1e-6)
                 ),
-                cfr_plus_params=CfrPlusParamsConfig(**config_dict.get('cfr_plus_params', {})),
-                agent_params=AgentParamsConfig(**config_dict.get('agent_params', {})),
+                cfr_plus_params=CfrPlusParamsConfig(**cfr_plus_cfg),
+                agent_params=AgentParamsConfig(**agent_params_cfg),
                 cambia_rules=CambiaRulesConfig(
                      allowDrawFromDiscardPile=cambia_rules_cfg.get('allowDrawFromDiscardPile', False),
                      allowReplaceAbilities=cambia_rules_cfg.get('allowReplaceAbilities', False),
@@ -89,12 +103,13 @@ def load_config(config_path: str = "config.yaml") -> Config:
                      cards_per_player=cambia_rules_cfg.get('cards_per_player', 4),
                      initial_view_count=cambia_rules_cfg.get('initial_view_count', 2),
                      cambia_allowed_round=cambia_rules_cfg.get('cambia_allowed_round', 0),
-                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False)
+                     allowOpponentSnapping=cambia_rules_cfg.get('allowOpponentSnapping', False),
+                     max_game_turns=cambia_rules_cfg.get('max_game_turns', 300)
                 ),
-                persistence=PersistenceConfig(**config_dict.get('persistence', {})),
+                persistence=PersistenceConfig(**persistence_cfg),
                 logging=LoggingConfig(
-                     log_level_file=logging_cfg.get('log_level_file', 'DEBUG'), # New key
-                     log_level_console=logging_cfg.get('log_level_console', 'WARNING'), # New key
+                     log_level_file=logging_cfg.get('log_level_file', 'DEBUG'),
+                     log_level_console=logging_cfg.get('log_level_console', 'WARNING'),
                      log_dir=logging_cfg.get('log_dir', 'logs'),
                      log_file_prefix=logging_cfg.get('log_file_prefix', 'cambia')
                 )

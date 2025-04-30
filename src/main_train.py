@@ -50,7 +50,6 @@ def setup_logging(config, verbose: bool):
     # Set root logger level to the lowest level used by handlers
     root_logger.setLevel(min(file_log_level, console_log_level))
 
-    # Remove existing handlers to avoid duplicates if script is re-run
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
@@ -163,6 +162,12 @@ def main():
          config.persistence.agent_data_save_path = args.save_path
          logger.info(f"Overriding save path from command line: {args.save_path}")
 
+    # Set the system recursion limit
+    if config.system.recursion_limit:
+         sys.setrecursionlimit(config.system.recursion_limit)
+         logger.info(f"Recursion limit set to: {config.system.recursion_limit}")
+
+    logger.info(f"Confirm recursion limit: {sys.getrecursionlimit()}")
 
     # Initialize trainer
     try:

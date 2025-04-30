@@ -5,6 +5,9 @@ api:
     email: "agent@example.com"
     password: "password123"
 
+system:
+  recursion_limit: 10000 # Python default is 1000
+
 cfr_training:
   num_iterations: 100000
   save_interval: 5000
@@ -29,6 +32,7 @@ cambia_rules:
   initial_view_count: 2
   cambia_allowed_round: 0
   allowOpponentSnapping: false
+  max_game_turns: 300
 
 persistence:
   agent_data_save_path: "cambia_cfr_agent_level1.joblib"

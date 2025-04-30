@@ -2,13 +2,12 @@
 import numpy as np
 import time
 import logging
-from typing import Callable, Dict, List, Optional, Set, TypeAlias, Tuple # Added Tuple
+from typing import Callable, Dict, List, Optional, TypeAlias
 from collections import defaultdict, deque
 import copy
 import traceback
 
-# Import necessary components from the project
-from .game_engine import CambiaGameState, StateDelta, UndoInfo # Import delta types
+from .game_engine import CambiaGameState, StateDelta, UndoInfo
 from .constants import (
      ActionAbilityKingSwapDecision, GameAction, NUM_PLAYERS,
      ActionPassSnap, ActionSnapOwn, ActionSnapOpponent,
@@ -105,6 +104,7 @@ class CFRTrainer:
             action_log_for_game: List[Dict] = [] # Log actions for this specific game simulation
 
             if not game_state.is_terminal():
+                 # Pass depth 0 for root call
                  initial_obs = self._create_observation(None, None, game_state, -1, []) # Create initial obs from game state
                  for i in range(self.num_players):
                       try:
@@ -134,7 +134,8 @@ class CFRTrainer:
             try:
                  # --- Run CFR Recursion ---
                  # Pass the *mutable* game_state object down the recursion
-                 final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration, action_log_for_game)
+                 # Start depth tracking at 0
+                 final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration, action_log_for_game, depth=0)
 
                  # --- Log Completed Game ---
                  # Use the final state of game_state after recursion completes
@@ -150,6 +151,12 @@ class CFRTrainer:
                 logger.error(f"Recursion depth exceeded on iteration {self.current_iteration}! Saving progress and stopping.")
                 # Log the game state *at the point of the error* if possible (difficult)
                 logger.error(f"State at RecursionError (approx): {game_state}")
+                # Log the last few actions if available
+                if action_log_for_game:
+                    logger.error("Last actions before RecursionError:")
+                    for entry in action_log_for_game[-10:]: # Log last 10 actions
+                        logger.error(f"  Turn {entry.get('turn', '?')} P{entry.get('player','?')} -> {entry.get('action', '?')}")
+
                 logger.error("Traceback:\n%s", traceback.format_exc())
                 self.save_data()
                 raise # Re-raise to stop execution
@@ -181,20 +188,21 @@ class CFRTrainer:
         logger.info("Final average strategy computed.")
 
 
-    def _cfr_recursive(self, game_state: CambiaGameState, agent_states: List[AgentState], reach_probs: np.ndarray, iteration: int, action_log: List[Dict]) -> np.ndarray:
+    def _cfr_recursive(self, game_state: CambiaGameState, agent_states: List[AgentState], reach_probs: np.ndarray, iteration: int, action_log: List[Dict], depth: int) -> np.ndarray:
         """
         Recursive CFR+ function. Operates on the *same* game_state object,
-        applying and undoing actions. Clones agent_states.
+        applying and undoing actions. Clones agent_states. Includes depth tracking.
         """
 
         # --- Base Case: Terminal Node ---
         if game_state.is_terminal():
+            # logger.debug(f"Iter {iteration}, Depth {depth}: Reached terminal state. Utility: {[game_state.get_utility(i) for i in range(self.num_players)]}")
             return np.array([game_state.get_utility(i) for i in range(self.num_players)], dtype=np.float64)
 
         # --- Identify Acting Player ---
         player = game_state.get_acting_player()
         if player == -1:
-             logger.error(f"Could not determine acting player in non-terminal state. State: {game_state}")
+             logger.error(f"Iter {iteration}, Depth {depth}: Could not determine acting player in non-terminal state. State: {game_state}")
              return np.zeros(self.num_players, dtype=np.float64)
 
         current_agent_state = agent_states[player]
@@ -203,50 +211,54 @@ class CFRTrainer:
         # 1. Get Infoset Key
         try:
              if not hasattr(current_agent_state, 'own_hand') or not hasattr(current_agent_state, 'opponent_belief'):
-                  logger.error(f"AgentState for P{player} appears uninitialized before get_infoset_key(). State: {current_agent_state}")
+                  logger.error(f"Iter {iteration}, P{player}, Depth {depth}: AgentState appears uninitialized before get_infoset_key(). State: {current_agent_state}")
                   return np.zeros(self.num_players, dtype=np.float64)
              infoset_key = current_agent_state.get_infoset_key()
         except Exception as e:
-             logger.error(f"Error getting infoset key for P{player}. AgentState: {current_agent_state}. GameState: {game_state}", exc_info=True)
+             logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error getting infoset key. AgentState: {current_agent_state}. GameState: {game_state}", exc_info=True)
              return np.zeros(self.num_players, dtype=np.float64)
 
         # 2. Get Legal Actions
         try:
             legal_actions_set = game_state.get_legal_actions()
-            legal_actions = sorted(list(legal_actions_set), key=repr)
+            legal_actions = sorted(list(legal_actions_set), key=repr) # Keep alphabetical sort for now
         except Exception as e:
-            logger.error(f"Error getting/sorting legal actions for P{player} at state {game_state}. InfosetKey: {infoset_key}", exc_info=True)
+            logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error getting/sorting legal actions at state {game_state}. InfosetKey: {infoset_key}", exc_info=True)
             return np.zeros(self.num_players, dtype=np.float64)
 
         num_actions = len(legal_actions)
         if num_actions == 0:
              # If no actions but not terminal, it's an engine error or requires forcing game end
              if not game_state.is_terminal():
-                  logger.warning(f"No legal actions found for P{player} at infoset {infoset_key} in *non-terminal* state {game_state}. Forcing game end check.")
+                  logger.warning(f"Iter {iteration}, P{player}, Depth {depth}: No legal actions found at infoset {infoset_key} in *non-terminal* state {game_state}. Forcing game end check.")
                   # Create an undo stack just for this check
                   local_undo_stack: deque[Callable[[], None]] = deque()
-                  game_state._check_game_end(local_undo_stack)
+                  local_delta_list: StateDelta = [] # Need dummy delta list
+                  # Apply the check (which modifies state and adds to local_undo_stack)
+                  game_state._check_game_end(local_undo_stack, local_delta_list)
                   # Execute the undo stack for the check to revert any state changes made by it
                   while local_undo_stack:
                        try: local_undo_stack.popleft()()
-                       except Exception as undo_e: logger.error(f"Error undoing _check_game_end: {undo_e}")
+                       except Exception as undo_e: logger.error(f"Iter {iteration}, Depth {depth}: Error undoing _check_game_end: {undo_e}")
 
                   # Now re-check if the state *became* terminal after the check
                   if game_state.is_terminal():
-                       logger.info(f"State confirmed terminal after no-action check for P{player}.")
+                       logger.info(f"Iter {iteration}, P{player}, Depth {depth}: State confirmed terminal after no-action check.")
                        return np.array([game_state.get_utility(i) for i in range(self.num_players)], dtype=np.float64)
                   else:
-                       logger.error(f"State still non-terminal after no-action check for P{player}. Engine/logic error. Returning 0 utility.")
+                       logger.error(f"Iter {iteration}, P{player}, Depth {depth}: State still non-terminal after no-action check. Engine/logic error. Returning 0 utility.")
                        return np.zeros(self.num_players, dtype=np.float64)
              else: # Already terminal, return utility
+                  # logger.debug(f"Iter {iteration}, Depth {depth}: Reached terminal state (no actions). Utility: {[game_state.get_utility(i) for i in range(self.num_players)]}")
                   return np.array([game_state.get_utility(i) for i in range(self.num_players)], dtype=np.float64)
 
 
         # 3. Initialize Infoset Data
         current_regrets = self.regret_sum.get(infoset_key)
         if current_regrets is None or current_regrets.shape[0] != num_actions:
+            # logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Initializing regrets/strategy for infoset {infoset_key} with {num_actions} actions.")
             self.regret_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
-            current_regrets = self.regret_sum[infoset_key]
+            current_regrets = self.regret_sum[infoset_key] # Update reference
 
         current_strategy_sum = self.strategy_sum.get(infoset_key)
         if current_strategy_sum is None or current_strategy_sum.shape[0] != num_actions:
@@ -258,6 +270,8 @@ class CFRTrainer:
 
         # 4. Compute Current Strategy (sigma^t)
         strategy = get_rm_plus_strategy(current_regrets)
+        # if logger.isEnabledFor(logging.DEBUG): logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Regrets={current_regrets}, Strategy={strategy}")
+
 
         # 5. Update Average Strategy Numerator and Denominator
         player_reach = reach_probs[player]
@@ -285,24 +299,30 @@ class CFRTrainer:
         for i, action in enumerate(legal_actions):
             action_prob = strategy[i]
 
-            # --- Regret-Based Pruning ---
+            # --- Log Action Attempt ---
+            logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Processing action {i+1}/{num_actions}: {action} (Prob: {action_prob:.4f})")
+
+            # --- Regret-Based Pruning (Corrected Logic) ---
+            node_positive_regret_sum = np.sum(np.maximum(0.0, current_regrets))
             should_prune = (use_pruning and
                            player_reach > 0 and
-                           current_regrets[i] <= pruning_threshold and
-                           iteration > 10) # Add small delay to pruning
+                           current_regrets[i] <= pruning_threshold and # Action's regret is non-positive
+                           node_positive_regret_sum > pruning_threshold and # But *other* actions have positive regret
+                           iteration > 10) # Warmup period
+
 
             if should_prune:
-                 # If pruned, assume utility is same as node value (no regret update)
-                 # Need node value *without* this action first? Calculate later.
-                 # For now, just assign 0, regret update logic handles it.
+                 logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Pruning action {action}")
                  action_utilities[i] = np.zeros(self.num_players) # Store 0 util for pruned branch
                  continue # Skip simulation for this action
 
-            # Skip actions with negligible probability
-            if action_prob < 1e-9 and not use_pruning: continue # Don't skip if pruning might reconsider
+            # Skip actions with negligible probability unless pruning is active (as pruning might reopen them)
+            if action_prob < 1e-9 and not use_pruning:
+                 logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Skipping action {action} due to low probability.")
+                 continue
 
             action_log_entry = {
-                "player": player, "turn": game_state.get_turn_number(),
+                "player": player, "turn": game_state.get_turn_number(), "depth": depth, # Add depth to log
                 "state_desc_before": str(game_state), # State *before* this specific action
                 "infoset_key": infoset_key,
                 "action": action, "action_prob": action_prob, "reach_prob": player_reach
@@ -321,7 +341,7 @@ class CFRTrainer:
                  state_after_action_desc = str(game_state) # Capture after modification
 
             except Exception as apply_err:
-                 logger.error(f"Error applying action {action} in state {state_before_this_action_str} at infoset {infoset_key} (Iter {iteration}): {apply_err}", exc_info=False) # Log only exception message initially
+                 logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error applying action {action} in state {state_before_this_action_str} at infoset {infoset_key}: {apply_err}", exc_info=False) # Log only exception message initially
                  # Add more detailed traceback if verbose needed
                  if logger.isEnabledFor(logging.DEBUG): logger.exception("Full traceback for apply_action error:")
                  action_utilities[i] = np.zeros(self.num_players)
@@ -354,7 +374,7 @@ class CFRTrainer:
                        player_specific_obs = self._filter_observation(observation, agent_idx)
                        cloned_agent.update(player_specific_obs)
                   except Exception as agent_update_err:
-                       logger.error(f"Error updating AgentState {agent_idx} for P{player} acting with {action}. Infoset: {infoset_key}. Obs: {observation}", exc_info=True)
+                       logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error updating AgentState {agent_idx} for action {action}. Infoset: {infoset_key}. Obs: {observation}", exc_info=True)
                        agent_update_failed = True
                        break # Stop processing agents for this action branch
                   next_agent_states.append(cloned_agent)
@@ -367,25 +387,42 @@ class CFRTrainer:
                 # Attempt to undo the game state change before continuing
                 if undo_info:
                      try: undo_info()
-                     except Exception as undo_e: logger.error(f"Error undoing action after agent update failure: {undo_e}")
+                     except Exception as undo_e: logger.error(f"Iter {iteration}, Depth {depth}: Error undoing action after agent update failure: {undo_e}")
                 continue # Move to the next action
 
             # --- Reach Probability Update ---
             next_reach_probs = reach_probs.copy()
             # Update reach prob using the probability of the action *taken*
-            next_reach_probs[player] *= action_prob
+            # Note: We scale reach by the action probability *regardless* of who is updating.
+            # The regrets are only updated for the current player, but the traversal
+            # always follows the computed strategy profile.
+            next_reach_probs[player] *= action_prob # This seems correct for player p's contribution
+            # Should we scale opponent's reach prob? Typically, pi_{-i}(h) for regret updates.
+            # Let's rethink this: reach_probs[p] = pi_p(h), reach_probs[opp] = pi_opp(h)
+            # Next reach probs for recursion: pi_p(ha) = pi_p(h)*sigma(a), pi_opp(ha) = pi_opp(h)
+            # So only the acting player's reach prob needs scaling by sigma(a).
+            # The regret update uses pi_{-i}(h) = reach_probs[opponent]. This seems correct.
+
 
             # --- Recursive Call (with modified game_state) ---
             try:
-                 # Pass the modified game_state down
+                 logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Recursing ({i+1}/{num_actions}) for action: {action}")
+                 # Pass the modified game_state down, increment depth
                  recursive_utilities = self._cfr_recursive(
-                     game_state, next_agent_states, next_reach_probs, iteration, action_log
+                     game_state, next_agent_states, next_reach_probs, iteration, action_log, depth + 1
                  )
                  action_utilities[i] = recursive_utilities
+                 logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Returned from recursion for {action}. Util: {recursive_utilities}")
 
+            except RecursionError: # Catch RecursionError specifically here
+                  logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Recursion depth exceeded during action: {action}. State: {game_state}", exc_info=False)
+                  action_log_entry["outcome"] = "ERROR: RecursionError"
+                  action_log.append(action_log_entry)
+                  # Re-raise the error to be caught by the main loop
+                  raise
             except Exception as recursive_err:
                   # Simplify error message to avoid recursion in logging
-                  logger.error(f"Error in recursive call for action {type(action).__name__} from P{player} T#{game_state.get_turn_number()}. Infoset: {infoset_key}", exc_info=False)
+                  logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error in recursive call for action {action}. Infoset: {infoset_key}", exc_info=False)
                   if logger.isEnabledFor(logging.DEBUG): logger.exception("Full traceback for recursion error:")
                   action_utilities[i] = np.zeros(self.num_players) # Assign zero utility on error
                   # Log the error in the action sequence
@@ -396,7 +433,7 @@ class CFRTrainer:
                   # Attempt to undo state before continuing
                   if undo_info:
                       try: undo_info()
-                      except Exception as undo_e: logger.error(f"Error undoing action after recursion error: {undo_e}")
+                      except Exception as undo_e: logger.error(f"Iter {iteration}, Depth {depth}: Error undoing action after recursion error: {undo_e}")
                   continue # Move to the next action
 
             # --- Finalize Action Log Entry (Success Case) ---
@@ -408,21 +445,15 @@ class CFRTrainer:
             if undo_info:
                  try:
                       undo_info()
-                      # # Optional: Verification step (can be expensive)
-                      # current_state_str = str(game_state)
-                      # if current_state_str != state_before_this_action_str:
-                      #      logger.error(f"Undo failed verification! Action: {action}")
-                      #      logger.error(f" State Before: {state_before_this_action_str}")
-                      #      logger.error(f" State After Undo: {current_state_str}")
-                      #      # Decide how to handle verification failure (e.g., raise, stop)
                  except Exception as undo_e:
-                      logger.exception(f"FATAL: Error undoing action {action} from state {state_before_this_action_str}. State may be corrupt. Stopping branch.")
+                      logger.exception(f"FATAL: Iter {iteration}, P{player}, Depth {depth}: Error undoing action {action} from state {state_before_this_action_str}. State may be corrupt. Stopping branch.")
                       # Return error utility or raise? Raising might stop training. Return 0 for now.
                       return np.zeros(self.num_players, dtype=np.float64)
             else:
                  # This case should ideally not be reached if apply_action worked
-                 logger.error(f"Missing undo information for successful action {action}. State corrupt.")
+                 logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Missing undo information for successful action {action}. State corrupt.")
                  return np.zeros(self.num_players, dtype=np.float64)
+        # --- End Action Loop ---
 
 
         # --- Calculate Node Value (after exploring all actions/pruning) ---
@@ -439,14 +470,22 @@ class CFRTrainer:
             instantaneous_regret = player_action_values - player_node_value
 
             # Weight regret update by opponent's reach probability (counterfactual value)
-            update_weight = opponent_reach # Already includes traversing player's reach
+            update_weight = opponent_reach # pi_{-i}(h)
 
-            current_regrets = self.regret_sum[infoset_key] # Fetch current regrets for the infoset
+            current_regrets_before_update = np.copy(self.regret_sum[infoset_key]) # Copy for logging
             # Apply Regret Matching+ update: R += weighted_instantaneous_regret, then take max(0, R)
-            self.regret_sum[infoset_key] = np.maximum(0.0, current_regrets + update_weight * instantaneous_regret)
+            self.regret_sum[infoset_key] = np.maximum(0.0, current_regrets_before_update + update_weight * instantaneous_regret)
+
+            # --- Log Regret Update ---
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: NodeVal={player_node_value:.4f}, ActionUtils={player_action_values}, InstRegret={instantaneous_regret}")
+                logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Updating Regrets. OppReach: {opponent_reach:.4f}, Weight: {update_weight:.4f}")
+                logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Regrets Old: {current_regrets_before_update}")
+                logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Regrets New: {self.regret_sum[infoset_key]}")
 
 
         # --- Return Node Value ---
+        logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Returning node value: {node_value}")
         return node_value
 
 
