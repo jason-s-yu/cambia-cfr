@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import load_config
-from .cfr_trainer import CFRTrainer
+from .cfr_trainer import CFRTrainer, GracefulShutdownException
 
 # Global logger instance (initialized after setup)
 logger = logging.getLogger(__name__)
@@ -24,12 +24,17 @@ shutdown_event = threading.Event()
 def handle_sigint(sig, frame):
     """Signal handler for SIGINT (Ctrl+C)."""
     if not shutdown_event.is_set():
-        logger.warning("SIGINT received. Requesting graceful shutdown...")
+        # Do not call logger here: unsafe in signal handler context
+        # logger.warning("SIGINT received. Requesting graceful shutdown...")
+        print("\nSIGINT received. Requesting graceful shutdown...", file=sys.stderr)
         shutdown_event.set()
         # Optional: Restore default handler if needed, though re-raising KeyboardInterrupt is cleaner
         # signal.signal(signal.SIGINT, signal.SIG_DFL)
     else:
-        logger.warning("Multiple SIGINT received. Shutdown already in progress.")
+        # logger.warning("Multiple SIGINT received. Shutdown already in progress.")
+        print(
+            "\nMultiple SIGINT received. Shutdown already in progress.", file=sys.stderr
+        )
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -292,6 +297,9 @@ def main():
         logger.warning("Training interrupted by user (Ctrl+C) or shutdown event.")
         logger.info("Exiting program.")
         # No need to save here, trainer saves *before* raising KeyboardInterrupt
+    except GracefulShutdownException:
+        # This should ideally be caught inside the trainer's loop now
+        logger.error("GracefulShutdownException propagated unexpectedly to main.")
     except Exception:
         logger.exception("An unexpected error occurred during training:")
         logger.info("Attempting to save final progress before exiting due to error...")
