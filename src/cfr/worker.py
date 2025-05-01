@@ -6,8 +6,9 @@ Based on External Sampling Monte Carlo CFR.
 
 import copy
 import logging
+import sys
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypeAlias
 
 import numpy as np
 
@@ -32,7 +33,7 @@ from ..game.engine import CambiaGameState
 from ..game.types import StateDelta, UndoInfo
 from ..utils import (
     InfosetKey,
-    PolicyDict,
+    # PolicyDict, # No longer directly needed as snapshot is dict
     get_rm_plus_strategy,
     LocalRegretUpdateDict,
     LocalStrategyUpdateDict,
@@ -40,7 +41,11 @@ from ..utils import (
     WorkerResult,
 )
 
+# Logger setup will happen inside run_cfr_simulation_worker
 logger = logging.getLogger(__name__)
+
+# Type alias for the snapshot (regular dict)
+RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 
 
 # Placeholder for the recursive traversal function, to be defined below
@@ -51,7 +56,7 @@ def _traverse_game_for_worker(
     iteration: int,
     updating_player: int,
     weight: float,
-    regret_sum_snapshot: PolicyDict,  # Pass snapshot of global regrets
+    regret_sum_snapshot: RegretSnapshotDict,  # Snapshot is now a regular dict
     config: Config,  # Pass config for rules etc.
     # --- Local Accumulators ---
     local_regret_updates: LocalRegretUpdateDict,
@@ -98,7 +103,11 @@ def _traverse_game_for_worker(
             current_context = DecisionContext.SNAP_MOVE
         else:
             # Log locally if needed, main process handles global logging
-            # logger.warning(...)
+            logger.warning(
+                "Worker: Unknown pending action type (%s) when determining context.",
+                type(pending).__name__,
+                exc_info=True,
+            )
             current_context = DecisionContext.START_TURN
     else:
         current_context = DecisionContext.START_TURN
@@ -106,7 +115,7 @@ def _traverse_game_for_worker(
     # --- Get Acting Player and Infoset ---
     player = game_state.get_acting_player()
     if player == -1:
-        # logger.error(...) # Local log?
+        logger.error("Worker: Could not determine acting player at depth %d.", depth)
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
     current_agent_state = agent_states[player]
     opponent = 1 - player
@@ -114,12 +123,22 @@ def _traverse_game_for_worker(
         if not hasattr(current_agent_state, "own_hand") or not hasattr(
             current_agent_state, "opponent_belief"
         ):
-            # logger.error(...)
+            logger.error(
+                "Worker: Agent state P%d invalid for key generation at depth %d.",
+                player,
+                depth,
+            )
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         base_infoset_tuple = current_agent_state.get_infoset_key()
         infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
     except Exception as e_key:
-        # logger.exception(...)
+        logger.error(
+            "Worker: Error getting infoset key for P%d at depth %d: %s",
+            player,
+            depth,
+            e_key,
+            exc_info=True,
+        )
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     # --- Get Legal Actions ---
@@ -127,7 +146,13 @@ def _traverse_game_for_worker(
         legal_actions_set = game_state.get_legal_actions()
         legal_actions = sorted(list(legal_actions_set), key=repr)
     except Exception as e_legal:
-        # logger.exception(...)
+        logger.error(
+            "Worker: Error getting legal actions for P%d at depth %d: %s",
+            player,
+            depth,
+            e_legal,
+            exc_info=True,
+        )
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
     num_actions = len(legal_actions)
 
@@ -136,6 +161,11 @@ def _traverse_game_for_worker(
         # logger.warning(...)
         # No need to force end check here, just return 0 utility if state isn't terminal
         if not game_state.is_terminal():
+            logger.warning(
+                "Worker: No legal actions for P%d at depth %d, non-terminal state.",
+                player,
+                depth,
+            )
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         else:
             return np.array(
@@ -144,10 +174,17 @@ def _traverse_game_for_worker(
             )
 
     # --- Get Current Strategy from Regret Snapshot ---
-    # Note: In External Sampling, the strategy used for traversal is fixed for the iteration.
-    # We use the strategy derived from the *snapshot* of regrets passed to the worker.
-    current_regrets = regret_sum_snapshot.get(infoset_key)
+    # Snapshot is now a dict, use .get() with a default value (None).
+    current_regrets: Optional[np.ndarray] = regret_sum_snapshot.get(infoset_key)
+
     if current_regrets is None or len(current_regrets) != num_actions:
+        if current_regrets is not None:  # Log dimension mismatch
+            logger.warning(
+                "Worker: Regret dim mismatch for key %s. Snapshot: %d, Need: %d. Using uniform.",
+                infoset_key,
+                len(current_regrets),
+                num_actions,
+            )
         # If infoset is new or mismatched in snapshot, use uniform strategy for traversal
         strategy = np.ones(num_actions) / num_actions if num_actions > 0 else np.array([])
         # Initialize local updates arrays if needed, assuming they might be needed later
@@ -174,11 +211,32 @@ def _traverse_game_for_worker(
             infoset_key not in local_strategy_sum_updates
             or len(local_strategy_sum_updates[infoset_key]) != num_actions
         ):
+            # Re-initialize if dimensions changed between reading snapshot and accumulating here
+            if (
+                infoset_key in local_strategy_sum_updates
+                and len(local_strategy_sum_updates[infoset_key]) != num_actions
+            ):
+                logger.warning(
+                    "Worker: StratSum dim mismatch for key %s during accumulation. Have: %d, Need: %d. Re-initializing.",
+                    infoset_key,
+                    len(local_strategy_sum_updates[infoset_key]),
+                    num_actions,
+                )
             local_strategy_sum_updates[infoset_key] = np.zeros(
                 num_actions, dtype=np.float64
             )
 
-        local_strategy_sum_updates[infoset_key] += weight * player_reach * strategy
+        # Ensure strategy has the same length (should match num_actions)
+        if len(strategy) == num_actions:
+            local_strategy_sum_updates[infoset_key] += weight * player_reach * strategy
+        else:
+            logger.error(
+                "Worker: Strategy length (%d) mismatch with num_actions (%d) for key %s. Skipping strategy update.",
+                len(strategy),
+                num_actions,
+                infoset_key,
+            )
+
         local_reach_prob_updates[infoset_key] += weight * player_reach
 
     # --- Iterate Through Actions ---
@@ -186,6 +244,13 @@ def _traverse_game_for_worker(
     node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     for i, action in enumerate(legal_actions):
+        if i >= len(strategy):  # Safety check if strategy length somehow mismatched
+            logger.error(
+                "Worker: Action index %d out of bounds for strategy length %d. Breaking loop.",
+                i,
+                len(strategy),
+            )
+            break
         action_prob = strategy[i]
         if action_prob < 1e-9:  # Skip negligible probability branches
             continue
@@ -202,7 +267,14 @@ def _traverse_game_for_worker(
                 drawn_card_this_step = game_state.pending_action_data["drawn_card"]
             state_delta, undo_info = game_state.apply_action(action)
         except Exception as apply_err:
-            # logger.exception(...) # Local log?
+            logger.error(
+                "Worker: Error applying action %s for P%d at depth %d: %s",
+                action,
+                player,
+                depth,
+                apply_err,
+                exc_info=True,
+            )
             # In worker, error applying action should likely stop this simulation branch
             continue  # Skip to next action
 
@@ -227,28 +299,50 @@ def _traverse_game_for_worker(
                 player_specific_obs = _filter_observation(observation, agent_idx)
                 cloned_agent.update(player_specific_obs)
             except Exception as e_update:
-                # logger.exception(...)
+                logger.error(
+                    "Worker: Error updating agent state %d after action %s at depth %d: %s",
+                    agent_idx,
+                    action,
+                    depth,
+                    e_update,
+                    exc_info=True,
+                )
                 agent_update_failed = True
                 break
             next_agent_states.append(cloned_agent)
 
         if agent_update_failed:
             if undo_info:
-                undo_info()
+                try:
+                    undo_info()
+                except Exception as undo_e:
+                    logger.error(
+                        "Worker: Error undoing action after agent update failure: %s",
+                        undo_e,
+                        exc_info=True,
+                    )
             continue  # Skip to next action
 
         # Calculate next reach probabilities
         next_reach_probs = reach_probs.copy()
-        next_reach_probs[
+        # The player acting used their reach probability *weighted by the action prob*
+        # The opponent's reach remains the same for this step down.
+        # CFR reach prob calculation: pi(h) = product of player probabilities along path h
+        # pi(ha) = pi(h) * sigma(I(h), a)
+        # For ESMCFR, we need reach for both players to correctly weight regret.
+        # Reach_probs passed down should represent pi_i(h) and pi_-i(h)
+        # Let's adjust reach prob calculation based on standard CFR update:
+        temp_reach_probs = reach_probs.copy()
+        temp_reach_probs[
             player
-        ] *= action_prob  # Correct update based on player taking the action
+        ] *= action_prob  # Update reach for the acting player based on action taken
 
         # Recursive call
         try:
             recursive_utilities = _traverse_game_for_worker(
                 game_state,
                 next_agent_states,
-                next_reach_probs,
+                temp_reach_probs,  # Pass the updated reach probs
                 iteration,
                 updating_player,
                 weight,
@@ -261,7 +355,13 @@ def _traverse_game_for_worker(
             )
             action_utilities[i] = recursive_utilities
         except Exception as recursive_err:
-            # logger.exception(...)
+            logger.error(
+                "Worker: Error in recursive call after action %s at depth %d: %s",
+                action,
+                depth,
+                recursive_err,
+                exc_info=True,
+            )
             action_utilities[i] = np.zeros(
                 NUM_PLAYERS, dtype=np.float64
             )  # Assign 0 utility on error
@@ -271,11 +371,21 @@ def _traverse_game_for_worker(
             try:
                 undo_info()
             except Exception as undo_e:
-                # logger.exception(...)
+                logger.error(
+                    "Worker: Error undoing action %s at depth %d: %s. State may be corrupt.",
+                    action,
+                    depth,
+                    undo_e,
+                    exc_info=True,
+                )
                 # If undo fails, the state is corrupt for this worker, probably stop
                 return np.zeros(NUM_PLAYERS, dtype=np.float64)
         else:
-            # logger.error(...)
+            logger.error(
+                "Worker: Missing undo info for action %s at depth %d. State corrupt.",
+                action,
+                depth,
+            )
             return np.zeros(NUM_PLAYERS, dtype=np.float64)  # State corrupt
 
     # --- Calculate Node Value & Accumulate Regret Update ---
@@ -283,11 +393,21 @@ def _traverse_game_for_worker(
 
     # Accumulate regret update (if current node belongs to updating_player)
     if player == updating_player:
-        # Ensure local regret array is initialized
+        # Ensure local regret array is initialized and has correct size
         if (
             infoset_key not in local_regret_updates
             or len(local_regret_updates[infoset_key]) != num_actions
         ):
+            if (
+                infoset_key in local_regret_updates
+                and len(local_regret_updates[infoset_key]) != num_actions
+            ):
+                logger.warning(
+                    "Worker: Regret dim mismatch for key %s during accumulation. Have: %d, Need: %d. Re-initializing.",
+                    infoset_key,
+                    len(local_regret_updates[infoset_key]),
+                    num_actions,
+                )
             local_regret_updates[infoset_key] = np.zeros(num_actions, dtype=np.float64)
 
         player_action_values = action_utilities[:, player]
@@ -297,29 +417,64 @@ def _traverse_game_for_worker(
         # Weight regret update by opponent's reach probability
         # NOTE: In External Sampling, we weight by the reach prob of the SAMPLER,
         # which corresponds to the reach prob of players *not* being updated.
-        # Here, `opponent_reach` is the reach prob of the player whose decision wasn't sampled.
+        # Here, `opponent_reach` is the reach prob pi_-i(h) passed down.
         update_weight = opponent_reach  # Correct for ESMCFR
         local_regret_updates[infoset_key] += update_weight * instantaneous_regret
 
     return node_value
 
 
+def _setup_worker_logging(log_level: int, worker_id: int):
+    """Configures basic logging for a worker process."""
+    # Use a unique format for worker logs
+    log_format = (
+        f"[Worker {worker_id}] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    formatter = logging.Formatter(log_format)
+
+    # Get the root logger
+    worker_logger = logging.getLogger()
+
+    # Remove any handlers potentially inherited? (Shouldn't happen with multiprocessing)
+    for handler in worker_logger.handlers[:]:
+        worker_logger.removeHandler(handler)
+
+    # Add a StreamHandler to stderr
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setLevel(log_level)
+    stream_handler.setFormatter(formatter)
+    worker_logger.addHandler(stream_handler)
+
+    # Set the logger level
+    worker_logger.setLevel(log_level)
+    # Optionally suppress logs from libraries within worker if needed
+    # logging.getLogger("some_library").setLevel(logging.WARNING)
+
+
 def run_cfr_simulation_worker(
-    worker_args: Tuple[int, Config, PolicyDict],
+    worker_args: Tuple[
+        int, Config, RegretSnapshotDict, int, int
+    ],  # Added log_level, worker_id
 ) -> Optional[WorkerResult]:
     """
     Top-level function executed by each worker process.
     Initializes game state, agent states, and runs one simulation traversal.
 
     Args:
-        worker_args: A tuple containing (iteration, config, regret_sum_snapshot).
+        worker_args: A tuple containing (iteration, config, regret_sum_snapshot, log_level, worker_id).
 
     Returns:
         A WorkerResult tuple containing the locally accumulated update dictionaries,
         or None if the simulation failed critically.
     """
-    iteration, config, regret_sum_snapshot = worker_args
+    iteration, config, regret_sum_snapshot, log_level, worker_id = worker_args
+
+    # --- Setup Logging for this worker ---
+    _setup_worker_logging(log_level, worker_id)
+
     try:
+        logger.debug("Worker %d starting iteration %d.", worker_id, iteration)
+
         # --- Initialize Game and Agent States ---
         game_state = CambiaGameState(house_rules=config.cambia_rules)
         initial_agent_states = []
@@ -347,11 +502,11 @@ def run_cfr_simulation_worker(
                 )
                 initial_agent_states.append(agent)
         else:
-            logger.error("Worker (Iter %d): Game terminal at init.", iteration)
+            logger.error("Game terminal at init.")
             return None  # Critical failure
 
         if not initial_agent_states:
-            logger.error("Worker (Iter %d): Failed init agent states.", iteration)
+            logger.error("Failed init agent states.")
             return None  # Critical failure
 
         # --- Determine Updating Player & Iteration Weight ---
@@ -393,6 +548,8 @@ def run_cfr_simulation_worker(
 
         # Return the accumulated local updates
         # Convert defaultdicts back to regular dicts for pickling consistency if needed
+        # (Defaultdicts are generally pickleable, but explicit conversion is safer)
+        logger.debug("Worker %d finished iteration %d.", worker_id, iteration)
         return (
             dict(local_regret_updates),
             dict(local_strategy_sum_updates),
@@ -401,8 +558,9 @@ def run_cfr_simulation_worker(
 
     except Exception as e:
         # Log the exception traceback from within the worker
+        # Logger is configured now
         logger.error(
-            "Error in worker process during iteration %d:", iteration, exc_info=True
+            "Error in worker process during iteration %d: %s", iteration, e, exc_info=True
         )
         # Optionally return None or re-raise to signal failure to the main process
         return None

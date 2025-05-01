@@ -3,18 +3,25 @@
 
 import logging
 import sys
+import threading
 import time
-import copy  # For deep copying regret snapshot
+import copy
 import multiprocessing
 from typing import Any, Callable, Optional, List, Tuple
+import traceback
 
 from tqdm import tqdm
 
+from ..analysis_tools import AnalysisTools
+
 # Ensure relative imports work correctly
-from ..utils import WorkerResult, PolicyDict  # Import WorkerResult and PolicyDict
-from ..config import Config  # Import Config for type`` hinting
+from ..utils import (
+    WorkerResult,
+    PolicyDict,
+)  # Import WorkerResult and PolicyDict
+from ..config import Config
 from .exceptions import GracefulShutdownException
-from .worker import run_cfr_simulation_worker  # Import the worker function
+from .worker import run_cfr_simulation_worker
 
 
 logger = logging.getLogger(__name__)
@@ -51,7 +58,7 @@ class CFRTrainingLoopMixin:
         exploitability_interval = self.config.cfr_training.exploitability_interval
 
         # Determine number of workers based on parsed config value
-        num_workers = self.config.parsed_num_workers
+        num_workers = self.config.cfr_training.num_workers
         logger.info("Using %d worker process(es) for training.", num_workers)
 
         if total_iterations_to_run <= 0:
@@ -79,6 +86,10 @@ class CFRTrainingLoopMixin:
             leave=False,
         )
 
+        # Determine worker log level (use file level for potentially more detail)
+        worker_log_level_str = self.config.logging.log_level_file.upper()
+        worker_log_level = getattr(logging, worker_log_level_str, logging.DEBUG)
+
         try:
             # 't' is the iteration number currently being executed
             for t in progress_bar:
@@ -98,19 +109,29 @@ class CFRTrainingLoopMixin:
 
                 # --- Prepare for Simulation(s) ---
                 # Create a snapshot of regrets for workers to use for strategy calculation
-                # Deep copy to avoid race conditions if shared memory isn't used
+                # Convert to a regular dict to ensure pickleability (defaultdict lambda fails)
                 try:
-                    regret_snapshot = copy.deepcopy(self.regret_sum)
+                    # Deepcopy first to ensure we don't modify the main dict during conversion
+                    regret_sum_copy = copy.deepcopy(self.regret_sum)
+                    regret_snapshot = dict(regret_sum_copy)
+                    # Ensure keys are InfosetKey instances within the snapshot
+                    # (May not be strictly necessary if load_data already ensures this, but safer)
+                    # regret_snapshot = {
+                    #     (InfosetKey(*k) if isinstance(k, tuple) else k): v
+                    #     for k, v in regret_snapshot.items()
+                    # }
                 except Exception as e:
-                    logger.error("Failed to deepcopy regret_sum: %s", e, exc_info=True)
-                    # Decide how to handle: maybe try shallow copy or fail?
-                    # For now, let's try to proceed cautiously with a reference (risky)
-                    logger.warning(
-                        "Proceeding with shallow copy of regret_sum due to deepcopy error."
+                    logger.error(
+                        "Failed to deepcopy and convert regret_sum to dict: %s",
+                        e,
+                        exc_info=True,
                     )
-                    regret_snapshot = self.regret_sum  # Risky fallback
+                    # Fallback might be risky, let's halt if conversion fails.
+                    raise RuntimeError(
+                        f"Could not prepare regret snapshot for iteration {t}"
+                    ) from e
 
-                worker_args = (t, self.config, regret_snapshot)
+                worker_base_args = (t, self.config, regret_snapshot, worker_log_level)
                 results: List[Optional[WorkerResult]] = []
                 sim_failed = False
 
@@ -118,8 +139,9 @@ class CFRTrainingLoopMixin:
                 if num_workers == 1:
                     # Sequential execution
                     try:
-                        # status_bar update removed from worker, update here?
                         progress_bar.set_postfix_str("Running sim...", refresh=False)
+                        # Add worker_id = 0 for sequential
+                        worker_args = worker_base_args + (0,)
                         result = run_cfr_simulation_worker(worker_args)
                         results = [result]
                         if result is None:
@@ -134,15 +156,19 @@ class CFRTrainingLoopMixin:
                         sim_failed = True
                 else:
                     # Parallel execution
+                    # Create list of arguments, adding worker_id to each
                     worker_args_list = [
-                        worker_args
-                    ] * num_workers  # Pass same args to all workers
+                        worker_base_args + (worker_id,)
+                        for worker_id in range(num_workers)
+                    ]
                     try:
                         progress_bar.set_postfix_str(
                             f"Running {num_workers} sims...", refresh=False
                         )
                         # Use context manager for the pool
                         with multiprocessing.Pool(processes=num_workers) as pool:
+                            # Using starmap might be slightly cleaner if args tuple gets complex
+                            # results = pool.starmap(run_cfr_simulation_worker, worker_args_list)
                             results = pool.map(
                                 run_cfr_simulation_worker, worker_args_list
                             )
@@ -161,10 +187,16 @@ class CFRTrainingLoopMixin:
                             if not results:  # All workers failed
                                 sim_failed = True
                     except Exception as e:
-                        logger.exception(
-                            "Error during parallel simulation pool execution on iteration %d.",
+                        # Log the full traceback from the pool error
+                        # logger.exception(...) doesn't capture the remote traceback well
+                        logger.error(
+                            "Error during parallel simulation pool execution on iteration %d: %s",
                             t,
+                            e,
                         )
+                        # Attempt to log the underlying traceback if available (e.g., from Pool.map)
+                        # This might still show the pickling error locally
+                        logger.error(traceback.format_exc())
                         sim_failed = True
 
                 if sim_failed:
