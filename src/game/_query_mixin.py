@@ -111,7 +111,8 @@ class QueryMixin:
                     return potential_snapper
                 else:
                     logger.error(
-                        "Snap phase acting player index %d invalid or missing hand.", potential_snapper
+                        "Snap phase acting player index %d invalid or missing hand.",
+                        potential_snapper,
                     )
                     return -1  # Indicates an error state
             else:
@@ -127,7 +128,8 @@ class QueryMixin:
                 return pending_player
             else:
                 logger.error(
-                    "Pending action player index %d invalid or missing hand.", pending_player
+                    "Pending action player index %d invalid or missing hand.",
+                    pending_player,
                 )
                 return -1  # Indicates an error state
         elif not self._game_over:
@@ -139,7 +141,8 @@ class QueryMixin:
                 return current_player
             else:
                 logger.error(
-                    "Current player index %d invalid or missing hand in active game.", current_player
+                    "Current player index %d invalid or missing hand in active game.",
+                    current_player,
                 )
                 return -1  # Indicates an error state
         else:

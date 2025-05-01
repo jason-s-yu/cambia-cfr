@@ -51,7 +51,9 @@ class AbilityMixin:
 
         if acting_player != self.pending_action_player:
             logger.error(
-                "Legal actions requested for P%d but pending action is for P%d", acting_player, self.pending_action_player
+                "Legal actions requested for P%d but pending action is for P%d",
+                acting_player,
+                self.pending_action_player,
             )
             return legal_actions  # Wrong player
 
@@ -61,7 +63,8 @@ class AbilityMixin:
             and hasattr(self.players[acting_player], "hand")
         ):
             logger.error(
-                "Pending action legal actions: Acting player P%d invalid or missing hand.", acting_player
+                "Pending action legal actions: Acting player P%d invalid or missing hand.",
+                acting_player,
             )
             return legal_actions
 
@@ -158,7 +161,8 @@ class AbilityMixin:
 
         else:
             logger.error(
-                "Unknown pending action type (%s) encountered for legal actions.", action_type
+                "Unknown pending action type (%s) encountered for legal actions.",
+                action_type,
             )
 
         return legal_actions
@@ -183,7 +187,10 @@ class AbilityMixin:
             return None
         if acting_player != self.pending_action_player:
             logger.error(
-                "Action %s received from P%d but pending action is for P%d", action, acting_player, self.pending_action_player
+                "Action %s received from P%d but pending action is for P%d",
+                action,
+                acting_player,
+                self.pending_action_player,
             )
             return None  # Action ignored
 
@@ -208,7 +215,10 @@ class AbilityMixin:
                 action, ActionDiscard
             ):  # Player chose to discard the drawn card
                 logger.debug(
-                    "Player %s discards drawn %s. Use ability: %s", player, drawn_card, action.use_ability
+                    "Player %s discards drawn %s. Use ability: %s",
+                    player,
+                    drawn_card,
+                    action.use_ability,
                 )
                 # --- State Change: Add drawn card to discard ---
                 original_discard_len = len(self.discard_pile)
@@ -252,7 +262,11 @@ class AbilityMixin:
                 if 0 <= target_idx < len(hand):
                     replaced_card = hand[target_idx]  # The card currently in hand
                     logger.debug(
-                        "Player %d replaces card at index %d (%s) with drawn %s.", player, target_idx, replaced_card, drawn_card
+                        "Player %d replaces card at index %d (%s) with drawn %s.",
+                        player,
+                        target_idx,
+                        replaced_card,
+                        drawn_card,
                     )
                     # --- State Change: Swap card in hand, discard old one ---
                     original_card_in_hand = hand[
@@ -273,7 +287,9 @@ class AbilityMixin:
                             popped_discard
                         ) != serialize_card(replaced_card):
                             logger.error(
-                                "Undo Replace Mismatch: Popped %s, expected %s", popped_discard, replaced_card
+                                "Undo Replace Mismatch: Popped %s, expected %s",
+                                popped_discard,
+                                replaced_card,
                             )
 
                     delta_replace = (
@@ -299,7 +315,9 @@ class AbilityMixin:
                     )  # Clear the draw/replace pending state
                 else:
                     logger.error(
-                        "Invalid REPLACE action index: %d for hand size %d", target_idx, len(hand)
+                        "Invalid REPLACE action index: %d for hand size %d",
+                        target_idx,
+                        len(hand),
                     )
                     # Don't clear pending state? Or clear and penalize? Let's clear and log.
                     self._clear_pending_action(undo_stack, delta_list)
@@ -307,7 +325,8 @@ class AbilityMixin:
 
             else:  # Received action doesn't match expected Discard/Replace
                 logger.warning(
-                    "Received action %s while expecting post-draw Discard/Replace.", action
+                    "Received action %s while expecting post-draw Discard/Replace.",
+                    action,
                 )
                 return None  # Invalid action for this state
 
@@ -323,11 +342,16 @@ class AbilityMixin:
                 if isinstance(peeked_card, Card):
                     peeked_card_str = serialize_card(peeked_card)
                     logger.info(
-                        "P%d uses 7/8 ability, peeks own card %d: %s", player, target_idx, peeked_card_str
+                        "P%d uses 7/8 ability, peeks own card %d: %s",
+                        player,
+                        target_idx,
+                        peeked_card_str,
                     )
                 else:
                     logger.error(
-                        "Peek Own Error: Item at index %d is not Card: %s", target_idx, peeked_card
+                        "Peek Own Error: Item at index %d is not Card: %s",
+                        target_idx,
+                        peeked_card,
                     )
             else:
                 logger.error(
@@ -359,15 +383,22 @@ class AbilityMixin:
                     if isinstance(peeked_card, Card):
                         peeked_card_str = serialize_card(peeked_card)
                         logger.info(
-                            "P%d uses 9/T ability, peeks opponent card %d: %s", player, target_opp_idx, peeked_card_str
+                            "P%d uses 9/T ability, peeks opponent card %d: %s",
+                            player,
+                            target_opp_idx,
+                            peeked_card_str,
                         )
                     else:
                         logger.error(
-                            "Peek Other Error: Item at opponent index %d is not Card: %s", target_opp_idx, peeked_card
+                            "Peek Other Error: Item at opponent index %d is not Card: %s",
+                            target_opp_idx,
+                            peeked_card,
                         )
                 else:
                     logger.error(
-                        "Invalid PEEK_OTHER index %d for opponent hand size %d", target_opp_idx, len(opp_hand)
+                        "Invalid PEEK_OTHER index %d for opponent hand size %d",
+                        target_opp_idx,
+                        len(opp_hand),
                     )
             else:
                 logger.error(
@@ -428,16 +459,27 @@ class AbilityMixin:
                         )
                         # --- End State Change ---
                         logger.info(
-                            "P%d uses J/Q ability, blind swaps own %d (%s) with opp %d (%s).", player, own_h_idx, original_own_card, opp_h_idx, original_opp_card
+                            "P%d uses J/Q ability, blind swaps own %d (%s) with opp %d (%s).",
+                            player,
+                            own_h_idx,
+                            original_own_card,
+                            opp_h_idx,
+                            original_opp_card,
                         )
                         # valid_swap = True
                     else:
                         logger.error(
-                            "Blind Swap Error: Cards involved are not valid Card objects (%s, %s)", original_own_card, original_opp_card
+                            "Blind Swap Error: Cards involved are not valid Card objects (%s, %s)",
+                            original_own_card,
+                            original_opp_card,
                         )
                 else:
                     logger.error(
-                        "Invalid BLIND_SWAP indices: own %d (max %d), opp %d (max %d)", own_h_idx, len(hand)-1, opp_h_idx, len(opp_hand)-1
+                        "Invalid BLIND_SWAP indices: own %d (max %d), opp %d (max %d)",
+                        own_h_idx,
+                        len(hand) - 1,
+                        opp_h_idx,
+                        len(opp_hand) - 1,
                     )
             else:
                 logger.error(
@@ -472,16 +514,27 @@ class AbilityMixin:
                             card2
                         )
                         logger.info(
-                            "P%d uses K ability, looks at own %d (%s) and opp %d (%s). Waiting for swap decision.", player, own_h_idx, card1_str, opp_h_idx, card2_str
+                            "P%d uses K ability, looks at own %d (%s) and opp %d (%s). Waiting for swap decision.",
+                            player,
+                            own_h_idx,
+                            card1_str,
+                            opp_h_idx,
+                            card2_str,
                         )
                         can_proceed = True
                     else:
                         logger.error(
-                            "King Look Error: Cards involved are not valid Card objects (%s, %s)", card1, card2
+                            "King Look Error: Cards involved are not valid Card objects (%s, %s)",
+                            card1,
+                            card2,
                         )
                 else:
                     logger.error(
-                        "Invalid KING_LOOK indices: own %d (max %d), opp %d (max %d)", own_h_idx, len(hand)-1, opp_h_idx, len(opp_hand)-1
+                        "Invalid KING_LOOK indices: own %d (max %d), opp %d (max %d)",
+                        own_h_idx,
+                        len(hand) - 1,
+                        opp_h_idx,
+                        len(opp_hand) - 1,
                     )
             else:
                 logger.error(
@@ -609,7 +662,12 @@ class AbilityMixin:
                             )
                             # --- End State Change ---
                             logger.info(
-                                "P%d King ability: Swapped own %d (%s) with opp %d (%s).", player, own_h_idx, card1, opp_h_idx, card2
+                                "P%d King ability: Swapped own %d (%s) with opp %d (%s).",
+                                player,
+                                own_h_idx,
+                                card1,
+                                opp_h_idx,
+                                card2,
                             )
                         else:
                             logger.info(
@@ -660,7 +718,9 @@ class AbilityMixin:
             # Verify action matches the required target slot
             if action.target_empty_slot_index != target_slot_idx:
                 logger.error(
-                    "Snap Opponent Move Error: Action target slot (%d) does not match pending data target (%d).", action.target_empty_slot_index, target_slot_idx
+                    "Snap Opponent Move Error: Action target slot (%d) does not match pending data target (%d).",
+                    action.target_empty_slot_index,
+                    target_slot_idx,
                 )
                 # Do not clear pending action - player needs to submit correct action.
                 return None  # Invalid action
@@ -703,7 +763,11 @@ class AbilityMixin:
                         )
                         # --- End State Change ---
                         logger.info(
-                            "P%d completes Snap Opponent: Moves %s (from own idx %d) to opp idx %d.", snapper_idx, card_to_move, own_card_idx, target_slot_idx
+                            "P%d completes Snap Opponent: Moves %s (from own idx %d) to opp idx %d.",
+                            snapper_idx,
+                            card_to_move,
+                            own_card_idx,
+                            target_slot_idx,
                         )
                         self._clear_pending_action(undo_stack, delta_list)
                         # Turn advances *after* this move is complete (handled in main apply_action loop)
@@ -712,11 +776,15 @@ class AbilityMixin:
                         return None  # No card discarded *now*
                     else:
                         logger.error(
-                            "Invalid target slot index %d for SnapOpponentMove (Opp Hand Size: %d). Should not happen.", target_slot_idx, len(opp_hand)
+                            "Invalid target slot index %d for SnapOpponentMove (Opp Hand Size: %d). Should not happen.",
+                            target_slot_idx,
+                            len(opp_hand),
                         )
                 else:
                     logger.error(
-                        "Invalid own card index %d for SnapOpponentMove (Own Hand Size: %d).", own_card_idx, len(hand)
+                        "Invalid own card index %d for SnapOpponentMove (Own Hand Size: %d).",
+                        own_card_idx,
+                        len(hand),
                     )
             else:
                 logger.error("Snap Opponent Move Error: Opponent %d invalid.", opp_idx)
@@ -728,7 +796,9 @@ class AbilityMixin:
 
         else:  # Mismatch between pending state and action received
             logger.warning(
-                "Unhandled pending action (%s) vs received action (%s)", pending_type, action
+                "Unhandled pending action (%s) vs received action (%s)",
+                pending_type,
+                action,
             )
             # Should we clear pending state? Probably safest to avoid getting stuck.
             self._clear_pending_action(undo_stack, delta_list)
@@ -829,7 +899,10 @@ class AbilityMixin:
             )
             # --- End State Change ---
             logger.debug(
-                "Set pending action for P%d to %s due to %s ability.", player_index, type(next_pending_action).__name__, discarded_card
+                "Set pending action for P%d to %s due to %s ability.",
+                player_index,
+                type(next_pending_action).__name__,
+                discarded_card,
             )
         else:
             logger.debug(
@@ -879,7 +952,9 @@ class AbilityMixin:
         self._add_change(change_clear, undo_clear, delta_clear, undo_stack, delta_list)
         # --- End State Change ---
         logger.debug(
-            "Cleared pending action state (was %s for P%d).", orig_pending_type_name, original_pending_player
+            "Cleared pending action state (was %s for P%d).",
+            orig_pending_type_name,
+            original_pending_player,
         )
 
     def _get_pending_action_name(self) -> str:

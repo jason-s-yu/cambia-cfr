@@ -38,7 +38,7 @@ cambia_rules:
   initial_view_count: 2          # Cards initially peeked by players
   cambia_allowed_round: 0        # First round (0-indexed) Cambia can be called (0 = immediately)
   allowOpponentSnapping: false   # Can players snap cards in opponent's hand?
-  max_game_turns: 300            # Maximum turns before game ends automatically (0 = no limit)
+  max_game_turns: 200            # Maximum turns before game ends automatically (0 = no limit)
 
 # Persistence Settings
 persistence:
@@ -47,7 +47,7 @@ persistence:
 
 # Logging Configuration
 logging:
-  log_level_file: "INFO"        # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level_file: "DEBUG"        # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   log_level_console: "ERROR"    # Logging level for the console
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory

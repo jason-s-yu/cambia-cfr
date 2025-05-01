@@ -1,7 +1,7 @@
-"""src/cfr_trainer.py"""
-
+# src/cfr_trainer.py
 import logging
 import copy
+import sys
 import time
 import traceback
 from collections import defaultdict, deque
@@ -40,8 +40,6 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-TQDM_UPDATE_INTERVAL = 10000
-
 
 class CFRTrainer:
     def __init__(self, config: Config, run_log_dir: Optional[str] = None):
@@ -60,6 +58,8 @@ class CFRTrainer:
         self.exploitability_results: List[Tuple[int, float]] = []
         self.run_log_dir = run_log_dir
         self.max_depth_this_iter = 0
+        self._last_exploit_str = "N/A"
+        self._total_infosets_str = "0"
 
     def load_data(self, filepath: Optional[str] = None):
         path = filepath or self.config.persistence.agent_data_save_path
@@ -95,11 +95,20 @@ class CFRTrainer:
                 self.exploitability_results = [
                     (int(it), float(expl)) for it, expl in exploit_history
                 ]
+                if self.exploitability_results:
+                    last_exploit_val = self.exploitability_results[-1][1]
+                    self._last_exploit_str = (
+                        f"{last_exploit_val:.3f}"
+                        if last_exploit_val != float("inf")
+                        else "N/A"
+                    )
             else:
                 logger.warning(
                     "Invalid exploitability history format found in loaded data. Resetting."
                 )
                 self.exploitability_results = []
+                self._last_exploit_str = "N/A"
+            self._total_infosets_str = f"{len(self.regret_sum):,}"
             logger.info("Resuming training from iteration %d", self.current_iteration + 1)
         else:
             logger.info("No saved data found or error loading. Starting fresh.")
@@ -108,6 +117,8 @@ class CFRTrainer:
             self.reach_prob_sum = defaultdict(float)
             self.current_iteration = 0
             self.exploitability_results = []
+            self._last_exploit_str = "N/A"
+            self._total_infosets_str = "0"
 
     def save_data(self, filepath: Optional[str] = None):
         from .persistence import save_agent_data
@@ -147,6 +158,16 @@ class CFRTrainer:
             end_iteration,
         )
         loop_start_time = time.time()
+
+        # Create the status bar (position 0, above the main bar)
+        status_bar = tqdm(
+            total=0,
+            position=0,
+            bar_format="{desc}",
+            desc="Initializing status...",
+        )
+
+        # Create the main progress bar (position 1)
         progress_bar = tqdm(
             range(start_iteration, end_iteration),
             desc="CFR+ Training",
@@ -154,12 +175,20 @@ class CFRTrainer:
             total=end_iteration,
             unit="iter",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            position=1,  # Ensure it's below the status bar
+            leave=False,  # Keep the main bar visible after loop finishes
         )
+
         for t in progress_bar:
             iter_start_time = time.time()
             self.current_iteration = t + 1
             self.max_depth_this_iter = 0
-            nodes_visited_counter = [0]
+
+            # Update status bar before starting iteration
+            status_bar.set_description_str(
+                f"Iter {self.current_iteration}/{end_iteration} | Depth:0 | MaxD:0 | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+            )
+
             game_state = None
             try:
                 game_state = CambiaGameState(house_rules=self.config.cambia_rules)
@@ -226,8 +255,7 @@ class CFRTrainer:
                     reach_probs,
                     self.current_iteration,
                     action_log_for_game,
-                    progress_bar,
-                    nodes_visited_counter,
+                    status_bar,  # Pass the status bar here
                     depth=0,
                 )
                 game_details = self.analysis.format_game_details_for_log(
@@ -239,10 +267,9 @@ class CFRTrainer:
                 self.analysis.log_game_history(game_details)
             except RecursionError:
                 logger.error(
-                    "Iter %d, Depth %d: Recursion depth exceeded on iteration %d! Saving progress and stopping.",
+                    "Iter %d, MaxDepth %d: Recursion depth exceeded! Saving progress and stopping.",
                     self.current_iteration,
-                    0,
-                    self.current_iteration,
+                    self.max_depth_this_iter,
                 )
                 logger.error("State at RecursionError (approx): %s", game_state)
                 if action_log_for_game:
@@ -267,17 +294,8 @@ class CFRTrainer:
             if game_failed:
                 continue
             iter_time = time.time() - iter_start_time
-            last_exploit = (
-                self.exploitability_results[-1][1]
-                if self.exploitability_results
-                else float("inf")
-            )
-            exploit_str = (
-                f"Expl: {last_exploit:.3f}"
-                if last_exploit != float("inf")
-                else "Expl: N/A"
-            )
-            nodes_this_iter_final = nodes_visited_counter[0]
+
+            # --- Calculate Exploitability Periodically ---
             if (
                 exploitability_interval > 0
                 and self.current_iteration % exploitability_interval == 0
@@ -293,7 +311,9 @@ class CFRTrainer:
                         current_avg_strategy, self.config
                     )
                     self.exploitability_results.append((self.current_iteration, exploit))
-                    exploit_str = f"Expl: {exploit:.3f}"
+                    self._last_exploit_str = (
+                        f"{exploit:.3f}" if exploit != float("inf") else "N/A"
+                    )
                     exploit_calc_time = time.time() - exploit_start_time
                     logger.info(
                         "Exploitability calculated: %.4f (took %.2fs)",
@@ -304,19 +324,31 @@ class CFRTrainer:
                     logger.warning(
                         "Could not compute average strategy for exploitability calculation."
                     )
-                    exploit_str = "Expl: N/A"
-            total_infosets = len(self.regret_sum)
+                    self._last_exploit_str = "N/A"
+
+            self._total_infosets_str = f"{len(self.regret_sum):,}"
+
+            # Update the main progress bar's postfix *after* the iteration is done
             postfix_dict = {
                 "LastT": f"{iter_time:.2f}s",
-                "NodesIter": f"{nodes_this_iter_final:,}",
                 "DepthMax": f"{self.max_depth_this_iter}",
-                exploit_str.split(":")[0].strip(): exploit_str.split(":")[1].strip(),
-                "TotalNodes": f"{total_infosets:,}",
+                "Expl": self._last_exploit_str,
+                "TotalNodes": self._total_infosets_str,
             }
             progress_bar.set_postfix(postfix_dict, refresh=True)
+
+            # Update the status bar description again after iteration finishes
+            status_bar.set_description_str(
+                f"Iter {self.current_iteration}/{end_iteration} complete | Depth:N/A | MaxD:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+            )
+
             if self.current_iteration % self.config.cfr_training.save_interval == 0:
                 self.save_data()
+
+        # Close both bars after the loop
+        status_bar.close()
         progress_bar.close()
+
         end_time = time.time()
         total_completed = self.current_iteration - start_iteration
         logger.info("Training loop finished %d iterations.", total_completed)
@@ -338,8 +370,19 @@ class CFRTrainer:
             else:
                 self.exploitability_results[-1] = (self.current_iteration, final_exploit)
             logger.info("Final exploitability: %.4f", final_exploit)
+            self._last_exploit_str = (
+                f"{final_exploit:.3f}" if final_exploit != float("inf") else "N/A"
+            )
         else:
             logger.warning("Could not compute final average strategy.")
+            self._last_exploit_str = "N/A"
+
+        # Final update to status bar (can be useful in some terminals)
+        tqdm.write(
+            f"Final State | MaxDepth:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}",
+            file=sys.stderr,
+        )
+
         self.save_data()
         logger.info("Final average strategy and data saved.")
 
@@ -350,38 +393,26 @@ class CFRTrainer:
         reach_probs: np.ndarray,
         iteration: int,
         action_log: List[Dict],
-        progress_bar: tqdm,
-        nodes_visited_counter: List[int],
+        status_bar: tqdm,  # Pass the status bar instead of progress bar
         depth: int,
     ) -> np.ndarray:
         self.max_depth_this_iter = max(self.max_depth_this_iter, depth)
-        nodes_visited_counter[0] += 1
-        if nodes_visited_counter[0] % TQDM_UPDATE_INTERVAL == 0:
-            last_exploit = (
-                self.exploitability_results[-1][1]
-                if self.exploitability_results
-                else float("inf")
-            )
-            exploit_str = (
-                f"Expl: {last_exploit:.3f}"
-                if last_exploit != float("inf")
-                else "Expl: N/A"
-            )
-            total_infosets = len(self.regret_sum)
-            postfix_dict = {
-                "NodesIter": f"{nodes_visited_counter[0]:,}",
-                "Depth": f"{depth}",
-                "DepthMax": f"{self.max_depth_this_iter}",
-                "TotalNodes": f"{total_infosets:,}",
-                exploit_str.split(":")[0].strip(): exploit_str.split(":")[1].strip(),
-            }
-            progress_bar.set_postfix(postfix_dict, refresh=False)
+
+        # --- Update Status Bar ---
+        total_infosets = len(self.regret_sum)
+        # Avoid recomputing exploitability here, use the last known value
+        status_desc = f"Iter {iteration} | Depth:{depth} | MaxD:{self.max_depth_this_iter} | Nodes:{total_infosets:,} | Expl:{self._last_exploit_str}"
+        status_bar.set_description_str(status_desc)
+
+        # --- Base Case: Terminal Node ---
         current_context = DecisionContext.TERMINAL
         if game_state.is_terminal():
             return np.array(
                 [game_state.get_utility(i) for i in range(self.num_players)],
                 dtype=np.float64,
             )
+
+        # --- Determine Node Type and Context ---
         elif game_state.snap_phase_active:
             current_context = DecisionContext.SNAP_DECISION
         elif game_state.pending_action:
@@ -411,6 +442,8 @@ class CFRTrainer:
                 current_context = DecisionContext.START_TURN
         else:
             current_context = DecisionContext.START_TURN
+
+        # --- Get Acting Player and Infoset ---
         player = game_state.get_acting_player()
         if player == -1:
             logger.error(
@@ -448,6 +481,8 @@ class CFRTrainer:
                 current_context.name,
             )
             return np.zeros(self.num_players, dtype=np.float64)
+
+        # --- Get Legal Actions ---
         try:
             legal_actions_set = game_state.get_legal_actions()
             legal_actions = sorted(list(legal_actions_set), key=repr)
@@ -464,6 +499,8 @@ class CFRTrainer:
             )
             return np.zeros(self.num_players, dtype=np.float64)
         num_actions = len(legal_actions)
+
+        # --- Handle No Legal Actions ---
         if num_actions == 0:
             if not game_state.is_terminal():
                 logger.warning(
@@ -493,11 +530,13 @@ class CFRTrainer:
                         depth,
                     )
                     return np.zeros(self.num_players, dtype=np.float64)
-            else:
+            else:  # Already terminal, should have been caught earlier
                 return np.array(
                     [game_state.get_utility(i) for i in range(self.num_players)],
                     dtype=np.float64,
                 )
+
+        # --- Initialize/Retrieve Regret and Strategy Sums ---
         current_regrets = self.regret_sum.get(infoset_key)
         if current_regrets is None or len(current_regrets) != num_actions:
             if current_regrets is not None:
@@ -529,6 +568,8 @@ class CFRTrainer:
             self.strategy_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
         if infoset_key not in self.reach_prob_sum:
             self.reach_prob_sum[infoset_key] = 0.0
+
+        # --- Calculate Current Strategy & Update Strategy Sum ---
         strategy = get_rm_plus_strategy(current_regrets)
         player_reach = reach_probs[player]
         if player_reach > 1e-9:
@@ -540,12 +581,16 @@ class CFRTrainer:
             if weight > 0:
                 self.reach_prob_sum[infoset_key] += weight * player_reach
                 self.strategy_sum[infoset_key] += weight * player_reach * strategy
+
+        # --- Iterate Through Actions ---
         action_utilities = np.zeros((num_actions, self.num_players), dtype=np.float64)
         node_value = np.zeros(self.num_players, dtype=np.float64)
         use_pruning = self.config.cfr_training.pruning_enabled
         pruning_threshold = self.config.cfr_training.pruning_threshold
+
         for i, action in enumerate(legal_actions):
             action_prob = strategy[i]
+            # --- Regret Pruning ---
             node_positive_regret_sum = np.sum(np.maximum(0.0, current_regrets))
             should_prune = (
                 use_pruning
@@ -558,6 +603,8 @@ class CFRTrainer:
                 continue
             if action_prob < 1e-9:
                 continue
+
+            # --- Apply Action and Recurse ---
             action_log_entry = {
                 "player": player,
                 "turn": game_state.get_turn_number(),
@@ -641,8 +688,7 @@ class CFRTrainer:
                     next_reach_probs,
                     iteration,
                     action_log,
-                    progress_bar,
-                    nodes_visited_counter,
+                    status_bar,  # Pass status bar down
                     depth + 1,
                 )
                 action_utilities[i] = recursive_utilities
@@ -698,6 +744,8 @@ class CFRTrainer:
                     action,
                 )
                 return np.zeros(self.num_players, dtype=np.float64)
+
+        # --- Calculate Node Value & Update Regrets ---
         node_value = np.sum(strategy[:, np.newaxis] * action_utilities, axis=0)
         opponent_reach = reach_probs[opponent]
         if player_reach > 1e-9:
@@ -711,7 +759,7 @@ class CFRTrainer:
                     current_regrets_before_update + update_weight * instantaneous_regret
                 )
                 self.regret_sum[infoset_key] = np.maximum(0.0, updated_regrets)
-            except ValueError as e_regret:  # More specific exception
+            except ValueError as e_regret:
                 logger.exception(
                     "Iter %d, P%d, Depth %d, Infoset %s, Context %s: ValueError during regret update: %s",
                     iteration,
@@ -721,7 +769,7 @@ class CFRTrainer:
                     current_context.name,
                     e_regret,
                 )
-            except Exception as e_regret:  # Catch-all with logging
+            except Exception as e_regret:
                 logger.exception(
                     "Iter %d, P%d, Depth %d, Infoset %s, Context %s: Unexpected error during regret update: %s",
                     iteration,

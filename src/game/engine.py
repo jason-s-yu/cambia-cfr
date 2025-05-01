@@ -27,7 +27,7 @@ from ..constants import (
     ActionDrawStockpile,
     ActionDrawDiscard,
     ActionCallCambia,
-    ActionDiscard
+    ActionDiscard,
 )
 from ..config import CambiaRulesConfig
 
@@ -189,7 +189,9 @@ class CambiaGameState(
                     undo_func()
                 except Exception as e:
                     logger.exception(
-                        "Error during undo operation %s: %s. State might be inconsistent.", undo_func, e
+                        "Error during undo operation %s: %s. State might be inconsistent.",
+                        undo_func,
+                        e,
                     )
                     # Potentially raise or log more severely
 
@@ -236,7 +238,9 @@ class CambiaGameState(
                         # implies the submitted `action` was invalid for the *current* pending state.
                         # Do nothing, wait for a valid action.
                         logger.warning(
-                            "Invalid action %s for pending state %s. Waiting.", action, self.pending_action
+                            "Invalid action %s for pending state %s. Waiting.",
+                            action,
+                            self.pending_action,
                         )
                         action_processed = False  # Mark as not successfully processed
                     else:
@@ -248,7 +252,10 @@ class CambiaGameState(
 
                 else:  # Wrong player for pending action (should be caught earlier by get_acting_player ideally)
                     logger.error(
-                        "Action %s from P%d received, but pending action requires P%d", action, acting_player, self.pending_action_player
+                        "Action %s from P%d received, but pending action requires P%d",
+                        action,
+                        acting_player,
+                        self.pending_action_player,
                     )
                     action_processed = False  # Action ignored
 
@@ -257,7 +264,10 @@ class CambiaGameState(
                 if acting_player != self.current_player_index:
                     # Should not happen if logic is correct
                     logger.error(
-                        "Standard action %s from P%d, but expected P%d", action, acting_player, self.current_player_index
+                        "Standard action %s from P%d, but expected P%d",
+                        action,
+                        acting_player,
+                        self.current_player_index,
                     )
                     action_processed = False
                 else:
@@ -347,7 +357,8 @@ class CambiaGameState(
                             # DO NOT ADVANCE TURN YET - Wait for Discard/Replace decision
                         else:  # Stockpile empty even after reshuffle attempt
                             logger.warning(
-                                "P%d tried DRAW_STOCKPILE, but stockpile/discard empty. Game should end.", player
+                                "P%d tried DRAW_STOCKPILE, but stockpile/discard empty. Game should end.",
+                                player,
                             )
                             # Game end check will handle this after turn fails to advance
                             action_processed = False  # Action failed
@@ -472,13 +483,16 @@ class CambiaGameState(
                             )
                         else:
                             logger.warning(
-                                "P%d tried invalid CALL_CAMBIA (Already called or too early).", player
+                                "P%d tried invalid CALL_CAMBIA (Already called or too early).",
+                                player,
                             )
                             action_processed = False  # Action invalid
 
                     else:  # An action type not handled at the start of a turn
                         logger.warning(
-                            "Unhandled action type %s received at start of turn for P%d.", type(action), player
+                            "Unhandled action type %s received at start of turn for P%d.",
+                            type(action),
+                            player,
                         )
                         action_processed = False
 
@@ -500,7 +514,9 @@ class CambiaGameState(
 
         except Exception:
             logger.exception(
-                "Critical error during apply_action logic for action %s. State: %s. Attempting rollback.", action, self
+                "Critical error during apply_action logic for action %s. State: %s. Attempting rollback.",
+                action,
+                self,
             )
             # Attempt to execute the master undo function
             try:
@@ -511,7 +527,8 @@ class CambiaGameState(
             except Exception as undo_e:
                 # If undo fails, the state is likely corrupted.
                 logger.error(
-                    "Exception during master undo after apply_action error: %s. Game state may be inconsistent!", undo_e
+                    "Exception during master undo after apply_action error: %s. Game state may be inconsistent!",
+                    undo_e,
                 )
                 # Consider forcing game over?
                 # self._game_over = True
@@ -539,7 +556,10 @@ class CambiaGameState(
             )  # Add undo op to the *front* (for LIFO execution)
         except Exception as e:
             logger.exception(
-                "Error applying change function %s for delta %s: %s", change_func.__name__, delta, e
+                "Error applying change function %s for delta %s: %s",
+                change_func.__name__,
+                delta,
+                e,
             )
             # Depending on severity, might want to raise or handle differently
 
@@ -600,7 +620,9 @@ class CambiaGameState(
         Returns a list of StateDeltaChanges for the penalty draws/reshuffles.
         """
         logger.warning(
-            "Applying penalty: Player %d attempts to draw %d cards.", player_index, num_cards
+            "Applying penalty: Player %d attempts to draw %d cards.",
+            player_index,
+            num_cards,
         )
         penalty_deltas: StateDelta = []
         if not (
@@ -627,10 +649,13 @@ class CambiaGameState(
                     penalty_deltas.extend(
                         reshuffle_outcome_deltas
                     )  # Add reshuffle delta(s)
-                    logger.debug("Reshuffled during penalty draw %d/%d", i+1, num_cards)
+                    logger.debug("Reshuffled during penalty draw %d/%d", i + 1, num_cards)
                 else:  # Cannot reshuffle
                     logger.warning(
-                        "Stockpile/discard empty during penalty draw %d/%d for P%d. Cannot draw more.", i+1, num_cards, player_index
+                        "Stockpile/discard empty during penalty draw %d/%d for P%d. Cannot draw more.",
+                        i + 1,
+                        num_cards,
+                        player_index,
                     )
                     break  # Stop drawing penalty cards
 
@@ -651,7 +676,9 @@ class CambiaGameState(
                 break
 
         logger.info(
-            "Player %d drew %d cards as penalty.", player_index, len(cards_actually_drawn_this_penalty)
+            "Player %d drew %d cards as penalty.",
+            player_index,
+            len(cards_actually_drawn_this_penalty),
         )
 
         # --- Create the single master undo function for the *entire penalty draw sequence* ---
@@ -662,7 +689,8 @@ class CambiaGameState(
             self.stockpile = original_stockpile_state
             self.discard_pile = original_discard_state
             logger.debug(
-                "Undo penalty sequence applied for P%d. State restored to pre-penalty.", player_index
+                "Undo penalty sequence applied for P%d. State restored to pre-penalty.",
+                player_index,
             )
 
         # Add the master undo function to the *front* of the main stack
@@ -724,7 +752,10 @@ class CambiaGameState(
         # --- End State Change ---
 
         logger.debug(
-            "Advanced turn to T#%d P%d. Cambia turns: %d", self._turn_number, self.current_player_index, self.turns_after_cambia
+            "Advanced turn to T#%d P%d. Cambia turns: %d",
+            self._turn_number,
+            self.current_player_index,
+            self.turns_after_cambia,
         )
 
         # Check game end conditions *after* advancing the turn
@@ -834,7 +865,9 @@ class CambiaGameState(
                 # Basic validation of hand contents before scoring
                 if not all(isinstance(card, Card) for card in current_hand):
                     logger.error(
-                        "Calculate score: Player %d's hand contains non-Card objects: %s. Assigning max score.", i, current_hand
+                        "Calculate score: Player %d's hand contains non-Card objects: %s. Assigning max score.",
+                        i,
+                        current_hand,
                     )
                     scores.append(float("inf"))  # Assign effectively infinite score
                     final_hands_str.append(
@@ -846,7 +879,8 @@ class CambiaGameState(
                     final_hands_str.append([serialize_card(c) for c in current_hand])
             else:
                 logger.error(
-                    "Calculate score: Player %d invalid or missing hand. Assigning max score.", i
+                    "Calculate score: Player %d invalid or missing hand. Assigning max score.",
+                    i,
                 )
                 scores.append(float("inf"))
                 final_hands_str.append(["ERROR"])
@@ -883,12 +917,16 @@ class CambiaGameState(
                         utilities_calculated = [-1.0] * self.num_players
                         utilities_calculated[winner_calculated] = 1.0
                         logger.info(
-                            "Tie score (%d) broken by Cambia caller P%d.", min_score, winner_calculated
+                            "Tie score (%d) broken by Cambia caller P%d.",
+                            min_score,
+                            winner_calculated,
                         )
                     else:
                         # True tie among winners list
                         logger.info(
-                            "True tie between players %s with score %d.", winners, min_score
+                            "True tie between players %s with score %d.",
+                            winners,
+                            min_score,
                         )
                         winner_calculated = None  # No single winner
                         # Assign utilities: 0 for tied players, -1 for losers
@@ -927,7 +965,7 @@ class CambiaGameState(
             self._winner = winner_calculated
             self._utilities = utilities_calculated
             logger.debug(
-                "Final winner/utilities set: W=%d, U=%s", self._winner, self._utilities
+                "Final winner/utilities set: W=%s, U=%s", self._winner, self._utilities
             )
 
         return winner_calculated, utilities_calculated

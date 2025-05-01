@@ -1,12 +1,17 @@
+# src/main_train.py
 """src/main_train.py"""
 
 import logging
-import logging.handlers
+import logging.handlers  # Keep this for other potential handlers
 import argparse
 import os
 import datetime
 import sys
+import re
 from tqdm import tqdm
+
+# Import the custom handler
+from .serial_rotating_handler import SerialRotatingFileHandler
 
 from .config import load_config
 from .cfr_trainer import CFRTrainer
@@ -30,32 +35,12 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-# Custom Namer for RotatingFileHandler
-def log_namer(default_name: str) -> str:
-    """
-    Custom namer for RotatingFileHandler to achieve {prefix}_{date}_{number}.log format.
-    Extracts prefix and date from the base filename structure.
-    """
-    # default_name will be like /path/to/logs/prefix_run_date/prefix.log.N
-    dir_name, base_filename = os.path.split(default_name)
-    parts = base_filename.split(".")
-    prefix = parts[0]
-    num = parts[-1]  # The rotation number
-
-    # Extract date from directory name (assuming format prefix_run_YYYY_MM_DD-HHMMSS)
-    run_dir_name = os.path.basename(dir_name)
-    try:
-        date_part = run_dir_name.split("_run_")[-1]
-    except IndexError:
-        # Fallback if directory name format is unexpected
-        date_part = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
-
-    new_filename = f"{prefix}_{date_part}_{int(num):03d}.log"
-    return os.path.join(dir_name, new_filename)
+# log_namer is no longer needed with the custom handler
+# def log_namer(default_name: str) -> str: ... # REMOVED
 
 
 def setup_logging(config, verbose: bool):
-    """Configures logging to console, timestamped+chunked file, and latest log dir link."""
+    """Configures logging to console and timestamped, serially chunked files within run directories."""
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
@@ -82,10 +67,9 @@ def setup_logging(config, verbose: bool):
         )
         return None, None  # Indicate failure
 
-    # Create timestamped dir for this run with the new format
-    timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
-    # Use the configured log prefix for the directory name
-    run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run_{timestamp}")
+    # Create timestamped directory for this run
+    run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
+    run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run-{run_timestamp}")
     try:
         os.makedirs(run_log_dir, exist_ok=True)
     except OSError as e:
@@ -94,8 +78,8 @@ def setup_logging(config, verbose: bool):
         )
         return None, None
 
-    # Base log file path inside run dir (still uses prefix.log as base for rotator)
-    log_filename_base = os.path.join(run_log_dir, f"{log_prefix}.log")
+    # Define the base log filename *pattern* for the custom handler (without serial)
+    base_log_pattern = os.path.join(run_log_dir, f"{log_prefix}_run-{run_timestamp}")
 
     # Formatter
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -110,88 +94,88 @@ def setup_logging(config, verbose: bool):
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    # Display progress bar at base
-    # Use Tqdm handler IF we have a TTY, otherwise standard StreamHandler
+    # Console Handler (using Tqdm handler if possible)
     if sys.stderr.isatty():
         ch = TqdmLoggingHandler()
     else:
-        ch = logging.StreamHandler(sys.stderr)  # Log to stderr
+        ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(console_log_level)
     ch.setFormatter(formatter)
     root_logger.addHandler(ch)
 
-    # File chunking / rotating log file handler
+    # Use the Custom Serial Rotating File Handler
     try:
-        # Rotate logs within the timestamped directory
-        max_bytes = config.logging.log_max_bytes  # ~10MB
-        backup_count = config.logging.log_backup_count  # Number of backup files
-        fh = logging.handlers.RotatingFileHandler(
-            log_filename_base,
+        max_bytes = config.logging.log_max_bytes
+        backup_count = config.logging.log_backup_count
+        # Pass the pattern, maxBytes, and backupCount
+        fh = SerialRotatingFileHandler(
+            base_log_pattern,
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",
         )
-        # Assign the custom namer
-        fh.namer = log_namer
-        # Note: Rollover occurs *before* the next message is written.
-        # The current file will be named prefix.log until it's full.
-        # When it rolls over, prefix.log becomes prefix_date_001.log,
-        # and a new prefix.log is created. This isn't exactly the requested
-        # {prefix}_{date}_{batch}.log format for *all* files including the current one.
-        # Achieving that would require a more complex handler or renaming after creation.
-        # This setup gives: prefix.log (current), prefix_date_001.log, prefix_date_002.log ...
+        # namer and rotator are handled internally by the custom handler
 
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
         root_logger.addHandler(fh)
 
-        # Log initial messages *after* handlers are set up
+        # Log initial messages *after* handlers are set up (using lazy %)
         logger.info("-" * 50)
-        logger.info(f"Logging initialized for run: {timestamp}")
-        logger.info(f"Log Directory: {run_log_dir}")
+        logger.info("Logging initialized for run timestamp: %s", run_timestamp)
+        logger.info("Run Log Directory: %s", run_log_dir)
+        # Get the currently active filename from the handler
+        current_log_file = fh.baseFilename
         logger.info(
-            f"Base Log File: {log_filename_base} (rolls over to {log_prefix}_{timestamp}_NNN.log)"
+            "Logging to: %s (rotates to %s_NNN.log inside dir, _001 is oldest)",
+            current_log_file,
+            base_log_pattern,
         )
-        logger.info(f"Log Chunk Size: {max_bytes / (1024*1024):.1f} MB")
-        logger.info(f"Max Log Chunks: {backup_count}")
-        logger.info(f"File Log Level: {logging.getLevelName(file_log_level)}")
-        logger.info(f"Console Log Level: {logging.getLevelName(console_log_level)}")
-        logger.info(f"Command: {' '.join(sys.argv)}")
+        logger.info("Log Chunk Size: %.1f MB", max_bytes / (1024 * 1024))
+        logger.info("Max Log Chunks: %d", backup_count)
+        logger.info("File Log Level: %s", logging.getLevelName(file_log_level))
+        logger.info("Console Log Level: %s", logging.getLevelName(console_log_level))
+        logger.info("Command: %s", " ".join(sys.argv))
         logger.info("-" * 50)
 
     except Exception as e:
         print(
-            f"ERROR: Could not set up rotating file logging at {log_filename_base}: {e}"
+            f"ERROR: Could not set up serial rotating file logging using pattern {base_log_pattern}: {e}"
         )
-        # Remove console handler if file handler failed? Maybe not, console might still be useful.
+        # Print traceback for debugging setup issues
+        import traceback
+
+        traceback.print_exc()
         return None, None  # Indicate failure
 
-    # Create/Update latest log directory link/copy
+    # Create/Update latest log directory link/copy (pointing to the directory)
     latest_log_link_path = os.path.join(main_log_dir, "latest_run")
     try:
         absolute_run_log_dir = os.path.abspath(run_log_dir)
         if sys.platform == "win32":
-            # Windows: Cannot easily "link" directories without special tools/permissions.
-            # Create a simple text file pointing to the latest run dir.
-            with open(latest_log_link_path + ".txt", "w") as f:
+            # Windows: Create a simple text file pointing to the latest run dir.
+            marker_path = latest_log_link_path + ".txt"
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+            with open(marker_path, "w", encoding="utf-8") as f:
                 f.write(f"Latest run directory: {absolute_run_log_dir}\n")
-            logger.info(f"Updated latest run marker file: {latest_log_link_path}.txt")
+            logger.info("Updated latest run marker file: %s", marker_path)
         else:
             # Unix-like: Use symlink to the directory
-            if os.path.lexists(latest_log_link_path):  # Use lexists for links
+            if os.path.lexists(latest_log_link_path):
                 os.remove(latest_log_link_path)
             os.symlink(
                 absolute_run_log_dir, latest_log_link_path, target_is_directory=True
             )
-            logger.info(f"Updated latest_run symlink -> {absolute_run_log_dir}")
+            logger.info("Updated latest_run symlink -> %s", absolute_run_log_dir)
     except Exception as e:
-        logger.error(f"Could not create/update latest_run link/marker: {e}")
+        logger.error("Could not create/update latest_run link/marker: %s", e)
 
     # Reduce Verbosity from Libraries
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-    # Return the run_log_dir for potential use elsewhere (like saving analysis)
-    return run_log_dir, timestamp  # Indicate success
+    # Return the run_log_dir
+    return run_log_dir, run_timestamp  # Indicate success
 
 
 def main():
@@ -242,32 +226,33 @@ def main():
     # Logger is now configured globally
 
     logger.info("--- Starting Cambia CFR+ Training ---")
-    logger.info(f"Configuration loaded from: {args.config}")
+    logger.info("Configuration loaded from: %s", args.config)
 
     # Override config settings from command line if provided
     if args.iterations is not None:
         config.cfr_training.num_iterations = args.iterations
-        logger.info(f"Overriding iterations from command line: {args.iterations}")
+        logger.info("Overriding iterations from command line: %d", args.iterations)
     if args.save_path is not None:
         config.persistence.agent_data_save_path = args.save_path
-        logger.info(f"Overriding save path from command line: {args.save_path}")
+        logger.info("Overriding save path from command line: %s", args.save_path)
 
     # Set the system recursion limit
     if config.system.recursion_limit:
         try:
             sys.setrecursionlimit(config.system.recursion_limit)
-            logger.info(f"System recursion limit set to: {config.system.recursion_limit}")
+            logger.info(
+                "System recursion limit set to: %d", config.system.recursion_limit
+            )
         except Exception as e:
-            logger.error(f"Failed to set recursion limit: {e}")
+            logger.error("Failed to set recursion limit: %s", e)
 
-    logger.info(f"Confirm recursion limit: {sys.getrecursionlimit()}")
+    logger.info("Confirm recursion limit: %d", sys.getrecursionlimit())
 
     # Initialize trainer
     try:
-        trainer = CFRTrainer(
-            config, run_log_dir=run_log_dir
-        )  # Pass run_log_dir to trainer
-    except Exception as e:
+        # Pass run_log_dir; trainer might use it for analysis logs if needed
+        trainer = CFRTrainer(config, run_log_dir=run_log_dir)
+    except Exception:
         logger.exception("Failed to initialize CFRTrainer:")
         sys.exit(1)
 
@@ -277,7 +262,8 @@ def main():
             logger.error("Cannot load data: Agent data save path is not configured.")
         else:
             logger.info(
-                f"Attempting to load agent data from: {config.persistence.agent_data_save_path}"
+                "Attempting to load agent data from: %s",
+                config.persistence.agent_data_save_path,
             )
             trainer.load_data()
     else:
@@ -291,9 +277,8 @@ def main():
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user (KeyboardInterrupt).")
         logger.info("Attempting to save current progress...")
-        if not trainer.config.persistence.agent_data_save_path or not os.path.basename(
-            trainer.config.persistence.agent_data_save_path
-        ):
+        save_path = trainer.config.persistence.agent_data_save_path
+        if not save_path or not os.path.basename(save_path):
             logger.error(
                 "Cannot save progress: Agent data save path is invalid or not configured."
             )
@@ -302,13 +287,12 @@ def main():
                 trainer.save_data()
                 logger.info("Progress saved.")
             except Exception as save_e:
-                logger.error(f"Failed to save progress after interrupt: {save_e}")
-    except Exception as e:
+                logger.error("Failed to save progress after interrupt: %s", save_e)
+    except Exception:
         logger.exception("An unexpected error occurred during training:")
         logger.info("Attempting to save current progress before exiting...")
-        if not trainer.config.persistence.agent_data_save_path or not os.path.basename(
-            trainer.config.persistence.agent_data_save_path
-        ):
+        save_path = trainer.config.persistence.agent_data_save_path
+        if not save_path or not os.path.basename(save_path):
             logger.error(
                 "Cannot save progress: Agent data save path is invalid or not configured."
             )
@@ -317,7 +301,7 @@ def main():
                 trainer.save_data()
                 logger.info("Progress saved.")
             except Exception as save_e:
-                logger.error(f"Failed to save progress after error: {save_e}")
+                logger.error("Failed to save progress after error: %s", save_e)
 
 
 if __name__ == "__main__":

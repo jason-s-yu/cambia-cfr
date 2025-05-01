@@ -551,7 +551,9 @@ class SnapLogicMixin:
                         opp_hand = self.players[opp_idx].hand
                         if not all(isinstance(card, Card) for card in opp_hand):
                             logger.error(
-                                "Initiate Snap Check: Opponent %d's hand contains non-Card objects. Skipping snap-opp check for P%d.", opp_idx, p_idx
+                                "Initiate Snap Check: Opponent %d's hand contains non-Card objects. Skipping snap-opp check for P%d.",
+                                opp_idx,
+                                p_idx,
                             )
                         else:
                             can_snap_opponent = any(
@@ -559,7 +561,9 @@ class SnapLogicMixin:
                             )
                     else:
                         logger.warning(
-                            "Initiate Snap Check: Opponent %d invalid/missing hand for P%d checking SnapOpponent.", opp_idx, p_idx
+                            "Initiate Snap Check: Opponent %d invalid/missing hand for P%d checking SnapOpponent.",
+                            opp_idx,
+                            p_idx,
                         )
 
             if can_snap_own or can_snap_opponent:
@@ -568,7 +572,9 @@ class SnapLogicMixin:
         started_snap = False
         if potential_indices:
             logger.debug(
-                "Discard of %s triggers potential snap phase for players %d.", discarded_card, potential_indices
+                "Discard of %s triggers potential snap phase for players %s.",
+                discarded_card,
+                potential_indices,
             )
 
             # Determine who discarded the card. This is tricky.
@@ -597,7 +603,8 @@ class SnapLogicMixin:
                 # effectively caused the discard (even if via replace), and snap order starts after them.
                 discarder_player = self.current_player_index  # Tentative definition
                 logger.debug(
-                    "Snap Phase: Assuming discard caused by P%d's action.", discarder_player
+                    "Snap Phase: Assuming discard caused by P%d's action.",
+                    discarder_player,
                 )
 
             # Determine snap order: Start from player *after* the discarder.
@@ -649,7 +656,10 @@ class SnapLogicMixin:
                 # --- End State Change ---
                 started_snap = True
                 logger.info(
-                    "Snap phase started. Discard: %s. Potential snappers (ordered): %s. P%d acts first.", discarded_card, ordered_snappers, self.get_acting_player()
+                    "Snap phase started. Discard: %s. Potential snappers (ordered): %s. P%d acts first.",
+                    discarded_card,
+                    ordered_snappers,
+                    self.get_acting_player(),
                 )
 
             else:
@@ -659,7 +669,9 @@ class SnapLogicMixin:
                 started_snap = False
         else:
             logger.debug(
-                "No potential snappers found for discard of %s (Rank %s).", discarded_card, target_rank
+                "No potential snappers found for discard of %s (Rank %s).",
+                discarded_card,
+                target_rank,
             )
             started_snap = False
 
