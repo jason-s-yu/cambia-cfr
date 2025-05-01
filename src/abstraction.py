@@ -2,19 +2,35 @@
 from typing import Optional
 from .card import Card
 from .constants import (
-    CardBucket, DecayCategory, JOKER_RANK_STR, KING, ACE, TWO, THREE, FOUR, # Use JOKER_RANK_STR
-    FIVE, SIX, SEVEN, EIGHT, NINE, TEN, JACK, QUEEN, RED_SUITS
+    CardBucket,
+    DecayCategory,
+    JOKER_RANK_STR,
+    KING,
+    ACE,
+    TWO,
+    THREE,
+    FOUR,  # Use JOKER_RANK_STR
+    FIVE,
+    SIX,
+    SEVEN,
+    EIGHT,
+    NINE,
+    TEN,
+    JACK,
+    QUEEN,
+    RED_SUITS,
 )
+
 
 def get_card_bucket(card: Optional[Card]) -> CardBucket:
     """Maps a Card object to its corresponding CardBucket."""
     if card is None:
-        return CardBucket.UNKNOWN # Or handle appropriately
+        return CardBucket.UNKNOWN  # Or handle appropriately
 
     rank = card.rank
     suit = card.suit
 
-    if rank == JOKER_RANK_STR: # Use JOKER_RANK_STR
+    if rank == JOKER_RANK_STR:  # Use JOKER_RANK_STR
         return CardBucket.ZERO
     if rank == KING:
         return CardBucket.NEG_KING if suit in RED_SUITS else CardBucket.HIGH_KING
@@ -37,7 +53,12 @@ def get_card_bucket(card: Optional[Card]) -> CardBucket:
 
 def decay_bucket(bucket: CardBucket) -> DecayCategory:
     """Maps a specific CardBucket to a broader DecayCategory."""
-    if bucket in [CardBucket.ZERO, CardBucket.NEG_KING, CardBucket.ACE, CardBucket.LOW_NUM]:
+    if bucket in [
+        CardBucket.ZERO,
+        CardBucket.NEG_KING,
+        CardBucket.ACE,
+        CardBucket.LOW_NUM,
+    ]:
         return DecayCategory.LIKELY_LOW
     if bucket in [CardBucket.MID_NUM, CardBucket.PEEK_SELF]:
         return DecayCategory.LIKELY_MID
