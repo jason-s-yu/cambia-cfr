@@ -2,6 +2,7 @@ single.py
 game_history.jsonl
 cambia_history.jsonl
 logs/
+*.old
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

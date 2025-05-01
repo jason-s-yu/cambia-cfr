@@ -1,18 +1,17 @@
 # src/main_train.py
 import logging
-import logging.handlers
 import argparse
 import os
 import datetime
 import sys
-import re
 import signal
 import threading
 from tqdm import tqdm
 
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import load_config
-from .cfr_trainer import CFRTrainer, GracefulShutdownException
+from .cfr.trainer import CFRTrainer
+from .cfr.exceptions import GracefulShutdownException
 
 # Global logger instance (initialized after setup)
 logger = logging.getLogger(__name__)
