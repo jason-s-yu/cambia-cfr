@@ -11,7 +11,7 @@ system:
 
 # CFR Training Parameters
 cfr_training:
-  num_iterations: 1000          # Total training iterations
+  num_iterations: 10000         # Total training iterations
   save_interval: 1              # Save progress every N iterations
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
@@ -47,9 +47,9 @@ persistence:
 
 # Logging Configuration
 logging:
-  log_level_file: "DEBUG"        # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level_file: "DEBUG"       # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   log_level_console: "ERROR"    # Logging level for the console
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory
   log_max_bytes: 9437184        # Max size before rotation (~9MB = 9 * 1024 * 1024)
-  log_backup_count: 999         # Max number of backup log files (e.g., cambia.log.1, .2, ...)
+  log_backup_count: 9999        # Max number of backup log files

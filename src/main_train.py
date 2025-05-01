@@ -1,26 +1,37 @@
 # src/main_train.py
-"""src/main_train.py"""
-
 import logging
-import logging.handlers  # Keep this for other potential handlers
+import logging.handlers
 import argparse
 import os
 import datetime
 import sys
 import re
+import signal
+import threading
 from tqdm import tqdm
 
-# Import the custom handler
 from .serial_rotating_handler import SerialRotatingFileHandler
-
 from .config import load_config
 from .cfr_trainer import CFRTrainer
 
 # Global logger instance (initialized after setup)
 logger = logging.getLogger(__name__)
 
+# Shared event for graceful shutdown
+shutdown_event = threading.Event()
 
-# Progress bar handler
+
+def handle_sigint(sig, frame):
+    """Signal handler for SIGINT (Ctrl+C)."""
+    if not shutdown_event.is_set():
+        logger.warning("SIGINT received. Requesting graceful shutdown...")
+        shutdown_event.set()
+        # Optional: Restore default handler if needed, though re-raising KeyboardInterrupt is cleaner
+        # signal.signal(signal.SIGINT, signal.SIG_DFL)
+    else:
+        logger.warning("Multiple SIGINT received. Shutdown already in progress.")
+
+
 class TqdmLoggingHandler(logging.Handler):
     """Passes log records to tqdm.write(), ensuring they don't interfere with the progress bar."""
 
@@ -33,10 +44,6 @@ class TqdmLoggingHandler(logging.Handler):
             self.flush()
         except Exception:
             self.handleError(record)
-
-
-# log_namer is no longer needed with the custom handler
-# def log_namer(default_name: str) -> str: ... # REMOVED
 
 
 def setup_logging(config, verbose: bool):
@@ -114,7 +121,6 @@ def setup_logging(config, verbose: bool):
             backupCount=backup_count,
             encoding="utf-8",
         )
-        # namer and rotator are handled internally by the custom handler
 
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
@@ -212,6 +218,10 @@ def main():
 
     args = parser.parse_args()
 
+    # --- Setup Shutdown Handling ---
+    # Register signal handler *before* potentially long operations
+    signal.signal(signal.SIGINT, handle_sigint)
+
     # Load configuration *before* setting up logging
     config = load_config(args.config)
     if not config:
@@ -248,10 +258,13 @@ def main():
 
     logger.info("Confirm recursion limit: %d", sys.getrecursionlimit())
 
-    # Initialize trainer
+    # Initialize trainer, passing the shutdown event
     try:
-        # Pass run_log_dir; trainer might use it for analysis logs if needed
-        trainer = CFRTrainer(config, run_log_dir=run_log_dir)
+        trainer = CFRTrainer(
+            config,
+            run_log_dir=run_log_dir,
+            shutdown_event=shutdown_event,  # Pass the event
+        )
     except Exception:
         logger.exception("Failed to initialize CFRTrainer:")
         sys.exit(1)
@@ -269,28 +282,19 @@ def main():
     else:
         logger.info("Starting training from scratch (no data loaded).")
 
-    # Run training
+    # Run training, catching KeyboardInterrupt which is re-raised by the trainer on graceful shutdown
     try:
-        # trainer.train() now handles the tqdm loop internally
         trainer.train()
         logger.info("Training completed successfully.")
     except KeyboardInterrupt:
-        logger.warning("Training interrupted by user (KeyboardInterrupt).")
-        logger.info("Attempting to save current progress...")
-        save_path = trainer.config.persistence.agent_data_save_path
-        if not save_path or not os.path.basename(save_path):
-            logger.error(
-                "Cannot save progress: Agent data save path is invalid or not configured."
-            )
-        else:
-            try:
-                trainer.save_data()
-                logger.info("Progress saved.")
-            except Exception as save_e:
-                logger.error("Failed to save progress after interrupt: %s", save_e)
+        # This is caught either from a direct interrupt before trainer loop,
+        # or after the trainer catches GracefulShutdownException and re-raises KeyboardInterrupt.
+        logger.warning("Training interrupted by user (Ctrl+C) or shutdown event.")
+        logger.info("Exiting program.")
+        # No need to save here, trainer saves *before* raising KeyboardInterrupt
     except Exception:
         logger.exception("An unexpected error occurred during training:")
-        logger.info("Attempting to save current progress before exiting...")
+        logger.info("Attempting to save final progress before exiting due to error...")
         save_path = trainer.config.persistence.agent_data_save_path
         if not save_path or not os.path.basename(save_path):
             logger.error(
@@ -299,9 +303,10 @@ def main():
         else:
             try:
                 trainer.save_data()
-                logger.info("Progress saved.")
+                logger.info("Progress saved after error.")
             except Exception as save_e:
                 logger.error("Failed to save progress after error: %s", save_e)
+        sys.exit(1)  # Exit with error code after unexpected exception
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import copy
 import sys
 import time
 import traceback
+import threading  # For shutdown event
 from collections import defaultdict, deque
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -41,8 +42,17 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+class GracefulShutdownException(Exception):
+    """Custom exception raised when a graceful shutdown is requested."""
+
+
 class CFRTrainer:
-    def __init__(self, config: Config, run_log_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config: Config,
+        run_log_dir: Optional[str] = None,
+        shutdown_event: Optional[threading.Event] = None,
+    ):
         self.config = config
         self.num_players = NUM_PLAYERS
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -60,6 +70,8 @@ class CFRTrainer:
         self.max_depth_this_iter = 0
         self._last_exploit_str = "N/A"
         self._total_infosets_str = "0"
+        # Store the shutdown event, create a dummy if None for standalone use
+        self.shutdown_event = shutdown_event or threading.Event()
 
     def load_data(self, filepath: Optional[str] = None):
         path = filepath or self.config.persistence.agent_data_save_path
@@ -179,173 +191,204 @@ class CFRTrainer:
             leave=False,  # Keep the main bar visible after loop finishes
         )
 
-        for t in progress_bar:
-            iter_start_time = time.time()
-            self.current_iteration = t + 1
-            self.max_depth_this_iter = 0
-
-            # Update status bar before starting iteration
-            status_bar.set_description_str(
-                f"Iter {self.current_iteration}/{end_iteration} | Depth:0 | MaxD:0 | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
-            )
-
-            game_state = None
-            try:
-                game_state = CambiaGameState(house_rules=self.config.cambia_rules)
-                initial_hands_for_log = [list(p.hand) for p in game_state.players]
-                initial_peeks_for_log = [
-                    p.initial_peek_indices for p in game_state.players
-                ]
-            except Exception as e:
-                logger.exception(
-                    "Error initializing game state on iteration %d: %s",
-                    self.current_iteration,
-                    e,
-                )
-                progress_bar.set_postfix_str("Error init game, skipping")
-                continue
-            reach_probs = np.ones(self.num_players, dtype=np.float64)
-            initial_agent_states = []
-            action_log_for_game: List[Dict] = []
-            if not game_state.is_terminal():
-                initial_obs = self._create_observation(
-                    None, None, game_state, -1, [], None
-                )
-                for i in range(self.num_players):
-                    try:
-                        agent = AgentState(
-                            player_id=i,
-                            opponent_id=game_state.get_opponent_index(i),
-                            memory_level=self.config.agent_params.memory_level,
-                            time_decay_turns=self.config.agent_params.time_decay_turns,
-                            initial_hand_size=len(initial_hands_for_log[i]),
-                            config=self.config,
-                        )
-                        agent.initialize(
-                            initial_obs,
-                            initial_hands_for_log[i],
-                            initial_peeks_for_log[i],
-                        )
-                        initial_agent_states.append(agent)
-                    except Exception as e:
-                        logger.exception(
-                            "Error initializing AgentState %d on iteration %d: %s",
-                            i,
-                            self.current_iteration,
-                            e,
-                        )
-                        initial_agent_states = []
-                        break
-            else:
-                logger.error(
-                    "Game is terminal immediately after initialization on iteration %d. Skipping.",
-                    self.current_iteration,
-                )
-                progress_bar.set_postfix_str("Error game terminal init, skipping")
-                continue
-            if not initial_agent_states:
-                progress_bar.set_postfix_str("Error init agents, skipping")
-                continue
-            final_utilities = None
-            game_failed = False
-            try:
-                final_utilities = self._cfr_recursive(
-                    game_state,
-                    initial_agent_states,
-                    reach_probs,
-                    self.current_iteration,
-                    action_log_for_game,
-                    status_bar,  # Pass the status bar here
-                    depth=0,
-                )
-                game_details = self.analysis.format_game_details_for_log(
-                    game_state=game_state,
-                    iteration=self.current_iteration,
-                    initial_hands=initial_hands_for_log,
-                    action_sequence=action_log_for_game,
-                )
-                self.analysis.log_game_history(game_details)
-            except RecursionError:
-                logger.error(
-                    "Iter %d, MaxDepth %d: Recursion depth exceeded! Saving progress and stopping.",
-                    self.current_iteration,
-                    self.max_depth_this_iter,
-                )
-                logger.error("State at RecursionError (approx): %s", game_state)
-                if action_log_for_game:
-                    logger.error(
-                        "Last actions:\n%s",
-                        "\n".join([f"  {e}" for e in action_log_for_game[-10:]]),
-                    )
-                logger.error("Traceback:\n%s", traceback.format_exc())
-                progress_bar.set_postfix_str("RecursionError!")
-                game_failed = True
-                self.save_data()
-                raise
-            except Exception as e:
-                logger.exception(
-                    "Error during CFR recursion on iteration %d: %s",
-                    self.current_iteration,
-                    e,
-                )
-                logger.error("State at Error: %s", game_state)
-                progress_bar.set_postfix_str(f"CFRError! {type(e).__name__}")
-                game_failed = True
-            if game_failed:
-                continue
-            iter_time = time.time() - iter_start_time
-
-            # --- Calculate Exploitability Periodically ---
-            if (
-                exploitability_interval > 0
-                and self.current_iteration % exploitability_interval == 0
-            ):
-                exploit_start_time = time.time()
-                logger.info(
-                    "Calculating exploitability at iteration %d...",
-                    self.current_iteration,
-                )
-                current_avg_strategy = self.compute_average_strategy()
-                if current_avg_strategy:
-                    exploit = self.analysis.calculate_exploitability(
-                        current_avg_strategy, self.config
-                    )
-                    self.exploitability_results.append((self.current_iteration, exploit))
-                    self._last_exploit_str = (
-                        f"{exploit:.3f}" if exploit != float("inf") else "N/A"
-                    )
-                    exploit_calc_time = time.time() - exploit_start_time
-                    logger.info(
-                        "Exploitability calculated: %.4f (took %.2fs)",
-                        exploit,
-                        exploit_calc_time,
-                    )
-                else:
+        try:
+            for t in progress_bar:
+                # Check for shutdown request *before* starting the iteration's work
+                if self.shutdown_event.is_set():
                     logger.warning(
-                        "Could not compute average strategy for exploitability calculation."
+                        "Shutdown detected before iteration %d. Stopping.", t + 1
                     )
-                    self._last_exploit_str = "N/A"
+                    raise GracefulShutdownException("Shutdown detected before iteration")
 
-            self._total_infosets_str = f"{len(self.regret_sum):,}"
+                iter_start_time = time.time()
+                self.current_iteration = t + 1
+                self.max_depth_this_iter = 0
 
-            # Update the main progress bar's postfix *after* the iteration is done
-            postfix_dict = {
-                "LastT": f"{iter_time:.2f}s",
-                "DepthMax": f"{self.max_depth_this_iter}",
-                "Expl": self._last_exploit_str,
-                "TotalNodes": self._total_infosets_str,
-            }
-            progress_bar.set_postfix(postfix_dict, refresh=True)
+                # Update status bar before starting iteration
+                status_bar.set_description_str(
+                    f"Iter {self.current_iteration}/{end_iteration} | Depth:0 | MaxD:0 | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+                )
 
-            # Update the status bar description again after iteration finishes
-            status_bar.set_description_str(
-                f"Iter {self.current_iteration}/{end_iteration} complete | Depth:N/A | MaxD:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+                game_state = None
+                try:
+                    game_state = CambiaGameState(house_rules=self.config.cambia_rules)
+                    initial_hands_for_log = [list(p.hand) for p in game_state.players]
+                    initial_peeks_for_log = [
+                        p.initial_peek_indices for p in game_state.players
+                    ]
+                except Exception as e:
+                    logger.exception(
+                        "Error initializing game state on iteration %d: %s",
+                        self.current_iteration,
+                        e,
+                    )
+                    progress_bar.set_postfix_str("Error init game, skipping")
+                    continue
+                reach_probs = np.ones(self.num_players, dtype=np.float64)
+                initial_agent_states = []
+                action_log_for_game: List[Dict] = []
+                if not game_state.is_terminal():
+                    initial_obs = self._create_observation(
+                        None, None, game_state, -1, [], None
+                    )
+                    for i in range(self.num_players):
+                        try:
+                            agent = AgentState(
+                                player_id=i,
+                                opponent_id=game_state.get_opponent_index(i),
+                                memory_level=self.config.agent_params.memory_level,
+                                time_decay_turns=self.config.agent_params.time_decay_turns,
+                                initial_hand_size=len(initial_hands_for_log[i]),
+                                config=self.config,
+                            )
+                            agent.initialize(
+                                initial_obs,
+                                initial_hands_for_log[i],
+                                initial_peeks_for_log[i],
+                            )
+                            initial_agent_states.append(agent)
+                        except Exception as e:
+                            logger.exception(
+                                "Error initializing AgentState %d on iteration %d: %s",
+                                i,
+                                self.current_iteration,
+                                e,
+                            )
+                            initial_agent_states = []
+                            break
+                else:
+                    logger.error(
+                        "Game is terminal immediately after initialization on iteration %d. Skipping.",
+                        self.current_iteration,
+                    )
+                    progress_bar.set_postfix_str("Error game terminal init, skipping")
+                    continue
+                if not initial_agent_states:
+                    progress_bar.set_postfix_str("Error init agents, skipping")
+                    continue
+                final_utilities = None
+                game_failed = False
+                try:
+                    # Pass the shutdown event down to the recursive function
+                    final_utilities = self._cfr_recursive(
+                        game_state,
+                        initial_agent_states,
+                        reach_probs,
+                        self.current_iteration,
+                        action_log_for_game,
+                        status_bar,  # Pass the status bar here
+                        depth=0,
+                        shutdown_event=self.shutdown_event,  # Pass event
+                    )
+                    game_details = self.analysis.format_game_details_for_log(
+                        game_state=game_state,
+                        iteration=self.current_iteration,
+                        initial_hands=initial_hands_for_log,
+                        action_sequence=action_log_for_game,
+                    )
+                    self.analysis.log_game_history(game_details)
+                except GracefulShutdownException as shutdown_exc:
+                    logger.warning(
+                        "Graceful shutdown triggered during iteration %d.",
+                        self.current_iteration,
+                    )
+                    raise shutdown_exc  # Re-raise to be caught by outer handler
+                except RecursionError:
+                    logger.error(
+                        "Iter %d, MaxDepth %d: Recursion depth exceeded! Saving progress and stopping.",
+                        self.current_iteration,
+                        self.max_depth_this_iter,
+                    )
+                    logger.error("State at RecursionError (approx): %s", game_state)
+                    if action_log_for_game:
+                        logger.error(
+                            "Last actions:\n%s",
+                            "\n".join([f"  {e}" for e in action_log_for_game[-10:]]),
+                        )
+                    logger.error("Traceback:\n%s", traceback.format_exc())
+                    progress_bar.set_postfix_str("RecursionError!")
+                    game_failed = True
+                    self.save_data()
+                    raise
+                except Exception as e:
+                    logger.exception(
+                        "Error during CFR recursion on iteration %d: %s",
+                        self.current_iteration,
+                        e,
+                    )
+                    logger.error("State at Error: %s", game_state)
+                    progress_bar.set_postfix_str(f"CFRError! {type(e).__name__}")
+                    game_failed = True
+                if game_failed:
+                    continue
+                iter_time = time.time() - iter_start_time
+
+                # --- Calculate Exploitability Periodically ---
+                if (
+                    exploitability_interval > 0
+                    and self.current_iteration % exploitability_interval == 0
+                ):
+                    exploit_start_time = time.time()
+                    logger.info(
+                        "Calculating exploitability at iteration %d...",
+                        self.current_iteration,
+                    )
+                    current_avg_strategy = self.compute_average_strategy()
+                    if current_avg_strategy:
+                        exploit = self.analysis.calculate_exploitability(
+                            current_avg_strategy, self.config
+                        )
+                        self.exploitability_results.append(
+                            (self.current_iteration, exploit)
+                        )
+                        self._last_exploit_str = (
+                            f"{exploit:.3f}" if exploit != float("inf") else "N/A"
+                        )
+                        exploit_calc_time = time.time() - exploit_start_time
+                        logger.info(
+                            "Exploitability calculated: %.4f (took %.2fs)",
+                            exploit,
+                            exploit_calc_time,
+                        )
+                    else:
+                        logger.warning(
+                            "Could not compute average strategy for exploitability calculation."
+                        )
+                        self._last_exploit_str = "N/A"
+
+                self._total_infosets_str = f"{len(self.regret_sum):,}"
+
+                # Update the main progress bar's postfix *after* the iteration is done
+                postfix_dict = {
+                    "LastT": f"{iter_time:.2f}s",
+                    "DepthMax": f"{self.max_depth_this_iter}",
+                    "Expl": self._last_exploit_str,
+                    "TotalNodes": self._total_infosets_str,
+                }
+                progress_bar.set_postfix(postfix_dict, refresh=True)
+
+                # Update the status bar description again after iteration finishes
+                status_bar.set_description_str(
+                    f"Iter {self.current_iteration}/{end_iteration} complete | Depth:N/A | MaxD:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+                )
+
+                if self.current_iteration % self.config.cfr_training.save_interval == 0:
+                    self.save_data()
+
+        except GracefulShutdownException:
+            # This catches the exception raised from _cfr_recursive or the loop start check
+            logger.warning(
+                "Graceful shutdown exception caught in train loop. Saving progress..."
             )
-
-            if self.current_iteration % self.config.cfr_training.save_interval == 0:
+            try:
                 self.save_data()
+                logger.info("Progress saved successfully.")
+            except Exception as save_e:
+                logger.error("Failed to save progress during shutdown: %s", save_e)
+            # Re-raise KeyboardInterrupt so main can catch it
+            raise KeyboardInterrupt("Graceful shutdown initiated")
 
-        # Close both bars after the loop
+        # Close both bars after the loop (if it completes normally)
         status_bar.close()
         progress_bar.close()
 
@@ -395,7 +438,13 @@ class CFRTrainer:
         action_log: List[Dict],
         status_bar: tqdm,  # Pass the status bar instead of progress bar
         depth: int,
+        shutdown_event: threading.Event,  # Accept shutdown event
     ) -> np.ndarray:
+
+        # --- Check for Shutdown Request ---
+        if shutdown_event.is_set():
+            raise GracefulShutdownException("Shutdown requested during recursion")
+
         self.max_depth_this_iter = max(self.max_depth_this_iter, depth)
 
         # --- Update Status Bar ---
@@ -690,8 +739,26 @@ class CFRTrainer:
                     action_log,
                     status_bar,  # Pass status bar down
                     depth + 1,
+                    shutdown_event=shutdown_event,  # Pass event down
                 )
                 action_utilities[i] = recursive_utilities
+            except GracefulShutdownException as shutdown_exc:
+                # Important: Catch, log, undo, THEN re-raise so higher levels also know
+                logger.debug(
+                    "Iter %d, P%d, Depth %d: Graceful shutdown caught during recursion for action %s.",
+                    iteration,
+                    player,
+                    depth,
+                    action,
+                )
+                if undo_info:
+                    try:
+                        undo_info()
+                    except Exception as undo_e:
+                        logger.error(
+                            "Error undoing action during shutdown propagation: %s", undo_e
+                        )
+                raise shutdown_exc  # Propagate up
             except RecursionError as rec_err:
                 logger.error(
                     "Iter %d, P%d, Depth %d: Recursion depth exceeded during action: %s. State: %s",
