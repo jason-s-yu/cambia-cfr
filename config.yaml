@@ -47,7 +47,7 @@ persistence:
 
 # Logging Configuration
 logging:
-  log_level_file: "DEBUG"       # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level_file: "INFO"        # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   log_level_console: "ERROR"    # Logging level for the console
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory

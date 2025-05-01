@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .game_engine import CambiaGameState, StateDelta, UndoInfo
 from .constants import (
-     ActionAbilityKingSwapDecision, GameAction, NUM_PLAYERS,
+     ActionAbilityKingSwapDecision, GameAction, NUM_PLAYERS, CardObject,
      ActionPassSnap, ActionSnapOwn, ActionSnapOpponent, ActionSnapOpponentMove,
      ActionDrawStockpile, ActionDrawDiscard, ActionReplace, ActionDiscard,
      ActionAbilityPeekOwnSelect, ActionAbilityPeekOtherSelect, ActionAbilityKingLookSelect,
@@ -21,6 +21,7 @@ from .agent_state import AgentState, AgentObservation
 from .utils import InfosetKey, PolicyDict, ReachProbDict, get_rm_plus_strategy, normalize_probabilities
 from .config import Config
 from .analysis_tools import AnalysisTools
+from .card import Card # Import Card for type hint
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,8 @@ class CFRTrainer:
             action_log_for_game: List[Dict] = []
 
             if not game_state.is_terminal():
-                 initial_obs = self._create_observation(None, None, game_state, -1, [])
+                 # Pass None for drawn_card initially
+                 initial_obs = self._create_observation(None, None, game_state, -1, [], None)
                  for i in range(self.num_players):
                       try:
                            agent = AgentState(
@@ -195,7 +197,7 @@ class CFRTrainer:
             exploit_str = f"Expl: {last_exploit:.3f}" if last_exploit != float('inf') else "Expl: N/A"
 
             # --- Calculate Exploitability Periodically ---
-            if self.current_iteration % exploitability_interval == 0:
+            if exploitability_interval > 0 and self.current_iteration % exploitability_interval == 0:
                  exploit_start_time = time.time()
                  logger.info(f"Calculating exploitability at iteration {self.current_iteration}...")
                  current_avg_strategy = self.compute_average_strategy() # Ensure it's up-to-date
@@ -363,16 +365,24 @@ class CFRTrainer:
             action_log_entry = { "player": player, "turn": game_state.get_turn_number(), "depth": depth, "context": current_context.name, "state_desc_before": str(game_state), "infoset_key": infoset_key, "action": action, "action_prob": action_prob, "reach_prob": player_reach }
             state_before_this_action_str = action_log_entry["state_desc_before"]
             state_delta: Optional[StateDelta] = None; undo_info: Optional[UndoInfo] = None; state_after_action_desc = "ERROR";
+            drawn_card_this_step: Optional[CardObject] = None # Track drawn card for observation
 
             try:
+                 # --- Get drawn card BEFORE applying action if it's a Draw action ---
+                 # This is needed because apply_action consumes the pending state
+                 if isinstance(action, (ActionReplace, ActionDiscard)) and game_state.pending_action_data.get("drawn_card"):
+                      drawn_card_this_step = game_state.pending_action_data["drawn_card"]
+
                  state_delta, undo_info = game_state.apply_action(action)
                  state_after_action_desc = str(game_state)
             except Exception as apply_err:
                  logger.error(f"Iter {iteration}, P{player}, Depth {depth}: Error applying action {action} in state {state_before_this_action_str} at infoset {infoset_key}: {apply_err}", exc_info=False)
                  action_log_entry["outcome"] = f"ERROR applying action: {apply_err}"; action_log.append(action_log_entry); undo_info = None; continue
 
-            # Observation uses snap log *after* action potentially modifies it
-            observation = self._create_observation(None, action, game_state, player, game_state.snap_results_log)
+            # Create observation AFTER action, passing the drawn card if available
+            observation = self._create_observation(
+                 None, action, game_state, player, game_state.snap_results_log, drawn_card_this_step
+            )
 
             next_agent_states = []
             agent_update_failed = False
@@ -462,7 +472,15 @@ class CFRTrainer:
               filtered_obs.peeked_cards = filtered_peek if filtered_peek else None
          return filtered_obs
 
-    def _create_observation(self, prev_state: Optional[CambiaGameState], action: Optional[GameAction], next_state: CambiaGameState, acting_player: int, snap_results: List[Dict]) -> AgentObservation:
+    def _create_observation(self,
+                             prev_state: Optional[CambiaGameState],
+                             action: Optional[GameAction],
+                             next_state: CambiaGameState,
+                             acting_player: int,
+                             snap_results: List[Dict],
+                             # Explicitly pass drawn card if known from the action context
+                             explicit_drawn_card: Optional[CardObject] = None
+                             ) -> AgentObservation:
          """ Creates the observation object based on state change (uses next_state). """
          discard_top = next_state.get_discard_top()
          hand_sizes = [next_state.get_player_card_count(i) for i in range(self.num_players)]
@@ -471,13 +489,14 @@ class CFRTrainer:
          who_called = next_state.cambia_caller_id
          game_over = next_state.is_terminal()
          turn_num = next_state.get_turn_number()
-         drawn_card = None
+         drawn_card = explicit_drawn_card # Use explicitly passed card first
          peeked_cards_dict = None # Dictionary to hold peek results {(player_idx, hand_idx): Card}
 
-         # Check pending state for drawn card info (relevant after Draw actions)
-         if next_state.pending_action and next_state.pending_action_player == acting_player:
+         # Check pending state for drawn card info (redundant if explicit_drawn_card is passed, but safe fallback)
+         # This state might be cleared by the time observation is created for Replace action.
+         if drawn_card is None and next_state.pending_action and next_state.pending_action_player == acting_player:
               pending_data = next_state.pending_action_data
-              # If the pending action implies a card was just drawn (e.g., Discard/Replace choice)
+              # If the pending action implies a card was just drawn (e.g., Discard choice AFTER draw)
               if isinstance(next_state.pending_action, ActionDiscard):
                    drawn_card = pending_data.get("drawn_card")
 

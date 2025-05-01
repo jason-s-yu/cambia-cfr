@@ -97,12 +97,20 @@ def load_config(config_path: str = "config.yaml") -> Optional[Config]: # Return 
                 print(f"Warning: Config file '{config_path}' is empty or invalid. Using default configuration.")
                 config_dict = {} # Use empty dict to proceed with defaults
 
-            # Using helper for safer nested access with defaults from dataclasses
+            # Retrieve the 'api' section safely, defaulting to an empty dict if not found
+            api_config_dict = config_dict.get('api', {})
+            # Retrieve the nested 'auth' dictionary within 'api', defaulting to empty if not found
+            auth_dict = api_config_dict.get('auth', {})
+
+            # Construct ApiConfig using values from the loaded dict or defaults
+            api_config = ApiConfig(
+                base_url=api_config_dict.get('base_url', ApiConfig.base_url),
+                auth=auth_dict # Directly assign the retrieved auth dictionary
+            )
+
+            # Using helper for safer nested access with defaults from dataclasses for other sections
             return Config(
-                api=ApiConfig(
-                    base_url=get_nested(config_dict, ['api', 'base_url'], ApiConfig.base_url),
-                    auth=get_nested(config_dict, ['api', 'auth'], ApiConfig.auth)
-                ),
+                api=api_config, # Use the manually constructed ApiConfig
                 system=SystemConfig(
                     recursion_limit=get_nested(config_dict, ['system', 'recursion_limit'], SystemConfig.recursion_limit)
                 ),

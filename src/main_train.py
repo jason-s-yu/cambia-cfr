@@ -6,6 +6,7 @@ import os
 import datetime
 import sys
 from tqdm import tqdm # Import tqdm
+import time # For custom namer
 
 from .config import load_config
 from .cfr_trainer import CFRTrainer
@@ -23,6 +24,30 @@ class TqdmLoggingHandler(logging.Handler):
             self.flush()
         except Exception:
             self.handleError(record)
+
+# Custom Namer for RotatingFileHandler
+def log_namer(default_name: str) -> str:
+    """
+    Custom namer for RotatingFileHandler to achieve {prefix}_{date}_{number}.log format.
+    Extracts prefix and date from the base filename structure.
+    """
+    # default_name will be like /path/to/logs/prefix_run_date/prefix.log.N
+    dir_name, base_filename = os.path.split(default_name)
+    parts = base_filename.split('.')
+    prefix = parts[0]
+    num = parts[-1] # The rotation number
+
+    # Extract date from directory name (assuming format prefix_run_YYYY_MM_DD-HHMMSS)
+    run_dir_name = os.path.basename(dir_name)
+    try:
+        date_part = run_dir_name.split('_run_')[-1]
+    except IndexError:
+        # Fallback if directory name format is unexpected
+        date_part = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
+
+    new_filename = f"{prefix}_{date_part}_{int(num):03d}.log"
+    return os.path.join(dir_name, new_filename)
+
 
 def setup_logging(config, verbose: bool):
     """Configures logging to console, timestamped+chunked file, and latest log dir link."""
@@ -48,16 +73,17 @@ def setup_logging(config, verbose: bool):
         print(f"ERROR: Could not create main log directory '{main_log_dir}': {e}. Logging disabled.")
         return None, None # Indicate failure
 
-    # Create timestamped dir for this run
+    # Create timestamped dir for this run with the new format
     timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
-    run_log_dir = os.path.join(main_log_dir, f"run_{timestamp}")
+    # Use the configured log prefix for the directory name
+    run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run_{timestamp}")
     try:
         os.makedirs(run_log_dir, exist_ok=True)
     except OSError as e:
         print(f"ERROR: Could not create run-specific log directory '{run_log_dir}': {e}. Logging disabled.")
         return None, None
 
-    # Base log file path inside run dir
+    # Base log file path inside run dir (still uses prefix.log as base for rotator)
     log_filename_base = os.path.join(run_log_dir, f"{log_prefix}.log")
 
     # Formatter
@@ -92,6 +118,16 @@ def setup_logging(config, verbose: bool):
             backupCount=backup_count,
             encoding='utf-8'
         )
+        # Assign the custom namer
+        fh.namer = log_namer
+        # Note: Rollover occurs *before* the next message is written.
+        # The current file will be named prefix.log until it's full.
+        # When it rolls over, prefix.log becomes prefix_date_001.log,
+        # and a new prefix.log is created. This isn't exactly the requested
+        # {prefix}_{date}_{batch}.log format for *all* files including the current one.
+        # Achieving that would require a more complex handler or renaming after creation.
+        # This setup gives: prefix.log (current), prefix_date_001.log, prefix_date_002.log ...
+
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
         root_logger.addHandler(fh)
@@ -100,7 +136,7 @@ def setup_logging(config, verbose: bool):
         logger.info("-" * 50)
         logger.info(f"Logging initialized for run: {timestamp}")
         logger.info(f"Log Directory: {run_log_dir}")
-        logger.info(f"Base Log File: {log_filename_base}")
+        logger.info(f"Base Log File: {log_filename_base} (rolls over to {log_prefix}_{timestamp}_NNN.log)")
         logger.info(f"Log Chunk Size: {max_bytes / (1024*1024):.1f} MB")
         logger.info(f"Max Log Chunks: {backup_count}")
         logger.info(f"File Log Level: {logging.getLevelName(file_log_level)}")

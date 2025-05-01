@@ -46,7 +46,7 @@ class AgentObservation:
      player_hand_sizes: List[int]
      stockpile_size: int
      # Information specific to the observing player:
-     drawn_card: Optional[CardObject] = None # If observing player drew
+     drawn_card: Optional[CardObject] = None # If observing player drew *or* action involved a drawn card
      peeked_cards: Optional[Dict[Tuple[int, int], CardObject]] = None # {(player_idx, hand_idx): Card}
      # Snap related info (Now detailed)
      snap_results: List[Dict[str, Any]] = field(default_factory=list) # List of dicts from GameState.snap_results_log
@@ -207,18 +207,21 @@ class AgentState:
         if action:
             if actor == self.player_id:
                 if isinstance(action, ActionReplace):
-                    if observation.drawn_card:
+                    # Use observation.drawn_card which should now be correctly populated
+                    drawn_card_from_obs = observation.drawn_card
+                    if drawn_card_from_obs:
                         target_idx = action.target_hand_index
-                        drawn_bucket = get_card_bucket(observation.drawn_card)
+                        drawn_bucket = get_card_bucket(drawn_card_from_obs)
                         if target_idx in self.own_hand:
                             # Update the known card info directly
-                            self.own_hand[target_idx] = KnownCardInfo(bucket=drawn_bucket, last_seen_turn=self._current_game_turn, card=observation.drawn_card)
-                            logger.debug(f"Agent {self.player_id} updated own hand index {target_idx} to {drawn_bucket.name} after replace.")
+                            self.own_hand[target_idx] = KnownCardInfo(bucket=drawn_bucket, last_seen_turn=self._current_game_turn, card=drawn_card_from_obs)
+                            logger.debug(f"Agent {self.player_id} updated own hand index {target_idx} to {drawn_bucket.name} after replace with {drawn_card_from_obs}.")
                         else:
                             # This might happen if reconciliation failed, but should be less likely now
                             logger.warning(f"Agent {self.player_id} Replace target index {target_idx} not found after reconciliation (Current indices: {list(self.own_hand.keys())}). State likely inconsistent.")
                     else:
-                        logger.warning("Replace action observed for self, but no drawn card in observation.")
+                        # This warning should no longer appear if the observation passing is fixed
+                        logger.error("Replace action observed for self, but no drawn card in observation. Belief update failed.")
 
                 elif isinstance(action, ActionDiscard):
                      # Discarding drawn card, no direct belief update needed here
