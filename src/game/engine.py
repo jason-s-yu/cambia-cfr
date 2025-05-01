@@ -1,43 +1,33 @@
 # src/game/engine.py
 import random
-from typing import Callable, List, Tuple, Optional, Set, Any, Dict, Deque
+from collections import deque
+from typing import Callable, List, Tuple, Optional, Any, Dict, Deque
 from dataclasses import dataclass, field
 import logging
 import copy
-import numpy as np
-from collections import deque
 
 # Use relative imports for modules within the 'game' package
 from .types import StateDelta, StateDeltaChange, UndoInfo
 from .player_state import PlayerState
-from .helpers import card_has_discard_ability, serialize_card
+from .helpers import serialize_card
+
+# --- Import Mixins ---
+from ._query_mixin import QueryMixin
+from ._snap_mixin import SnapLogicMixin
+from ._ability_mixin import AbilityMixin
+
+# Add imports for other mixins if created (e.g., SetupMixin, TurnLogicMixin)
 
 # Use relative imports for modules outside the 'game' package but within 'src'
 from ..card import Card, create_standard_deck
 from ..constants import (
-    KING,
-    QUEEN,
-    JACK,
-    NINE,
-    TEN,
-    SEVEN,
-    EIGHT,
+    # Keep only constants actually used in *this* file after refactoring
+    NUM_PLAYERS,
     GameAction,
-    ActionPassSnap,
-    ActionSnapOwn,
-    ActionSnapOpponent,
-    ActionSnapOpponentMove,
-    ActionDiscard,
-    ActionReplace,
-    ActionCallCambia,
     ActionDrawStockpile,
     ActionDrawDiscard,
-    ActionAbilityPeekOwnSelect,
-    ActionAbilityPeekOtherSelect,
-    ActionAbilityBlindSwapSelect,
-    ActionAbilityKingLookSelect,
-    ActionAbilityKingSwapDecision,
-    NUM_PLAYERS,
+    ActionCallCambia,
+    ActionDiscard
 )
 from ..config import CambiaRulesConfig
 
@@ -45,13 +35,19 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CambiaGameState:
-    """Represents the true, objective state of a 1v1 Cambia game. Now uses delta-based updates."""
+class CambiaGameState(
+    QueryMixin, SnapLogicMixin, AbilityMixin
+):  # Add mixins to inheritance
+    """
+    Represents the true, objective state of a 1v1 Cambia game.
+    Uses delta-based updates and mixins for modularity.
+    """
 
+    # --- Core State Attributes ---
     players: List[PlayerState] = field(default_factory=list)
     stockpile: List[Card] = field(default_factory=list)
     discard_pile: List[Card] = field(default_factory=list)
-    current_player_index: int = 0
+    current_player_index: int = 0  # Player whose turn it nominally is
     num_players: int = NUM_PLAYERS
     cambia_caller_id: Optional[int] = None
     turns_after_cambia: int = 0
@@ -61,24 +57,29 @@ class CambiaGameState:
     _utilities: List[float] = field(default_factory=lambda: [0.0] * NUM_PLAYERS)
     _turn_number: int = 0
 
+    # --- Pending Action State (Managed primarily by AbilityMixin) ---
     pending_action: Optional[GameAction] = None
     pending_action_player: Optional[int] = None
     pending_action_data: Dict[str, Any] = field(default_factory=dict)
 
+    # --- Snap Phase State (Managed primarily by SnapLogicMixin) ---
     snap_phase_active: bool = False
     snap_discarded_card: Optional[Card] = None
     snap_potential_snappers: List[int] = field(default_factory=list)
     snap_current_snapper_idx: int = 0
-    snap_results_log: List[Dict[str, Any]] = field(
-        default_factory=list
-    )  # Log snap attempts/results
+    snap_results_log: List[Dict[str, Any]] = field(default_factory=list)
 
+    # --- Initialization ---
     def __post_init__(self):
+        # If players list is empty, it indicates a new game needs setup
         if not self.players:
             self._setup_game()
+        # Initialize utilities based on num_players if needed (though default_factory handles it)
+        if len(self._utilities) != self.num_players:
+            self._utilities = [0.0] * self.num_players
 
     def _setup_game(self):
-        """Initializes the deck, shuffles, and deals cards."""
+        """Initializes the deck, shuffles, and deals cards. (Could be moved to SetupMixin)."""
         self.stockpile = create_standard_deck(include_jokers=self.house_rules.use_jokers)
         random.shuffle(self.stockpile)
         initial_peek_count = self.house_rules.initial_view_count
@@ -88,9 +89,11 @@ class CambiaGameState:
             for _ in range(self.num_players)
         ]
 
+        # Deal cards
         for _ in range(cards_per_player):
             for i in range(self.num_players):
                 if self.stockpile:
+                    # Basic validation during setup
                     if (
                         i < len(self.players)
                         and hasattr(self.players[i], "hand")
@@ -107,9 +110,13 @@ class CambiaGameState:
                         )
                 else:
                     logger.warning("Stockpile empty during initial deal!")
-                    break
-        self.discard_pile = []
-        self.current_player_index = random.randint(0, self.num_players - 1)
+                    break  # Stop dealing if stockpile runs out
+
+        self.discard_pile = []  # Start with empty discard
+        self.current_player_index = random.randint(
+            0, self.num_players - 1
+        )  # Random start player
+        # Reset all other state variables explicitly
         self.cambia_caller_id = None
         self.turns_after_cambia = 0
         self._game_over = False
@@ -120,284 +127,51 @@ class CambiaGameState:
         self.pending_action_player = None
         self.pending_action_data = {}
         self.snap_phase_active = False
+        self.snap_discarded_card = None
+        self.snap_potential_snappers = []
+        self.snap_current_snapper_idx = 0
         self.snap_results_log = []
+
         logger.debug(
             "Game setup complete. Player %s starts (Turn %s).",
             self.current_player_index,
             self._turn_number,
         )
-        logger.debug(
-            "Initial hands (hidden): %s",
-            [len(p.hand) if hasattr(p, "hand") else "ERROR" for p in self.players],
-        )
         logger.debug("House Rules: %s", self.house_rules)
 
-    # --- Helper for the delta-based undo mechanism ---
-    def _add_change(
-        self,
-        change_func: Callable[[], Any],
-        undo_func: UndoInfo,
-        delta: StateDeltaChange,
-        undo_stack: Deque,
-        delta_list: StateDelta,
-    ):
-        """Applies change, adds undo, records delta."""
-        change_func()
-        delta_list.append(delta)
-        undo_stack.appendleft(undo_func)  # Add undo op to the *front* (LIFO)
-
-    def get_player_hand(self, player_index: int) -> List[Card]:
-        if 0 <= player_index < len(self.players) and hasattr(
-            self.players[player_index], "hand"
-        ):
-            return self.players[player_index].hand
-        logger.error(
-            "Invalid player index %s or player object missing hand in get_player_hand.",
-            player_index,
-        )
-        return []
-
-    def get_opponent_index(self, player_index: int) -> int:
-        return 1 - player_index
-
-    def get_player_card_count(self, player_index: int) -> int:
-        if 0 <= player_index < len(self.players) and hasattr(
-            self.players[player_index], "hand"
-        ):
-            return len(self.players[player_index].hand)
-        logger.warning(
-            "Invalid player index %s or missing hand in get_player_card_count. Returning 0.",
-            player_index,
-        )
-        return 0
-
-    def get_stockpile_size(self) -> int:
-        return len(self.stockpile)
-
-    def get_discard_top(self) -> Optional[Card]:
-        return self.discard_pile[-1] if self.discard_pile else None
-
-    def get_turn_number(self) -> int:
-        return self._turn_number
-
-    def get_legal_actions(self) -> Set[GameAction]:
-        """Returns the set of valid actions for the current acting player."""
-        legal_actions: Set[GameAction] = set()
-
-        if self._game_over:
-            return legal_actions
-
-        acting_player = self.get_acting_player()
-        if acting_player == -1:
-            logger.error("Cannot get legal actions: Invalid acting player (-1).")
-            return legal_actions
-
-        # --- Snap Phase Actions ---
-        if self.snap_phase_active:
-            if not (
-                0 <= acting_player < len(self.players)
-                and hasattr(self.players[acting_player], "hand")
-            ):
-                logger.error(
-                    "Snap phase: Acting player %s object invalid or missing hand.",
-                    acting_player,
-                )
-                return legal_actions
-            snapper_hand = self.players[acting_player].hand
-            if self.snap_discarded_card is None:
-                logger.error("Snap phase active but snap_discarded_card is None.")
-                return legal_actions
-            target_rank = self.snap_discarded_card.rank
-
-            if not all(isinstance(card, Card) for card in snapper_hand):
-                logger.error(
-                    "Snap phase: Player %s's hand contains non-Card objects: %s",
-                    acting_player,
-                    snapper_hand,
-                )
-                return legal_actions
-
-            legal_actions.add(ActionPassSnap())
-            for i, card in enumerate(snapper_hand):
-                if card.rank == target_rank:
-                    legal_actions.add(ActionSnapOwn(own_card_hand_index=i))
-            if self.house_rules.allowOpponentSnapping:
-                opponent_idx = self.get_opponent_index(acting_player)
-                if 0 <= opponent_idx < len(self.players) and hasattr(
-                    self.players[opponent_idx], "hand"
-                ):
-                    opponent_hand = self.players[opponent_idx].hand
-                    if not all(isinstance(card, Card) for card in opponent_hand):
-                        logger.error(
-                            "Snap phase: Opponent %s's hand contains non-Card objects: %s",
-                            opponent_idx,
-                            opponent_hand,
-                        )
-                    else:
-                        for i, card in enumerate(opponent_hand):
-                            if card.rank == target_rank:
-                                legal_actions.add(
-                                    ActionSnapOpponent(opponent_target_hand_index=i)
-                                )
-                else:
-                    logger.warning(
-                        "Snap phase: Opponent object %s invalid or missing hand, cannot check for SnapOpponent.",
-                        opponent_idx,
-                    )
-            return legal_actions
-
-        # --- Pending Action Resolution ---
-        elif self.pending_action:
-            if acting_player != self.pending_action_player:
-                logger.error(
-                    "Legal actions requested for P%d but pending action is for P%d",
-                    acting_player,
-                    self.pending_action_player,
-                )
-                return legal_actions
-            if not (
-                0 <= acting_player < len(self.players)
-                and hasattr(self.players[acting_player], "hand")
-            ):
-                logger.error(
-                    "Pending action: Acting player %s object invalid or missing hand.",
-                    acting_player,
-                )
-                return legal_actions
-
-            action_type = self.pending_action
-            player = self.pending_action_player
-
-            if isinstance(action_type, ActionDiscard):  # Post-Draw Choice
-                legal_actions.add(ActionDiscard(use_ability=False))
-                drawn_card = self.pending_action_data.get("drawn_card")
-                if drawn_card and card_has_discard_ability(drawn_card):  # Use helper
-                    legal_actions.add(ActionDiscard(use_ability=True))
-                for i in range(self.get_player_card_count(player)):
-                    legal_actions.add(ActionReplace(target_hand_index=i))
-            elif isinstance(action_type, ActionAbilityPeekOwnSelect):
-                for i in range(self.get_player_card_count(player)):
-                    legal_actions.add(ActionAbilityPeekOwnSelect(target_hand_index=i))
-            elif isinstance(action_type, ActionAbilityPeekOtherSelect):
-                opp_idx = self.get_opponent_index(player)
-                for i in range(self.get_player_card_count(opp_idx)):
-                    legal_actions.add(
-                        ActionAbilityPeekOtherSelect(target_opponent_hand_index=i)
-                    )
-            elif isinstance(action_type, ActionAbilityBlindSwapSelect):
-                own_count = self.get_player_card_count(player)
-                opp_idx = self.get_opponent_index(player)
-                opp_count = self.get_player_card_count(opp_idx)
-                for i in range(own_count):
-                    for j in range(opp_count):
-                        legal_actions.add(
-                            ActionAbilityBlindSwapSelect(
-                                own_hand_index=i, opponent_hand_index=j
-                            )
-                        )
-            elif isinstance(action_type, ActionAbilityKingLookSelect):
-                own_count = self.get_player_card_count(player)
-                opp_idx = self.get_opponent_index(player)
-                opp_count = self.get_player_card_count(opp_idx)
-                for i in range(own_count):
-                    for j in range(opp_count):
-                        legal_actions.add(
-                            ActionAbilityKingLookSelect(
-                                own_hand_index=i, opponent_hand_index=j
-                            )
-                        )
-            elif isinstance(action_type, ActionAbilityKingSwapDecision):
-                legal_actions.add(ActionAbilityKingSwapDecision(perform_swap=True))
-                legal_actions.add(ActionAbilityKingSwapDecision(perform_swap=False))
-            elif isinstance(action_type, ActionSnapOpponentMove):
-                snapper_idx = player
-                target_slot = self.pending_action_data.get("target_empty_slot_index")
-                if target_slot is None:
-                    logger.error("Missing target_empty_slot_index for SnapOpponentMove")
-                else:
-                    for i in range(self.get_player_card_count(snapper_idx)):
-                        legal_actions.add(
-                            ActionSnapOpponentMove(
-                                own_card_to_move_hand_index=i,
-                                target_empty_slot_index=target_slot,
-                            )
-                        )
-            else:
-                logger.error(
-                    "Unknown pending action type for legal actions: %s", action_type
-                )
-            return legal_actions
-
-        # --- Standard Start-of-Turn Actions ---
-        player = self.current_player_index
-        if not (
-            0 <= player < len(self.players) and hasattr(self.players[player], "hand")
-        ):
-            logger.error(
-                "Start of turn: Player %s object invalid or missing hand.", player
-            )
-            return legal_actions
-
-        can_draw_stockpile = bool(self.stockpile) or (len(self.discard_pile) > 1)
-        can_draw_discard = self.house_rules.allowDrawFromDiscardPile and self.discard_pile
-
-        if can_draw_stockpile:
-            legal_actions.add(ActionDrawStockpile())
-        if can_draw_discard:
-            legal_actions.add(ActionDrawDiscard())
-
-        cambia_allowed_round = self.house_rules.cambia_allowed_round
-        if self.cambia_caller_id is None and (
-            self._turn_number // self.num_players >= cambia_allowed_round
-        ):
-            legal_actions.add(ActionCallCambia())
-
-        if (
-            not legal_actions
-            and not (can_draw_stockpile or can_draw_discard)
-            and not self._game_over
-        ):
-            logger.warning(
-                "No legal actions possible and cannot draw/reshuffle for P%s. State: %s. Ending game.",
-                player,
-                self,
-            )
-            pass  # Game end will be checked later
-        elif not legal_actions and not self._game_over:
-            logger.warning(
-                "No legal actions found for player %s at start of turn in state: %s. Ending game.",
-                player,
-                self,
-            )
-            pass  # Game end will be checked later
-
-        return legal_actions
-
-    # --- Helper methods moved to helpers.py ---
-    # _card_has_discard_ability -> helpers.card_has_discard_ability
-    # _serialize_card -> helpers.serialize_card
+    # --- Core Action Application Logic ---
 
     def apply_action(self, action: GameAction) -> Tuple[StateDelta, UndoInfo]:
         """
         Applies the given action by modifying 'self' and returns a StateDelta list
-        and a callable UndoInfo.
+        and a callable UndoInfo. Delegates logic to mixins based on game phase.
         """
         if self._game_over:
             logger.warning("Attempted action on a finished game.")
-            return [], lambda: None
+            return [], lambda: None  # No change, no undo
 
-        acting_player = self.get_acting_player()
+        acting_player = self.get_acting_player()  # Method from QueryMixin
+
+        # Basic validation: Ensure the acting player is valid before proceeding
+        if acting_player == -1:
+            logger.error(
+                "Apply Action: Cannot determine valid acting player. State: %s", self
+            )
+            # This might indicate an inconsistent state. Avoid further changes.
+            # Consider setting game_over=True here? For now, just return no-op.
+            return [], lambda: None
         if not (
             0 <= acting_player < len(self.players)
             and hasattr(self.players[acting_player], "hand")
         ):
             logger.error(
-                "Apply Action: Invalid acting player %s or missing hand. State: %s",
+                "Apply Action: Invalid acting player P%s or missing hand. State: %s",
                 acting_player,
                 self,
             )
-            self._game_over = True
-            self._calculate_final_scores()
+            # This is a critical error state, potentially end the game.
+            # self._game_over = True # Needs undo handling if done here
+            # self._calculate_final_scores()
             return [], lambda: None
 
         # --- Undo Stack & Delta List for this action ---
@@ -406,663 +180,150 @@ class CambiaGameState:
 
         # --- Master Undo Function ---
         def undo_action():
-            # Execute undo operations in reverse order of changes
+            # Execute undo operations in reverse order of changes (LIFO)
             while undo_stack:
                 try:
-                    undo_func = undo_stack.popleft()  # Pop from front (LIFO)
+                    undo_func = (
+                        undo_stack.popleft()
+                    )  # Pop from front (where _add_change prepends)
                     undo_func()
                 except Exception as e:
                     logger.exception(
-                        f"Error during undo operation {undo_func}: {e}. State might be inconsistent."
+                        "Error during undo operation %s: %s. State might be inconsistent.", undo_func, e
                     )
+                    # Potentially raise or log more severely
 
-        # --- Action Application Logic (Modifies self, uses self._add_change) ---
+        # --- Action Application Logic (Delegates to Mixins) ---
         try:
-            # --- Snap Phase Action Handling ---
+            card_discarded_this_step: Optional[Card] = None
+            action_processed = False
+            turn_should_advance_after_action = False  # Flag to control turn advancement
+
+            # 1. Handle Snap Phase Actions (Uses SnapLogicMixin)
             if self.snap_phase_active:
-                if (
-                    acting_player
-                    != self.snap_potential_snappers[self.snap_current_snapper_idx]
-                ):
-                    logger.error(
-                        f"Action {action} received, but expected snap action from P{self.snap_potential_snappers[self.snap_current_snapper_idx]}. Ignoring."
-                    )
-                    return [], lambda: None
-
-                logger.debug(
-                    f"Snap Phase (Turn {self._turn_number}): Player {acting_player} choosing action: {action}"
+                # _handle_snap_action performs state changes via _add_change
+                action_processed = self._handle_snap_action(
+                    action, acting_player, undo_stack, delta_list
                 )
-                if self.snap_discarded_card is None:
-                    logger.error(
-                        "Apply action in snap phase, but snap_discarded_card is None. Cannot proceed."
-                    )
-                    self._end_snap_phase(undo_stack, delta_list)
-                    return delta_list, undo_action
+                # Snap phase handles its own advancement or termination. Turn advances when phase ends.
+                # If _handle_snap_action returns True, it means the action was valid for the phase.
+                # If it returns False, it means the action was ignored (e.g., wrong player).
 
-                target_rank = self.snap_discarded_card.rank
-                snap_success = False
-                snap_penalty = False
-                removed_card_info: Optional[Tuple[int, int, Card]] = (
-                    None  # (player_idx, hand_idx, card)
-                )
-                snapped_opponent_card_info: Optional[Tuple[int, int, Card]] = (
-                    None  # (player_idx, hand_idx, card)
-                )
-                attempted_card: Optional[Card] = None
-                action_type_str = type(action).__name__
-                snap_details: Dict[str, Any] = {}
-
-                # Helper for logging snap results (uses _add_change with explicit args)
-                def log_snap_result(details_dict):
-                    original_log = list(self.snap_results_log)
-
-                    def change():
-                        self.snap_results_log.append(details_dict)
-
-                    def undo():
-                        self.snap_results_log = original_log
-
-                    # Explicitly pass undo_stack and delta_list
-                    self._add_change(
-                        change,
-                        undo,
-                        ("snap_log_append", details_dict),
-                        undo_stack,
-                        delta_list,
-                    )
-
-                if isinstance(action, ActionPassSnap):
-                    logger.debug(f"Player {acting_player} passes snap.")
-                    snap_details = {
-                        "snapper": acting_player,
-                        "action_type": action_type_str,
-                        "target_rank": target_rank,
-                        "success": False,
-                        "penalty": False,
-                        "details": "Passed",
-                        "snapped_card": None,
-                    }
-                    log_snap_result(snap_details)
-
-                elif isinstance(action, ActionSnapOwn):
-                    snap_idx = action.own_card_hand_index
-                    hand = self.players[acting_player].hand
-                    if 0 <= snap_idx < len(hand):
-                        attempted_card = hand[snap_idx]
-                        if not isinstance(attempted_card, Card):
-                            logger.error(
-                                f"SnapOwn: Card at index {snap_idx} is not a Card object: {attempted_card}. Applying penalty."
-                            )
-                            snap_penalty = True
-                        elif attempted_card.rank == target_rank:
-                            card_to_remove = hand[snap_idx]
-                            original_discard_len = len(self.discard_pile)
-
-                            def change_snap_own():
-                                removed = self.players[acting_player].hand.pop(snap_idx)
-                                self.discard_pile.append(removed)
-
-                            def undo_snap_own():
-                                popped_discard = self.discard_pile.pop()
-                                self.players[acting_player].hand.insert(
-                                    snap_idx, popped_discard
-                                )
-
-                            delta_snap_own = (
-                                "snap_own_success",
-                                acting_player,
-                                snap_idx,
-                                serialize_card(card_to_remove),
-                            )  # Use helper
-                            self._add_change(
-                                change_snap_own,
-                                undo_snap_own,
-                                delta_snap_own,
-                                undo_stack,
-                                delta_list,
-                            )  # Pass args
-                            snap_success = True
-                            removed_card_info = (acting_player, snap_idx, card_to_remove)
-                            logger.info(
-                                f"Player {acting_player} snaps own {card_to_remove} (matching {target_rank}) from index {snap_idx}. Hand size: {len(self.players[acting_player].hand)}"
-                            )
-                        else:
-                            snap_penalty = True
-                    else:
-                        snap_penalty = True
-
-                    if snap_penalty:
-                        logger.warning(
-                            f"Player {acting_player} attempted invalid Snap Own: {action} (Target Rank: {target_rank}, Attempted Card: {attempted_card}). Applying penalty."
-                        )
-                        penalty_deltas = self._apply_penalty(
-                            acting_player, self.house_rules.penaltyDrawCount, undo_stack
-                        )
-                        delta_list.extend(penalty_deltas)
-                    snap_details = {
-                        "snapper": acting_player,
-                        "action_type": action_type_str,
-                        "target_rank": target_rank,
-                        "success": snap_success,
-                        "penalty": snap_penalty,
-                        "removed_own_index": (
-                            removed_card_info[1] if removed_card_info else None
-                        ),
-                        "snapped_card": (
-                            serialize_card(removed_card_info[2])
-                            if removed_card_info
-                            else None
-                        ),  # Use helper
-                        "attempted_card": (
-                            serialize_card(attempted_card)
-                            if snap_penalty and attempted_card
-                            else None
-                        ),  # Use helper
-                    }
-                    log_snap_result(snap_details)
-
-                elif isinstance(action, ActionSnapOpponent):
-                    if not self.house_rules.allowOpponentSnapping:
-                        logger.error(
-                            "Invalid Action: SnapOpponent attempted but rule disallowed."
-                        )
-                        snap_penalty = True
-                        penalty_deltas = self._apply_penalty(
-                            acting_player, self.house_rules.penaltyDrawCount, undo_stack
-                        )
-                        delta_list.extend(penalty_deltas)
-                        attempted_card = None
-                    else:
-                        opp_idx = self.get_opponent_index(acting_player)
-                        if not (
-                            0 <= opp_idx < len(self.players)
-                            and hasattr(self.players[opp_idx], "hand")
-                        ):
-                            logger.error(
-                                f"SnapOpponent: Opponent object {opp_idx} invalid or missing hand."
-                            )
-                            snap_penalty = True
-                            penalty_deltas = self._apply_penalty(
-                                acting_player,
-                                self.house_rules.penaltyDrawCount,
-                                undo_stack,
-                            )
-                            delta_list.extend(penalty_deltas)
-                            attempted_card = None
-                        else:
-                            opp_hand = self.players[opp_idx].hand
-                            target_opp_hand_idx = action.opponent_target_hand_index
-                            if 0 <= target_opp_hand_idx < len(opp_hand):
-                                attempted_card = opp_hand[target_opp_hand_idx]
-                                if not isinstance(attempted_card, Card):
-                                    logger.error(
-                                        f"SnapOpponent: Card at opponent index {target_opp_hand_idx} is not a Card object: {attempted_card}. Applying penalty."
-                                    )
-                                    snap_penalty = True
-                                elif attempted_card.rank == target_rank:
-                                    card_to_remove = opp_hand[target_opp_hand_idx]
-
-                                    def change_snap_opp_remove():
-                                        self.players[opp_idx].hand.pop(
-                                            target_opp_hand_idx
-                                        )
-
-                                    def undo_snap_opp_remove():
-                                        self.players[opp_idx].hand.insert(
-                                            target_opp_hand_idx, card_to_remove
-                                        )
-
-                                    delta_snap_opp_remove = (
-                                        "snap_opponent_remove",
-                                        opp_idx,
-                                        target_opp_hand_idx,
-                                        serialize_card(card_to_remove),
-                                    )  # Use helper
-                                    self._add_change(
-                                        change_snap_opp_remove,
-                                        undo_snap_opp_remove,
-                                        delta_snap_opp_remove,
-                                        undo_stack,
-                                        delta_list,
-                                    )  # Pass args
-                                    snap_success = True
-                                    snapped_opponent_card_info = (
-                                        opp_idx,
-                                        target_opp_hand_idx,
-                                        card_to_remove,
-                                    )
-                                    logger.info(
-                                        f"Player {acting_player} snaps opponent's {card_to_remove} at index {target_opp_hand_idx}. Requires move."
-                                    )
-                                    # --- State Change: Set pending action for move ---
-                                    original_pending = (
-                                        self.pending_action,
-                                        self.pending_action_player,
-                                        copy.deepcopy(self.pending_action_data),
-                                    )
-                                    original_snap_active = self.snap_phase_active
-
-                                    def change_pending_move():
-                                        self.pending_action = ActionSnapOpponentMove(
-                                            own_card_to_move_hand_index=-1,
-                                            target_empty_slot_index=-1,
-                                        )  # Placeholder action type
-                                        self.pending_action_player = acting_player
-                                        self.pending_action_data = {
-                                            "target_empty_slot_index": target_opp_hand_idx
-                                        }  # Store the target slot
-                                        self.snap_phase_active = False  # Move decision happens outside snap phase
-
-                                    def undo_pending_move():
-                                        (
-                                            self.pending_action,
-                                            self.pending_action_player,
-                                            self.pending_action_data,
-                                        ) = original_pending
-                                        self.snap_phase_active = original_snap_active
-
-                                    delta_pending = (
-                                        "set_pending_action",
-                                        "ActionSnapOpponentMove",
-                                        acting_player,
-                                        {"target_empty_slot_index": target_opp_hand_idx},
-                                        (
-                                            type(original_pending[0]).__name__
-                                            if original_pending[0]
-                                            else None
-                                        ),
-                                        original_pending[1],
-                                        original_pending[2],
-                                    )
-                                    delta_snap_active = (
-                                        "set_attr",
-                                        "snap_phase_active",
-                                        False,
-                                        original_snap_active,
-                                    )
-                                    self._add_change(
-                                        change_pending_move,
-                                        undo_pending_move,
-                                        delta_pending,
-                                        undo_stack,
-                                        delta_list,
-                                    )  # Pass args
-                                    delta_list.append(
-                                        delta_snap_active
-                                    )  # Log snap active change separately
-                                    # --- End State Change ---
-                                    snap_details = {
-                                        "snapper": acting_player,
-                                        "action_type": action_type_str,
-                                        "target_rank": target_rank,
-                                        "success": snap_success,
-                                        "penalty": False,
-                                        "removed_opponent_index": target_opp_hand_idx,
-                                        "snapped_card": serialize_card(
-                                            card_to_remove
-                                        ),  # Use helper
-                                    }
-                                    log_snap_result(snap_details)
-                                    # Return immediately as the next action is the MOVE decision
-                                    return delta_list, undo_action
-                                else:
-                                    snap_penalty = True
-                            else:
-                                snap_penalty = True
-
-                            if snap_penalty:
-                                logger.warning(
-                                    f"Player {acting_player} attempted invalid Snap Opponent: {action} (Target Rank: {target_rank}, Attempted Card: {attempted_card}). Applying penalty."
-                                )
-                                penalty_deltas = self._apply_penalty(
-                                    acting_player,
-                                    self.house_rules.penaltyDrawCount,
-                                    undo_stack,
-                                )
-                                delta_list.extend(penalty_deltas)
-                    if not snap_success:
-                        snap_details = {
-                            "snapper": acting_player,
-                            "action_type": action_type_str,
-                            "target_rank": target_rank,
-                            "success": False,
-                            "penalty": snap_penalty,
-                            "snapped_card": None,
-                            "attempted_card": (
-                                serialize_card(attempted_card)
-                                if snap_penalty and attempted_card
-                                else None
-                            ),  # Use helper
-                        }
-                        log_snap_result(snap_details)
-
-                else:
-                    logger.error(
-                        f"Invalid action type {type(action)} received during snap phase."
-                    )
-                    snap_details = {
-                        "snapper": acting_player,
-                        "action_type": "InvalidAction",
-                        "target_rank": target_rank,
-                        "success": False,
-                        "penalty": False,
-                        "details": f"Received {type(action).__name__}",
-                        "snapped_card": None,
-                    }
-                    log_snap_result(snap_details)
-
-                # --- State Change: Advance snap index ---
-                original_snap_idx_local = self.snap_current_snapper_idx
-                next_snap_idx = self.snap_current_snapper_idx + 1
-
-                def change_snap_idx():
-                    self.snap_current_snapper_idx = next_snap_idx
-
-                def undo_snap_idx():
-                    self.snap_current_snapper_idx = original_snap_idx_local
-
-                self._add_change(
-                    change_snap_idx,
-                    undo_snap_idx,
-                    (
-                        "set_attr",
-                        "snap_current_snapper_idx",
-                        next_snap_idx,
-                        original_snap_idx_local,
-                    ),
-                    undo_stack,
-                    delta_list,
-                )  # Pass args
-                # --- End State Change ---
-
-                # Check if snap phase ends
-                if self.snap_current_snapper_idx >= len(self.snap_potential_snappers):
-                    self._end_snap_phase(
-                        undo_stack, delta_list
-                    )  # Ends snap phase AND advances turn
-                self._check_game_end(
-                    undo_stack, delta_list
-                )  # Check game end after potential turn advance
-                return delta_list, undo_action
-
-            # --- Pending Action Resolution Handling ---
+            # 2. Handle Pending Action Resolution (Uses AbilityMixin)
             elif self.pending_action:
-                if acting_player != self.pending_action_player:
+                if acting_player == self.pending_action_player:
+                    # _handle_pending_action performs state changes via _add_change
+                    # It returns the card discarded during this step, if any (for snap check).
+                    card_discarded_this_step = self._handle_pending_action(
+                        action, acting_player, undo_stack, delta_list
+                    )
+                    if card_discarded_this_step is not None:
+                        # Action successfully resolved the pending state (e.g., discard/replace, ability choice)
+                        action_processed = True
+                        # If the pending action is now clear AND snap isn't active, the turn might advance.
+                        if not self.pending_action and not self.snap_phase_active:
+                            # Check for snap initiation *before* advancing turn
+                            snap_started = self._initiate_snap_phase(
+                                card_discarded_this_step, undo_stack, delta_list
+                            )
+                            if not snap_started:
+                                # If snap didn't start, the main turn can advance
+                                turn_should_advance_after_action = True
+                        # If a new pending action was set (e.g., King Look -> King Swap), turn doesn't advance yet.
+                        # If snap phase started, turn doesn't advance yet.
+                    elif action_processed is False and self.pending_action:
+                        # _handle_pending_action returning None AND pending_action still set
+                        # implies the submitted `action` was invalid for the *current* pending state.
+                        # Do nothing, wait for a valid action.
+                        logger.warning(
+                            "Invalid action %s for pending state %s. Waiting.", action, self.pending_action
+                        )
+                        action_processed = False  # Mark as not successfully processed
+                    else:
+                        # _handle_pending_action returned None, but pending state *was* cleared (e.g. error case)
+                        action_processed = True  # Action led to clearing pending state
+                        turn_should_advance_after_action = (
+                            True  # Turn potentially advances if error cleared state
+                        )
+
+                else:  # Wrong player for pending action (should be caught earlier by get_acting_player ideally)
                     logger.error(
-                        f"Action {action} received from P{acting_player} but pending action is for P{self.pending_action_player}"
+                        "Action %s from P%d received, but pending action requires P%d", action, acting_player, self.pending_action_player
                     )
-                    return [], lambda: None
+                    action_processed = False  # Action ignored
 
-                pending_type = self.pending_action
-                player = self.pending_action_player
-                discard_for_snap_check = None
-
-                # --- Handle Post-Draw Choices (Discard/Replace) ---
-                if isinstance(pending_type, ActionDiscard) and isinstance(
-                    action, (ActionDiscard, ActionReplace)
-                ):
-                    drawn_card = self.pending_action_data.get("drawn_card")
-                    if not drawn_card:
-                        logger.error("Pending post-draw choice but no drawn_card!")
-                        self._clear_pending_action(undo_stack, delta_list)
-                        return delta_list, undo_action
-
-                    if isinstance(action, ActionDiscard):
-                        logger.debug(
-                            f"Player {player} discards drawn {drawn_card}. Use ability: {action.use_ability}"
-                        )
-                        original_discard_len = len(self.discard_pile)
-
-                        def change_discard():
-                            self.discard_pile.append(drawn_card)
-
-                        def undo_discard():
-                            self.discard_pile.pop()
-
-                        self._add_change(
-                            change_discard,
-                            undo_discard,
-                            (
-                                "list_append",
-                                "discard_pile",
-                                original_discard_len,
-                                serialize_card(drawn_card),
-                            ),
-                            undo_stack,
-                            delta_list,
-                        )  # Use helper
-                        discard_for_snap_check = drawn_card
-                        use_ability = action.use_ability and card_has_discard_ability(
-                            drawn_card
-                        )  # Use helper
-                        self._clear_pending_action(
-                            undo_stack, delta_list
-                        )  # Clear *before* potentially triggering ability
-                        if use_ability:
-                            self._trigger_discard_ability(
-                                player, drawn_card, undo_stack, delta_list
-                            )  # This sets a new pending state if applicable
-                            if self.pending_action:
-                                return (
-                                    delta_list,
-                                    undo_action,
-                                )  # Return if ability sets new pending state (e.g., King Look)
-                    elif isinstance(action, ActionReplace):
-                        target_idx = action.target_hand_index
-                        hand = self.players[player].hand
-                        if 0 <= target_idx < len(hand):
-                            replaced_card = hand[target_idx]
-                            logger.debug(
-                                f"Player {player} replaces card at index {target_idx} ({replaced_card}) with drawn {drawn_card}."
-                            )
-                            original_card_in_hand = hand[target_idx]
-                            original_discard_len = len(self.discard_pile)
-
-                            def change_replace():
-                                self.players[player].hand[target_idx] = drawn_card
-                                self.discard_pile.append(replaced_card)
-
-                            def undo_replace():
-                                popped_discard = self.discard_pile.pop()
-                                self.players[player].hand[
-                                    target_idx
-                                ] = original_card_in_hand
-                                # Check popped card matches original (helps debug undo)
-                                if popped_discard is not replaced_card and serialize_card(
-                                    popped_discard
-                                ) != serialize_card(
-                                    replaced_card
-                                ):  # Use helper
-                                    logger.error(
-                                        f"Undo Replace Mismatch: Popped {popped_discard}, expected {replaced_card}. State may be inconsistent."
-                                    )
-
-                            delta_replace = (
-                                "replace_discard",
-                                player,
-                                target_idx,
-                                serialize_card(drawn_card),
-                                serialize_card(replaced_card),
-                            )  # Use helper
-                            self._add_change(
-                                change_replace,
-                                undo_replace,
-                                delta_replace,
-                                undo_stack,
-                                delta_list,
-                            )  # Pass args
-                            discard_for_snap_check = replaced_card
-                            self._clear_pending_action(
-                                undo_stack, delta_list
-                            )  # Pass args
-                        else:
-                            logger.error(f"Invalid REPLACE action index: {target_idx}")
-                            self._clear_pending_action(
-                                undo_stack, delta_list
-                            )  # Pass args
-
-                # --- Handle Ability Selections ---
-                elif isinstance(pending_type, ActionAbilityPeekOwnSelect) and isinstance(
-                    action, ActionAbilityPeekOwnSelect
-                ):
-                    target_idx = action.target_hand_index
-                    hand = self.players[player].hand
-                    peeked_card_str = "ERROR"
-                    if 0 <= target_idx < len(hand):
-                        peeked_card_str = serialize_card(hand[target_idx])
-                        logger.info(
-                            f"P{player} uses 7/8, peeks own {target_idx}: {peeked_card_str}"
-                        )  # Use helper
-                    else:
-                        logger.error(f"Invalid PEEK_OWN index {target_idx}")
-                    discard_for_snap_check = (
-                        self.get_discard_top()
-                    )  # The card that triggered the ability
-                    self._clear_pending_action(undo_stack, delta_list)  # Pass args
-                    delta_list.append(("peek_own", player, target_idx, peeked_card_str))
-                elif isinstance(
-                    pending_type, ActionAbilityPeekOtherSelect
-                ) and isinstance(action, ActionAbilityPeekOtherSelect):
-                    opp_idx = self.get_opponent_index(player)
-                    target_opp_idx = action.target_opponent_hand_index
-                    peeked_card_str = "ERROR"
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        if 0 <= target_opp_idx < len(opp_hand):
-                            peeked_card_str = serialize_card(opp_hand[target_opp_idx])
-                            logger.info(
-                                f"P{player} uses 9/T, peeks opp {target_opp_idx}: {peeked_card_str}"
-                            )  # Use helper
-                        else:
-                            logger.error(f"Invalid PEEK_OTHER index {target_opp_idx}")
-                    else:
-                        logger.error(
-                            f"Peek Other: Opponent {opp_idx} invalid or missing hand."
-                        )
-                    discard_for_snap_check = self.get_discard_top()
-                    self._clear_pending_action(undo_stack, delta_list)  # Pass args
-                    delta_list.append(
-                        ("peek_other", player, opp_idx, target_opp_idx, peeked_card_str)
+            # 3. Handle Standard Start-of-Turn Actions
+            else:
+                if acting_player != self.current_player_index:
+                    # Should not happen if logic is correct
+                    logger.error(
+                        "Standard action %s from P%d, but expected P%d", action, acting_player, self.current_player_index
                     )
-                elif isinstance(
-                    pending_type, ActionAbilityBlindSwapSelect
-                ) and isinstance(action, ActionAbilityBlindSwapSelect):
-                    own_h_idx, opp_h_idx = (
-                        action.own_hand_index,
-                        action.opponent_hand_index,
-                    )
-                    opp_idx = self.get_opponent_index(player)
-                    hand = self.players[player].hand
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand):
-                            original_own_card = hand[own_h_idx]
-                            original_opp_card = opp_hand[opp_h_idx]
-
-                            def change_blind_swap():
-                                hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                    opp_hand[opp_h_idx],
-                                    hand[own_h_idx],
-                                )
-
-                            def undo_blind_swap():
-                                hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                    original_own_card,
-                                    original_opp_card,
-                                )
-
-                            delta_blind_swap = (
-                                "swap_blind",
-                                player,
-                                own_h_idx,
-                                opp_idx,
-                                opp_h_idx,
-                                serialize_card(original_own_card),
-                                serialize_card(original_opp_card),
-                            )  # Use helper
-                            self._add_change(
-                                change_blind_swap,
-                                undo_blind_swap,
-                                delta_blind_swap,
-                                undo_stack,
-                                delta_list,
-                            )  # Pass args
-                            logger.info(
-                                f"P{player} uses J/Q, blind swaps own {own_h_idx} with opp {opp_h_idx}."
-                            )
-                        else:
-                            logger.error(
-                                f"Invalid BLIND_SWAP indices: own {own_h_idx}, opp {opp_h_idx}"
-                            )
-                    else:
-                        logger.error(
-                            f"Blind Swap: Opponent {opp_idx} invalid or missing hand."
-                        )
-                    discard_for_snap_check = self.get_discard_top()
-                    self._clear_pending_action(undo_stack, delta_list)  # Pass args
-                elif isinstance(pending_type, ActionAbilityKingLookSelect) and isinstance(
-                    action, ActionAbilityKingLookSelect
-                ):
-                    own_h_idx, opp_h_idx = (
-                        action.own_hand_index,
-                        action.opponent_hand_index,
-                    )
-                    opp_idx = self.get_opponent_index(player)
-                    hand = self.players[player].hand
-                    card1_str, card2_str = "ERROR", "ERROR"
-                    card1, card2 = None, None
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(opp_hand):
-                            card1, card2 = hand[own_h_idx], opp_hand[opp_h_idx]
-                            card1_str, card2_str = serialize_card(card1), serialize_card(
-                                card2
-                            )  # Use helper
-                            logger.info(
-                                f"P{player} uses K, looks at own {own_h_idx} ({card1_str}) and opp {opp_h_idx} ({card2_str})."
-                            )
+                    action_processed = False
+                else:
+                    player = self.current_player_index
+                    if isinstance(action, ActionDrawStockpile):
+                        drawn_card: Optional[Card] = None
+                        # reshuffled = False
+                        if not self.stockpile:
+                            # _attempt_reshuffle adds its own undo ops
+                            reshuffle_deltas = self._attempt_reshuffle(undo_stack)
+                            if reshuffle_deltas:
+                                reshuffled = True
+                                delta_list.extend(reshuffle_deltas)
+                                # Reshuffle itself doesn't discard a card for snap check
+                        if self.stockpile:
+                            # --- State Change: Draw + Set Pending Discard/Replace ---
                             original_pending = (
                                 self.pending_action,
                                 self.pending_action_player,
                                 copy.deepcopy(self.pending_action_data),
                             )
-                            new_pending_data = {
-                                "own_idx": own_h_idx,
-                                "opp_idx": opp_h_idx,
-                                "card1": card1,
-                                "card2": card2,
-                            }
+                            drawn_card_for_change = self.stockpile[
+                                -1
+                            ]  # Card that will be drawn
 
-                            def change_king_pending():
-                                self.pending_action = ActionAbilityKingSwapDecision(
-                                    perform_swap=False
+                            def change_draw_stock():
+                                nonlocal drawn_card
+                                card = self.stockpile.pop()
+                                drawn_card = card
+                                logger.debug(
+                                    "P%d drew %s from stockpile.", player, drawn_card
+                                )
+                                # Set pending action for Discard/Replace choice
+                                self.pending_action = ActionDiscard(
+                                    use_ability=False
                                 )  # Placeholder type
                                 self.pending_action_player = player
-                                self.pending_action_data = new_pending_data
+                                self.pending_action_data = {"drawn_card": drawn_card}
 
-                            def undo_king_pending():
+                            def undo_draw_stock():
+                                # Restore pending state first
+                                drawn_card_in_pending = (
+                                    self.pending_action_data.get("drawn_card")
+                                    if self.pending_action_player == player
+                                    else None
+                                )
                                 (
                                     self.pending_action,
                                     self.pending_action_player,
                                     self.pending_action_data,
                                 ) = original_pending
+                                # Put card back *if* it was the one recorded in pending state
+                                if drawn_card_in_pending:
+                                    self.stockpile.append(drawn_card_in_pending)
 
-                            delta_king_pending = (
-                                "set_pending_action",
-                                "ActionAbilityKingSwapDecision",
+                            # Log draw itself and the pending state change
+                            delta_draw = (
+                                "draw_stockpile",
                                 player,
-                                {
-                                    "own_idx": own_h_idx,
-                                    "opp_idx": opp_h_idx,
-                                    "card1": card1_str,
-                                    "card2": card2_str,
-                                },
+                                serialize_card(drawn_card_for_change),
+                            )
+                            delta_pending = (
+                                "set_pending_action",
+                                "ActionDiscard",
+                                player,
+                                {"drawn_card": serialize_card(drawn_card_for_change)},
                                 (
                                     type(original_pending[0]).__name__
                                     if original_pending[0]
@@ -1072,789 +333,274 @@ class CambiaGameState:
                                 original_pending[2],
                             )
                             self._add_change(
-                                change_king_pending,
-                                undo_king_pending,
-                                delta_king_pending,
+                                change_draw_stock,
+                                undo_draw_stock,
+                                delta_draw,
                                 undo_stack,
                                 delta_list,
-                            )  # Pass args
+                            )
                             delta_list.append(
-                                (
-                                    "king_look",
-                                    player,
-                                    own_h_idx,
-                                    opp_h_idx,
-                                    card1_str,
-                                    card2_str,
-                                )
+                                delta_pending
+                            )  # Log pending state change separately
+                            # --- End State Change ---
+                            action_processed = True
+                            # DO NOT ADVANCE TURN YET - Wait for Discard/Replace decision
+                        else:  # Stockpile empty even after reshuffle attempt
+                            logger.warning(
+                                "P%d tried DRAW_STOCKPILE, but stockpile/discard empty. Game should end.", player
                             )
-                            # Return immediately, waiting for swap decision
-                            return delta_list, undo_action
-                        else:
-                            logger.error(
-                                f"Invalid KING_LOOK indices: own {own_h_idx}, opp {opp_h_idx}. Ability fizzles."
-                            )
-                            discard_for_snap_check = self.get_discard_top()
-                            self._clear_pending_action(
-                                undo_stack, delta_list
-                            )  # Pass args
-                    else:
-                        logger.error(
-                            f"King Look: Opponent {opp_idx} invalid or missing hand. Ability fizzles."
-                        )
-                        discard_for_snap_check = self.get_discard_top()
-                        self._clear_pending_action(undo_stack, delta_list)  # Pass args
-                elif isinstance(
-                    pending_type, ActionAbilityKingSwapDecision
-                ) and isinstance(action, ActionAbilityKingSwapDecision):
-                    perform_swap = action.perform_swap
-                    look_data = self.pending_action_data
-                    own_h_idx, opp_h_idx = look_data.get("own_idx"), look_data.get(
-                        "opp_idx"
-                    )
-                    card1, card2 = look_data.get("card1"), look_data.get(
-                        "card2"
-                    )  # These are the card objects from the look step
-                    if (
-                        own_h_idx is None
-                        or opp_h_idx is None
-                        or card1 is None
-                        or card2 is None
-                    ):
-                        logger.error("Missing data for King Swap decision. Fizzling.")
-                    else:
-                        opp_idx = self.get_opponent_index(player)
-                        hand = self.players[player].hand
-                        if 0 <= opp_idx < len(self.players) and hasattr(
-                            self.players[opp_idx], "hand"
+                            # Game end check will handle this after turn fails to advance
+                            action_processed = False  # Action failed
+
+                    elif isinstance(action, ActionDrawDiscard):
+                        if (
+                            self.house_rules.allowDrawFromDiscardPile
+                            and self.discard_pile
                         ):
-                            opp_hand = self.players[opp_idx].hand
-                            # --- DETAILED CHECK ---
-                            own_idx_valid = 0 <= own_h_idx < len(hand)
-                            opp_idx_valid = 0 <= opp_h_idx < len(opp_hand)
-                            card_at_own_idx = hand[own_h_idx] if own_idx_valid else None
-                            card_at_opp_idx = (
-                                opp_hand[opp_h_idx] if opp_idx_valid else None
+                            # --- State Change: Draw Disc + Set Pending Discard/Replace ---
+                            original_pending = (
+                                self.pending_action,
+                                self.pending_action_player,
+                                copy.deepcopy(self.pending_action_data),
                             )
-                            # Use 'is' for object identity comparison
-                            own_card_match = own_idx_valid and (card_at_own_idx is card1)
-                            opp_card_match = opp_idx_valid and (card_at_opp_idx is card2)
+                            drawn_card_for_change = self.discard_pile[-1]
 
-                            if perform_swap:
-                                if own_card_match and opp_card_match:
+                            def change_draw_discard():
+                                nonlocal drawn_card
+                                card = self.discard_pile.pop()
+                                drawn_card = card
+                                logger.debug(
+                                    "P%d drew %s from discard pile.", player, drawn_card
+                                )
+                                self.pending_action = ActionDiscard(use_ability=False)
+                                self.pending_action_player = player
+                                self.pending_action_data = {"drawn_card": drawn_card}
 
-                                    def change_king_swap():
-                                        hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                            card2,
-                                            card1,
-                                        )
+                            def undo_draw_discard():
+                                drawn_card_in_pending = (
+                                    self.pending_action_data.get("drawn_card")
+                                    if self.pending_action_player == player
+                                    else None
+                                )
+                                (
+                                    self.pending_action,
+                                    self.pending_action_player,
+                                    self.pending_action_data,
+                                ) = original_pending
+                                if drawn_card_in_pending:
+                                    self.discard_pile.append(drawn_card_in_pending)
 
-                                    def undo_king_swap():
-                                        hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                            card1,
-                                            card2,
-                                        )
-
-                                    delta_king_swap = (
-                                        "swap_king",
-                                        player,
-                                        own_h_idx,
-                                        opp_idx,
-                                        opp_h_idx,
-                                        serialize_card(card1),
-                                        serialize_card(card2),
-                                    )  # Use helper
-                                    self._add_change(
-                                        change_king_swap,
-                                        undo_king_swap,
-                                        delta_king_swap,
-                                        undo_stack,
-                                        delta_list,
-                                    )  # Pass args
-                                    logger.info(
-                                        f"P{player} King ability: Swapped own {own_h_idx} ({card1}) with opp {opp_h_idx} ({card2})."
-                                    )
-                                else:
-                                    # Log detailed reason for cancellation
-                                    reason = "Swap cancelled:"
-                                    if not own_idx_valid:
-                                        reason += f" Own index {own_h_idx} invalid (Hand size: {len(hand)})."
-                                    elif not own_card_match:
-                                        reason += f" Card at own index {own_h_idx} changed (Expected: {card1}, Found: {card_at_own_idx})."
-                                    if not opp_idx_valid:
-                                        reason += f" Opponent index {opp_h_idx} invalid (Hand size: {len(opp_hand)})."
-                                    elif not opp_card_match:
-                                        reason += f" Card at opponent index {opp_h_idx} changed (Expected: {card2}, Found: {card_at_opp_idx})."
-                                    logger.error(f"King Swap Error: {reason}")
-                            else:
-                                logger.info(f"P{player} King ability: Chose not to swap.")
+                            delta_draw = (
+                                "draw_discard",
+                                player,
+                                serialize_card(drawn_card_for_change),
+                            )
+                            delta_pending = (
+                                "set_pending_action",
+                                "ActionDiscard",
+                                player,
+                                {"drawn_card": serialize_card(drawn_card_for_change)},
+                                (
+                                    type(original_pending[0]).__name__
+                                    if original_pending[0]
+                                    else None
+                                ),
+                                original_pending[1],
+                                original_pending[2],
+                            )
+                            self._add_change(
+                                change_draw_discard,
+                                undo_draw_discard,
+                                delta_draw,
+                                undo_stack,
+                                delta_list,
+                            )
+                            delta_list.append(delta_pending)
+                            # --- End State Change ---
+                            action_processed = True
+                            # DO NOT ADVANCE TURN YET
                         else:
                             logger.error(
-                                f"King Swap: Opponent {opp_idx} invalid or missing hand."
+                                "Invalid Action: DRAW_DISCARD attempted when not allowed or pile empty."
                             )
-                    discard_for_snap_check = self.get_discard_top()
-                    self._clear_pending_action(undo_stack, delta_list)  # Pass args
-                elif isinstance(pending_type, ActionSnapOpponentMove) and isinstance(
-                    action, ActionSnapOpponentMove
-                ):
-                    snapper_idx = player
-                    own_card_idx, target_slot_idx = (
-                        action.own_card_to_move_hand_index,
-                        action.target_empty_slot_index,
-                    )
-                    hand = self.players[snapper_idx].hand
-                    opp_idx = self.get_opponent_index(snapper_idx)
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        if 0 <= own_card_idx < len(hand):
-                            moved_card = hand[own_card_idx]
-                            if (
-                                0 <= target_slot_idx <= len(opp_hand)
-                            ):  # Allow insert at end
+                            action_processed = False  # Action invalid
 
-                                def change_move():
-                                    card = self.players[snapper_idx].hand.pop(
-                                        own_card_idx
-                                    )
-                                    self.players[opp_idx].hand.insert(
-                                        target_slot_idx, card
-                                    )
+                    elif isinstance(action, ActionCallCambia):
+                        cambia_allowed_round = self.house_rules.cambia_allowed_round
+                        current_round = self._turn_number // self.num_players
+                        if (
+                            self.cambia_caller_id is None
+                            and current_round >= cambia_allowed_round
+                        ):
+                            logger.info("P%d calls Cambia!", player)
+                            # --- State Change: Set Cambia Caller ---
+                            original_cambia_caller = self.cambia_caller_id
+                            original_turns_after = self.turns_after_cambia
 
-                                def undo_move():
-                                    card = self.players[opp_idx].hand.pop(target_slot_idx)
-                                    self.players[snapper_idx].hand.insert(
-                                        own_card_idx, card
-                                    )
+                            def change_cambia():
+                                self.cambia_caller_id = player
+                                self.turns_after_cambia = 0
 
-                                delta_move = (
-                                    "snap_opponent_move",
-                                    snapper_idx,
-                                    own_card_idx,
-                                    opp_idx,
-                                    target_slot_idx,
-                                    serialize_card(moved_card),
-                                )  # Use helper
-                                self._add_change(
-                                    change_move,
-                                    undo_move,
-                                    delta_move,
-                                    undo_stack,
-                                    delta_list,
-                                )  # Pass args
-                                logger.info(
-                                    f"P{snapper_idx} completes Snap Opponent: Moves {moved_card} (from own idx {own_card_idx}) to opp idx {target_slot_idx}."
-                                )
-                                self._clear_pending_action(
-                                    undo_stack, delta_list
-                                )  # Pass args
-                                self._advance_turn(
-                                    undo_stack, delta_list
-                                )  # Turn advances AFTER the move
-                            else:
-                                logger.error(
-                                    f"Invalid target slot index {target_slot_idx} for SnapOpponentMove."
-                                )
-                                self._clear_pending_action(undo_stack, delta_list)
-                                self._advance_turn(undo_stack, delta_list)  # Pass args
+                            def undo_cambia():
+                                self.cambia_caller_id = original_cambia_caller
+                                self.turns_after_cambia = original_turns_after
+
+                            delta_caller = (
+                                "set_attr",
+                                "cambia_caller_id",
+                                player,
+                                original_cambia_caller,
+                            )
+                            delta_turns = (
+                                "set_attr",
+                                "turns_after_cambia",
+                                0,
+                                original_turns_after,
+                            )
+                            self._add_change(
+                                change_cambia,
+                                undo_cambia,
+                                delta_caller,
+                                undo_stack,
+                                delta_list,
+                            )
+                            delta_list.append(delta_turns)
+                            # --- End State Change ---
+                            action_processed = True
+                            turn_should_advance_after_action = (
+                                True  # Turn advances immediately after calling Cambia
+                            )
                         else:
-                            logger.error(
-                                f"Invalid own card index {own_card_idx} for SnapOpponentMove."
+                            logger.warning(
+                                "P%d tried invalid CALL_CAMBIA (Already called or too early).", player
                             )
-                            self._clear_pending_action(undo_stack, delta_list)
-                            self._advance_turn(undo_stack, delta_list)  # Pass args
-                    else:
-                        logger.error(f"Snap Opponent Move: Opponent {opp_idx} invalid.")
-                        self._clear_pending_action(undo_stack, delta_list)
-                        self._advance_turn(undo_stack, delta_list)  # Pass args
-                else:
-                    logger.warning(
-                        f"Unhandled pending action ({pending_type}) vs received action ({action})"
-                    )
-                    self._clear_pending_action(undo_stack, delta_list)  # Pass args
+                            action_processed = False  # Action invalid
 
-                # After resolving pending action, check for snap phase initiation or advance turn
-                # Unless the pending action was SnapOpponentMove, where turn advances automatically
-                snap_started_here = False
-                if not isinstance(action, ActionSnapOpponentMove):
-                    if not self.pending_action and not self.snap_phase_active:
-                        if discard_for_snap_check and self._initiate_snap_phase(
-                            discarded_card=discard_for_snap_check,
-                            undo_stack=undo_stack,
-                            delta_list=delta_list,
-                        ):  # Pass args
-                            snap_started_here = True
-                    if (
-                        not snap_started_here
-                        and not self.snap_phase_active
-                        and not self.pending_action
-                    ):
-                        self._advance_turn(undo_stack, delta_list)  # Pass args
-
-            # --- Handle Standard Start-of-Turn Actions ---
-            elif isinstance(action, ActionDrawStockpile):
-                player = self.current_player_index
-                drawn_card: Optional[Card] = None
-                reshuffled = False
-                if not self.stockpile:
-                    # Pass undo_stack explicitly
-                    reshuffle_deltas = self._attempt_reshuffle(undo_stack)
-                    if reshuffle_deltas:
-                        reshuffled = True
-                        delta_list.extend(reshuffle_deltas)
-                if self.stockpile:
-                    original_stockpile_len = len(self.stockpile)
-                    original_pending = (
-                        self.pending_action,
-                        self.pending_action_player,
-                        copy.deepcopy(self.pending_action_data),
-                    )
-                    drawn_card_for_change = self.stockpile[-1]
-
-                    def change_draw():
-                        nonlocal drawn_card
-                        card = self.stockpile.pop()
-                        drawn_card = card
-                        logger.debug(f"P{player} drew {drawn_card} from stockpile.")
-                        # Set pending action to decide Discard/Replace
-                        self.pending_action = ActionDiscard(
-                            use_ability=False
-                        )  # Placeholder type
-                        self.pending_action_player = player
-                        self.pending_action_data = {"drawn_card": drawn_card}
-
-                    def undo_draw():
-                        # Restore pending state and put card back
-                        drawn_card_in_pending = (
-                            self.pending_action_data.get("drawn_card")
-                            if self.pending_action_player == player
-                            else None
+                    else:  # An action type not handled at the start of a turn
+                        logger.warning(
+                            "Unhandled action type %s received at start of turn for P%d.", type(action), player
                         )
-                        (
-                            self.pending_action,
-                            self.pending_action_player,
-                            self.pending_action_data,
-                        ) = original_pending
-                        if drawn_card_in_pending:
-                            self.stockpile.append(drawn_card_in_pending)
+                        action_processed = False
 
-                    delta_draw = (
-                        "draw_stockpile",
-                        player,
-                        serialize_card(drawn_card_for_change),
-                    )  # Use helper
-                    delta_pending = (
-                        "set_pending_action",
-                        "ActionDiscard",
-                        player,
-                        {
-                            "drawn_card": serialize_card(drawn_card_for_change)
-                        },  # Use helper
-                        (
-                            type(original_pending[0]).__name__
-                            if original_pending[0]
-                            else None
-                        ),
-                        original_pending[1],
-                        original_pending[2],
-                    )
-                    self._add_change(
-                        change_draw, undo_draw, delta_draw, undo_stack, delta_list
-                    )  # Pass args
-                    delta_list.append(delta_pending)  # Log pending state change
-                    # DO NOT ADVANCE TURN HERE - Wait for Discard/Replace decision
+            # --- Post-Action Processing ---
+            if action_processed and turn_should_advance_after_action:
+                if (
+                    not self.snap_phase_active and not self.pending_action
+                ):  # Double check state allows turn advance
+                    self._advance_turn(undo_stack, delta_list)
                 else:
-                    logger.warning(
-                        f"P{player} tried DRAW_STOCKPILE, but stockpile/discard empty after reshuffle attempt. Game should end."
+                    logger.debug(
+                        "Turn advancement skipped due to active snap/pending action."
                     )
-                    original_game_over = self._game_over
 
-                    def change_game_over_draw():
-                        self._game_over = True
-                        self._calculate_final_scores()
+            # Final game end check after all processing for this action is done
+            # (Note: _advance_turn also calls this, but check here too for cases where turn doesn't advance)
+            if not self._game_over:  # Avoid redundant checks/calculations
+                self._check_game_end(undo_stack, delta_list)
 
-                    def undo_game_over_draw():
-                        self._game_over = original_game_over  # Note: Does not undo score calculation easily
-
-                    self._add_change(
-                        change_game_over_draw,
-                        undo_game_over_draw,
-                        ("set_attr", "_game_over", True, original_game_over),
-                        undo_stack,
-                        delta_list,
-                    )  # Pass args
-
-            elif isinstance(action, ActionDrawDiscard):
-                player = self.current_player_index
-                if self.house_rules.allowDrawFromDiscardPile and self.discard_pile:
-                    original_discard_len = len(self.discard_pile)
-                    original_pending = (
-                        self.pending_action,
-                        self.pending_action_player,
-                        copy.deepcopy(self.pending_action_data),
-                    )
-                    drawn_card_for_change = self.discard_pile[-1]
-
-                    def change_draw_discard():
-                        nonlocal drawn_card
-                        card = self.discard_pile.pop()
-                        drawn_card = card
-                        logger.debug(f"P{player} drew {drawn_card} from discard pile.")
-                        # Set pending action to decide Discard/Replace
-                        self.pending_action = ActionDiscard(
-                            use_ability=False
-                        )  # Placeholder type
-                        self.pending_action_player = player
-                        self.pending_action_data = {"drawn_card": drawn_card}
-
-                    def undo_draw_discard():
-                        drawn_card_in_pending = (
-                            self.pending_action_data.get("drawn_card")
-                            if self.pending_action_player == player
-                            else None
-                        )
-                        (
-                            self.pending_action,
-                            self.pending_action_player,
-                            self.pending_action_data,
-                        ) = original_pending
-                        if drawn_card_in_pending:
-                            self.discard_pile.append(drawn_card_in_pending)
-
-                    delta_draw = (
-                        "draw_discard",
-                        player,
-                        serialize_card(drawn_card_for_change),
-                    )  # Use helper
-                    delta_pending = (
-                        "set_pending_action",
-                        "ActionDiscard",
-                        player,
-                        {
-                            "drawn_card": serialize_card(drawn_card_for_change)
-                        },  # Use helper
-                        (
-                            type(original_pending[0]).__name__
-                            if original_pending[0]
-                            else None
-                        ),
-                        original_pending[1],
-                        original_pending[2],
-                    )
-                    self._add_change(
-                        change_draw_discard,
-                        undo_draw_discard,
-                        delta_draw,
-                        undo_stack,
-                        delta_list,
-                    )  # Pass args
-                    delta_list.append(delta_pending)
-                    # DO NOT ADVANCE TURN HERE - Wait for Discard/Replace decision
-                else:
-                    logger.error("Invalid Action: DRAW_DISCARD attempted.")
-
-            elif isinstance(action, ActionCallCambia):
-                player = self.current_player_index
-                if self.cambia_caller_id is None:
-                    logger.info(f"P{player} calls Cambia!")
-                    original_cambia_caller = self.cambia_caller_id
-                    original_turns_after = self.turns_after_cambia
-
-                    def change_cambia():
-                        self.cambia_caller_id = player
-                        self.turns_after_cambia = 0
-
-                    def undo_cambia():
-                        self.cambia_caller_id = original_cambia_caller
-                        self.turns_after_cambia = original_turns_after
-
-                    delta_caller = (
-                        "set_attr",
-                        "cambia_caller_id",
-                        player,
-                        original_cambia_caller,
-                    )
-                    delta_turns = (
-                        "set_attr",
-                        "turns_after_cambia",
-                        0,
-                        original_turns_after,
-                    )
-                    self._add_change(
-                        change_cambia, undo_cambia, delta_caller, undo_stack, delta_list
-                    )  # Pass args
-                    delta_list.append(delta_turns)
-                    self._advance_turn(undo_stack, delta_list)  # Pass args
-                else:
-                    logger.warning(f"P{player} tried invalid CALL_CAMBIA.")
-            else:
-                logger.warning(f"Unhandled action type at start of turn: {type(action)}")
-
-            # Check game end after handling standard turn actions IF NOT already handled
-            if not self.snap_phase_active and not self.pending_action:
-                self._check_game_end(undo_stack, delta_list)  # Pass args
-
-        except Exception as e:
+        except Exception:
             logger.exception(
-                f"Critical error during apply_action logic for action {action}. State: {self}"
+                "Critical error during apply_action logic for action %s. State: %s. Attempting rollback.", action, self
             )
+            # Attempt to execute the master undo function
             try:
                 undo_action()
                 logger.info(
                     "Successfully executed master undo after apply_action exception."
                 )
             except Exception as undo_e:
+                # If undo fails, the state is likely corrupted.
                 logger.error(
-                    f"Exception during master undo after apply_action error: {undo_e}"
+                    "Exception during master undo after apply_action error: %s. Game state may be inconsistent!", undo_e
                 )
+                # Consider forcing game over?
+                # self._game_over = True
+            # Return empty delta and no-op undo as the action failed critically
             return [], lambda: None
 
-        # --- Return the collected deltas and the master undo function ---
+        # Return the collected deltas and the master undo function for this action
         return delta_list, undo_action
 
-    def _clear_pending_action(self, undo_stack: Deque, delta_list: StateDelta):
-        """Resets the pending action state and adds undo operation and delta."""
-        if (
-            self.pending_action is None
-            and self.pending_action_player is None
-            and not self.pending_action_data
-        ):
-            return  # Nothing to clear
-
-        original_pending_action = self.pending_action
-        original_pending_player = self.pending_action_player
-        original_pending_data = copy.deepcopy(self.pending_action_data)
-
-        def change():
-            self.pending_action = None
-            self.pending_action_player = None
-            self.pending_action_data = {}
-
-        def undo():
-            self.pending_action = original_pending_action
-            self.pending_action_player = original_pending_player
-            self.pending_action_data = original_pending_data
-
-        delta = (
-            "clear_pending_action",
-            type(original_pending_action).__name__ if original_pending_action else None,
-            original_pending_player,
-            {
-                k: serialize_card(v) if isinstance(v, Card) else v
-                for k, v in original_pending_data.items()
-            },  # Use helper
-        )
-        # Explicitly pass undo_stack and delta_list
-        self._add_change(change, undo, delta, undo_stack, delta_list)
-
-    def _trigger_discard_ability(
+    # --- Undo/Delta Helper (Could be in a separate mixin) ---
+    def _add_change(
         self,
-        player_index: int,
-        discarded_card: Card,
+        change_func: Callable[[], Any],
+        undo_func: Callable[[], None],
+        delta: StateDeltaChange,
         undo_stack: Deque,
         delta_list: StateDelta,
     ):
-        """Sets up the pending state for executing a special ability, adding undo and delta."""
-        rank = discarded_card.rank
-        logger.debug(
-            f"Player {player_index} triggering ability of discarded {discarded_card}"
-        )
-        ability_triggered = False
-        next_pending_action: Optional[GameAction] = None
-
-        if rank in [SEVEN, EIGHT]:
-            next_pending_action = ActionAbilityPeekOwnSelect(target_hand_index=-1)
-            ability_triggered = True
-        elif rank in [NINE, TEN]:
-            next_pending_action = ActionAbilityPeekOtherSelect(
-                target_opponent_hand_index=-1
+        """Applies a change, adds its undo operation to the stack, and records the delta."""
+        try:
+            change_func()  # Apply the state modification
+            delta_list.append(delta)  # Record the change event
+            undo_stack.appendleft(
+                undo_func
+            )  # Add undo op to the *front* (for LIFO execution)
+        except Exception as e:
+            logger.exception(
+                "Error applying change function %s for delta %s: %s", change_func.__name__, delta, e
             )
-            ability_triggered = True
-        elif rank in [JACK, QUEEN]:
-            next_pending_action = ActionAbilityBlindSwapSelect(
-                own_hand_index=-1, opponent_hand_index=-1
-            )
-            ability_triggered = True
-        elif rank == KING:
-            next_pending_action = ActionAbilityKingLookSelect(
-                own_hand_index=-1, opponent_hand_index=-1
-            )
-            ability_triggered = True
+            # Depending on severity, might want to raise or handle differently
 
-        if ability_triggered and next_pending_action is not None:
-            original_pending_action = self.pending_action
-            original_pending_player = self.pending_action_player
-            original_pending_data = copy.deepcopy(self.pending_action_data)
-            new_pending_data = {"ability_card": discarded_card}
-
-            def change_ability_pending():
-                self.pending_action = next_pending_action
-                self.pending_action_player = player_index
-                self.pending_action_data = new_pending_data
-
-            def undo_ability_pending():
-                self.pending_action = original_pending_action
-                self.pending_action_player = original_pending_player
-                self.pending_action_data = original_pending_data
-
-            delta_ability = (
-                "set_pending_action",
-                type(next_pending_action).__name__,
-                player_index,
-                {"ability_card": serialize_card(discarded_card)},  # Use helper
-                (
-                    type(original_pending_action).__name__
-                    if original_pending_action
-                    else None
-                ),
-                original_pending_player,
-                {
-                    k: serialize_card(v) if isinstance(v, Card) else v
-                    for k, v in original_pending_data.items()
-                },  # Use helper
-            )
-            # Explicitly pass undo_stack and delta_list
-            self._add_change(
-                change_ability_pending,
-                undo_ability_pending,
-                delta_ability,
-                undo_stack,
-                delta_list,
-            )
-        else:
-            logger.debug(f"Card {discarded_card} has no relevant discard ability.")
-
-    def _initiate_snap_phase(
-        self, discarded_card: Card, undo_stack: Deque, delta_list: StateDelta
-    ) -> bool:
-        """Checks potential snappers and starts the snap phase, adding undos/deltas. Returns True if started."""
-        original_snap_phase = self.snap_phase_active
-        original_snap_card = self.snap_discarded_card
-        original_snap_potentials = list(self.snap_potential_snappers)
-        original_snap_idx = self.snap_current_snapper_idx
-        # Clear previous snap results log for this phase
-        original_snap_log = list(self.snap_results_log)
-
-        def change_clear_log():
-            self.snap_results_log = []
-
-        def undo_clear_log():
-            self.snap_results_log = original_snap_log
-
-        self._add_change(
-            change_clear_log,
-            undo_clear_log,
-            ("snap_log_clear", []),
-            undo_stack,
-            delta_list,
-        )
-
-        potential_indices = []
-        target_rank = discarded_card.rank
-
-        for p_idx in range(self.num_players):
-            if not (
-                0 <= p_idx < len(self.players) and hasattr(self.players[p_idx], "hand")
-            ):
-                logger.warning(
-                    f"Initiate Snap: Player {p_idx} invalid or missing hand. Skipping."
-                )
-                continue
-            if p_idx == self.cambia_caller_id:
-                continue  # Cambia caller cannot snap
-
-            hand = self.players[p_idx].hand
-            if not all(isinstance(card, Card) for card in hand):
-                logger.error(
-                    f"Initiate Snap: Player {p_idx}'s hand contains non-Card objects: {hand}. Skipping snap check."
-                )
-                continue
-            can_snap_own = any(card.rank == target_rank for card in hand)
-            can_snap_opponent = False
-            if self.house_rules.allowOpponentSnapping:
-                opp_idx = self.get_opponent_index(p_idx)
-                if opp_idx != self.cambia_caller_id:
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        if not all(isinstance(card, Card) for card in opp_hand):
-                            logger.error(
-                                f"Initiate Snap: Opponent {opp_idx}'s hand contains non-Card objects. Skipping snap-opp check."
-                            )
-                        else:
-                            can_snap_opponent = any(
-                                card.rank == target_rank for card in opp_hand
-                            )
-                    else:
-                        logger.warning(
-                            f"Initiate Snap: Opponent {opp_idx} invalid/missing hand for P{p_idx} checking SnapOpponent."
-                        )
-
-            if can_snap_own or can_snap_opponent:
-                potential_indices.append(p_idx)
-
-        started_snap = False
-        if potential_indices:
-            logger.debug(f"Discard of {discarded_card} triggers potential snap phase.")
-            # Determine discarder: the player whose turn it *was* before this discard action finished
-            # This is tricky, as the discard could be part of a Replace action or Discard action.
-            # Assume the player stored in pending_action_player (if set) or the player before current_player_index
-            discarder_player = (
-                self.pending_action_player
-            )  # If pending_action_player is set, they initiated the discard/replace
-            if discarder_player is None:
-                # If no pending player, it means the action was likely CallCambia or an error state.
-                # Fallback: assume it was the player whose turn just ended.
-                discarder_player = (
-                    self.current_player_index - 1 + self.num_players
-                ) % self.num_players
-                logger.warning(
-                    f"Could not determine discarder from pending state, assuming P{discarder_player}"
-                )
-
-            ordered_snappers = []
-            # Determine snap order starting from player AFTER the discarder
-            for i in range(1, self.num_players + 1):
-                check_p_idx = (discarder_player + i) % self.num_players
-                if check_p_idx in potential_indices:
-                    ordered_snappers.append(check_p_idx)
-
-            if ordered_snappers:
-                started_snap = True
-
-                def change_snap_start():
-                    self.snap_phase_active = True
-                    self.snap_discarded_card = discarded_card
-                    self.snap_potential_snappers = ordered_snappers
-                    self.snap_current_snapper_idx = 0
-
-                def undo_snap_start():
-                    self.snap_phase_active = original_snap_phase
-                    self.snap_discarded_card = original_snap_card
-                    self.snap_potential_snappers = original_snap_potentials
-                    self.snap_current_snapper_idx = original_snap_idx
-
-                delta_snap_start = (
-                    "start_snap_phase",
-                    serialize_card(discarded_card),
-                    ordered_snappers,
-                )  # Use helper
-                # Explicitly pass undo_stack and delta_list
-                self._add_change(
-                    change_snap_start,
-                    undo_snap_start,
-                    delta_snap_start,
-                    undo_stack,
-                    delta_list,
-                )
-                logger.debug(
-                    f"Snap phase started. Discarder P{discarder_player}. Potential snappers (ordered): {ordered_snappers}. P{self.get_acting_player()} acts first."
-                )
-            else:
-                logger.debug(
-                    "Potential snappers list empty after ordering. No snap phase."
-                )
-                started_snap = False
-        else:
-            logger.debug(f"No potential snappers found for rank {target_rank}.")
-            started_snap = False
-
-        return started_snap
-
-    def _end_snap_phase(self, undo_stack: Deque, delta_list: StateDelta):
-        """Cleans up snap phase state and advances the main game turn, adding undos/deltas."""
-        if not self.snap_phase_active:
-            return
-
-        logger.debug("Ending snap phase.")
-        original_snap_phase = self.snap_phase_active
-        original_snap_card = self.snap_discarded_card
-        original_snap_potentials = list(self.snap_potential_snappers)
-        original_snap_idx = self.snap_current_snapper_idx
-        # Note: We don't clear snap_results_log here, keep it until next snap phase starts
-
-        def change_snap_end():
-            self.snap_phase_active = False
-            self.snap_discarded_card = None
-            self.snap_potential_snappers = []
-            self.snap_current_snapper_idx = 0
-
-        def undo_snap_end():
-            self.snap_phase_active = original_snap_phase
-            self.snap_discarded_card = original_snap_card
-            self.snap_potential_snappers = original_snap_potentials
-            self.snap_current_snapper_idx = original_snap_idx
-
-        delta_snap_end = ("end_snap_phase",)
-        # Explicitly pass undo_stack and delta_list
-        self._add_change(
-            change_snap_end, undo_snap_end, delta_snap_end, undo_stack, delta_list
-        )
-        # Turn advances AFTER snap phase concludes
-        self._advance_turn(undo_stack, delta_list)  # Pass args
-
+    # --- Reshuffle Logic (Could be in DeckMixin or TurnLogicMixin) ---
     def _attempt_reshuffle(self, undo_stack_outer: Deque) -> Optional[StateDelta]:
-        """Reshuffles discard->stockpile if possible, adds undos/deltas. Returns deltas or None."""
-        # This function might be called outside apply_action (e.g., during penalty).
-        # It needs its OWN delta list and needs to add its undo op to the provided outer stack.
+        """
+        Reshuffles discard pile (except top card) into stockpile if stockpile is empty.
+        Adds its *own* undo operation to the provided undo_stack_outer.
+        Returns the StateDelta for the reshuffle, or None if no reshuffle occurred.
+        """
         if not self.stockpile and len(self.discard_pile) > 1:
             logger.info("Stockpile empty. Reshuffling discard pile.")
-            original_stockpile = list(self.stockpile)
-            original_discard = list(self.discard_pile)
+            # --- Capture state BEFORE changes for undo ---
+            original_stockpile = list(self.stockpile)  # Should be empty
+            original_discard = list(self.discard_pile)  # Keep full original order
             top_card = self.discard_pile[-1]
             cards_to_shuffle = self.discard_pile[:-1]
-            reshuffle_deltas: StateDelta = []  # Local list to return
+            # Make a copy to shuffle for the new state, preserve original order for undo
+            new_stockpile = list(cards_to_shuffle)
+            random.shuffle(new_stockpile)
 
-            # --- Capture state for delta/undo ---
-            # Copy cards BEFORE shuffle for undo
-            original_cards_to_shuffle = list(cards_to_shuffle)
-            # Get shuffled order for delta log
-            shuffled_order_for_delta = list(cards_to_shuffle)
-            random.shuffle(shuffled_order_for_delta)  # Shuffle for delta
-            shuffled_card_strs = [
-                serialize_card(c) for c in shuffled_order_for_delta
-            ]  # Use helper
-            delta_reshuffle = (
-                "reshuffle",
-                shuffled_card_strs,
-                serialize_card(top_card),
-            )  # Use helper
-
+            # --- Define change and undo ---
             def change_reshuffle():
                 self.discard_pile = [top_card]
-                # Use the pre-determined shuffled order for consistency
-                self.stockpile = shuffled_order_for_delta
-                logger.info(f"Reshuffled {len(self.stockpile)} cards into stockpile.")
+                self.stockpile = new_stockpile
+                logger.info("Reshuffled %d cards into stockpile.", len(self.stockpile))
 
             def undo_reshuffle():
-                # Restore exact previous state
-                self.stockpile = original_stockpile  # Should be empty
-                self.discard_pile = (
-                    original_discard  # Includes top card + unshuffled others
-                )
+                self.stockpile = original_stockpile  # Restore empty stockpile
+                self.discard_pile = original_discard  # Restore original discard pile
                 logger.debug("Undo reshuffle.")
 
-            # Manually apply change, add undo to outer stack, add delta to local list
+            # --- Create delta and add undo to outer stack ---
+            shuffled_card_strs = [serialize_card(c) for c in new_stockpile]
+            delta_reshuffle: StateDelta = [
+                ("reshuffle", shuffled_card_strs, serialize_card(top_card))
+            ]
+            # Manually apply change *now*
             change_reshuffle()
-            reshuffle_deltas.append(delta_reshuffle)
-            undo_stack_outer.appendleft(
-                undo_reshuffle
-            )  # Add this specific undo to the caller's stack
-            return reshuffle_deltas
+            # Add the specific undo for *this reshuffle* to the caller's undo stack
+            undo_stack_outer.appendleft(undo_reshuffle)
+            return delta_reshuffle  # Return the delta event
+
         elif not self.stockpile:
             logger.info("Stockpile empty, cannot reshuffle discard pile (size <= 1).")
+            return None  # No reshuffle happened
+        else:
+            # Stockpile not empty, no reshuffle needed
             return None
-        return None
 
+    # --- Penalty Logic (Could be in TurnLogicMixin) ---
     def _apply_penalty(
         self, player_index: int, num_cards: int, undo_stack_main: Deque
     ) -> StateDelta:
-        """Adds penalty cards, adds undos and returns deltas."""
-        # This generates a list of deltas. ONE master undo op is added to undo_stack_main.
+        """
+        Applies penalty draw(s) to a player, handling reshuffles if needed.
+        Adds ONE combined undo operation for the whole penalty sequence to undo_stack_main.
+        Returns a list of StateDeltaChanges for the penalty draws/reshuffles.
+        """
         logger.warning(
-            f"Applying penalty: Player {player_index} draws {num_cards} cards."
+            "Applying penalty: Player %d attempts to draw %d cards.", player_index, num_cards
         )
         penalty_deltas: StateDelta = []
         if not (
@@ -1862,60 +608,61 @@ class CambiaGameState:
             and hasattr(self.players[player_index], "hand")
         ):
             logger.error(
-                f"Cannot apply penalty: Player {player_index} invalid or missing hand."
+                "Cannot apply penalty: Player %d invalid or missing hand.", player_index
             )
-            return penalty_deltas
+            return penalty_deltas  # Return empty delta list
 
-        # --- Capture state BEFORE any changes for the master undo ---
+        # --- Capture state BEFORE any changes for the single master undo ---
         original_hand_state = list(self.players[player_index].hand)
         original_stockpile_state = list(self.stockpile)
         original_discard_state = list(self.discard_pile)
-        drawn_cards_in_penalty: List[Card] = []  # Track cards drawn for logging/debugging
+        cards_actually_drawn_this_penalty: List[Card] = []  # Track for logging/debugging
 
-        reshuffle_happened = False  # Track if a reshuffle occurred within this penalty
-
+        # --- Perform draws and potential reshuffles ---
         for i in range(num_cards):
             if not self.stockpile:
                 # Try to reshuffle. _attempt_reshuffle adds its own undo op to undo_stack_main.
                 reshuffle_outcome_deltas = self._attempt_reshuffle(undo_stack_main)
                 if reshuffle_outcome_deltas:
-                    reshuffle_happened = True
                     penalty_deltas.extend(
                         reshuffle_outcome_deltas
-                    )  # Add reshuffle delta to our list
-                    logger.debug(f"Reshuffled during penalty draw {i+1}/{num_cards}")
-                else:
+                    )  # Add reshuffle delta(s)
+                    logger.debug("Reshuffled during penalty draw %d/%d", i+1, num_cards)
+                else:  # Cannot reshuffle
                     logger.warning(
-                        f"Stockpile/discard empty during penalty draw {i+1}/{num_cards}! Cannot draw more."
+                        "Stockpile/discard empty during penalty draw %d/%d for P%d. Cannot draw more.", i+1, num_cards, player_index
                     )
-                    break  # Stop drawing
+                    break  # Stop drawing penalty cards
 
             if self.stockpile:
+                # --- Apply state change directly ---
                 drawn_card = self.stockpile.pop()
-                drawn_cards_in_penalty.append(drawn_card)
-                self.players[player_index].hand.append(drawn_card)  # Direct modification
-                delta = (
-                    "penalty_draw",
-                    player_index,
-                    serialize_card(drawn_card),
-                )  # Use helper
+                self.players[player_index].hand.append(drawn_card)
+                cards_actually_drawn_this_penalty.append(drawn_card)
+                # --- Record delta ---
+                delta = ("penalty_draw", player_index, serialize_card(drawn_card))
                 penalty_deltas.append(delta)
-                logger.debug(f"Player {player_index} penalty draw {i+1}: {drawn_card}")
+                # logger.debug(f"Player {player_index} penalty draw {i+1}: {drawn_card}") # Potentially verbose
             else:
+                # This case should theoretically not be reached if reshuffle logic is correct
                 logger.error(
-                    "Stockpile empty immediately after attempting reshuffle in penalty draw."
+                    "Stockpile empty immediately after attempting reshuffle in penalty draw. Stopping."
                 )
                 break
 
+        logger.info(
+            "Player %d drew %d cards as penalty.", player_index, len(cards_actually_drawn_this_penalty)
+        )
+
         # --- Create the single master undo function for the *entire penalty draw sequence* ---
         def undo_penalty_sequence():
-            # Restore the state to exactly how it was before this function was called
-            # Note: This undo function runs *before* any reshuffle undo ops that might be on the stack
+            # Restore the state to exactly how it was before this function was called.
+            # This undo runs *before* any reshuffle undo ops added by _attempt_reshuffle within this call.
             self.players[player_index].hand = original_hand_state
             self.stockpile = original_stockpile_state
             self.discard_pile = original_discard_state
             logger.debug(
-                f"Undo penalty sequence applied for P{player_index}. State restored to pre-penalty."
+                "Undo penalty sequence applied for P%d. State restored to pre-penalty.", player_index
             )
 
         # Add the master undo function to the *front* of the main stack
@@ -1923,39 +670,43 @@ class CambiaGameState:
 
         return penalty_deltas
 
+    # --- Turn Advancement & Game End Logic (Could be in TurnLogicMixin) ---
     def _advance_turn(self, undo_stack: Deque, delta_list: StateDelta):
-        """Moves to next player, handles Cambia turns, adds undos/deltas."""
+        """Advances to the next player, updates turn counts, checks for game end."""
         if self._game_over:
+            logger.debug("Attempted to advance turn, but game is already over.")
             return
 
+        # --- Calculate next state ---
         original_turn = self._turn_number
         original_player = self.current_player_index
         original_cambia_turns = self.turns_after_cambia
-        logger.debug(f"Advancing turn from T#{original_turn} P{original_player}")
+        logger.debug("Advancing turn from T#%d P%d", original_turn, original_player)
 
         next_player = (self.current_player_index + 1) % self.num_players
         next_turn = self._turn_number + 1
         next_cambia_turns = self.turns_after_cambia
+        # Increment Cambia turn counter *after* each player completes their turn during the final round
         if self.cambia_caller_id is not None:
-            # Only increment if the player whose turn it *was* is the cambia caller
-            # The turn advances *after* the player acts. Cambia round completes when
-            # it gets back to the caller's turn *start*.
-            # Counter increments AFTER each player's turn. Game ends when counter == num_players.
-            next_cambia_turns += 1
+            next_cambia_turns += 1  # Increment after the current player's turn finishes
 
+        # --- State Change: Update turn, player, cambia count ---
         def change_advance():
             self.current_player_index = next_player
             self._turn_number = next_turn
-            self.turns_after_cambia = next_cambia_turns
+            self.turns_after_cambia = (
+                next_cambia_turns  # Update based on calculation above
+            )
 
         def undo_advance():
             self._turn_number = original_turn
             self.current_player_index = original_player
             self.turns_after_cambia = original_cambia_turns
             logger.debug(
-                f"Undo advance turn. Back to T#{original_turn}, P{original_player}"
+                "Undo advance turn. Back to T#%d, P%d", original_turn, original_player
             )
 
+        # Log changes
         delta_player = ("set_attr", "current_player_index", next_player, original_player)
         delta_turn = ("set_attr", "_turn_number", next_turn, original_turn)
         delta_cambia = (
@@ -1964,33 +715,37 @@ class CambiaGameState:
             next_cambia_turns,
             original_cambia_turns,
         )
-
-        # Explicitly pass undo_stack and delta_list
         self._add_change(
             change_advance, undo_advance, delta_player, undo_stack, delta_list
         )
         delta_list.append(delta_turn)
-        if self.cambia_caller_id is not None:
+        if self.cambia_caller_id is not None:  # Only log cambia turn change if relevant
             delta_list.append(delta_cambia)
+        # --- End State Change ---
 
-        self._check_game_end(
-            undo_stack, delta_list
-        )  # Check game end after advancing turn
+        logger.debug(
+            "Advanced turn to T#%d P%d. Cambia turns: %d", self._turn_number, self.current_player_index, self.turns_after_cambia
+        )
+
+        # Check game end conditions *after* advancing the turn
+        self._check_game_end(undo_stack, delta_list)
 
     def _check_game_end(self, undo_stack: Deque, delta_list: StateDelta):
-        """Checks and sets game end conditions, adding undos/deltas."""
+        """Checks game end conditions and updates state if game has ended."""
         if self._game_over:
-            return
+            return  # Already ended
 
         end_condition_met = False
         reason = ""
 
+        # 1. Max Turns Reached
         max_turns = self.house_rules.max_game_turns
         if max_turns > 0 and self._turn_number >= max_turns:
             end_condition_met = True
             reason = f"Max game turns ({max_turns}) reached"
 
-        # Cambia ends when turns_after_cambia reaches num_players
+        # 2. Cambia Round Completed
+        # Game ends when turns_after_cambia *reaches* num_players (meaning all players had their final turn)
         if (
             not end_condition_met
             and self.cambia_caller_id is not None
@@ -1999,255 +754,180 @@ class CambiaGameState:
             end_condition_met = True
             reason = f"Cambia final turns ({self.turns_after_cambia}/{self.num_players}) completed"
 
-        # Check if current player *must* draw but cannot
+        # 3. Stalemate: Current player has no actions AND cannot draw/reshuffle
+        # Check only if it's a standard turn start (no pending/snap)
         if (
             not end_condition_met
             and not self.pending_action
             and not self.snap_phase_active
         ):
             player = self.current_player_index
+            # Validate player state before checking actions
             if 0 <= player < len(self.players) and hasattr(self.players[player], "hand"):
-                legal_actions = self.get_legal_actions()
-                # Player must draw if only draw/cambia actions are available
-                is_draw_required = not any(
-                    a
-                    for a in legal_actions
-                    if not isinstance(
-                        a, (ActionDrawStockpile, ActionDrawDiscard, ActionCallCambia)
-                    )
-                )
-                can_draw_or_reshuffle = bool(self.stockpile) or (
-                    len(self.discard_pile) > 1
-                )
-                if is_draw_required and not can_draw_or_reshuffle:
+                legal_actions = self.get_legal_actions()  # Use the QueryMixin method
+                can_draw_stockpile = bool(self.stockpile)
+                can_reshuffle = len(self.discard_pile) > 1
+                # If no actions are possible *at all* and they can't draw/reshuffle, it's an end state.
+                if not legal_actions and not can_draw_stockpile and not can_reshuffle:
                     end_condition_met = True
-                    reason = f"Player {player} requires draw, but cannot (Stock: {len(self.stockpile)}, Disc: {len(self.discard_pile)})"
+                    reason = f"Stalemate: P{player} has no actions and cannot draw/reshuffle (Stock: {len(self.stockpile)}, Disc: {len(self.discard_pile)})"
             else:
-                # Should not happen if game is running correctly
-                end_condition_met = True
-                reason = f"Game end check (Draw required): Player {player} invalid/missing hand."
-
-        # Check if current player has *no* actions (e.g., after failed draw)
-        if (
-            not end_condition_met
-            and not self.pending_action
-            and not self.snap_phase_active
-        ):
-            player = self.current_player_index
-            if 0 <= player < len(self.players) and hasattr(self.players[player], "hand"):
-                if not self.get_legal_actions():
-                    end_condition_met = True
-                    reason = f"No legal actions available for P{player}"
-            else:
-                # Should not happen
+                # This indicates a potential inconsistency if reached
                 end_condition_met = True
                 reason = (
-                    f"Game end check (no actions): Player {player} invalid/missing hand."
+                    f"Game end check (Stalemate): Player {player} invalid/missing hand."
                 )
 
-        if end_condition_met and not self._game_over:
-            logger.info(f"Game ends: {reason}.")
-            original_game_over = self._game_over
-            original_winner = self._winner
-            original_utilities = list(self._utilities)
-            # Calculate scores but don't set attributes yet for delta/undo
+        # If an end condition is met, finalize the game state
+        if end_condition_met and not self._game_over:  # Ensure we only trigger this once
+            logger.info("Game ends: %s.", reason)
+            # Calculate scores but don't set attributes directly yet for undo
             temp_winner, temp_utilities = self._calculate_final_scores(
                 set_attributes=False
             )
-            delta_game_end = ("game_end", reason, temp_winner, temp_utilities)
+
+            # --- State Change: Mark Game Over & Set Scores ---
+            original_game_over = self._game_over  # Should be False
+            original_winner = self._winner
+            original_utilities = list(self._utilities)
 
             def change_game_end():
                 self._game_over = True
-                # Recalculate and set attributes now
+                # Re-calculate and set attributes *now* within the change function
+                # This ensures the final state reflects the calculation at the time of ending.
                 self._calculate_final_scores(set_attributes=True)
 
             def undo_game_end():
                 self._game_over = original_game_over
                 self._winner = original_winner
-                self._utilities = original_utilities
+                self._utilities = original_utilities  # Restore previous scores/utilities
                 logger.debug("Undo game end.")
 
-            # Explicitly pass undo_stack and delta_list
+            # Log the end event with the calculated outcome
+            delta_game_end = ("game_end", reason, temp_winner, temp_utilities)
             self._add_change(
                 change_game_end, undo_game_end, delta_game_end, undo_stack, delta_list
             )
+            # --- End State Change ---
 
     def _calculate_final_scores(
         self, set_attributes=True
     ) -> Tuple[Optional[int], List[float]]:
-        """Calculates final scores and winner. Optionally sets instance attributes."""
-        if set_attributes and self._winner is not None:
-            # Scores already calculated and set previously
+        """
+        Calculates final scores based on hand values and determines the winner/utilities.
+        Optionally sets the _winner and _utilities attributes on self.
+        (Could be moved to TurnLogicMixin or EndgameMixin)
+        """
+        # If scores were already calculated and set (e.g., by a previous call in get_utility)
+        initial_utilities = [0.0] * self.num_players
+        if set_attributes and self._utilities != initial_utilities:
+            # If setting attributes and utilities are not default, assume already calculated.
+            # This check prevents overwriting tie results (where winner is None but utilities are set).
+            logger.debug("Scores seem already calculated, returning stored values.")
             return self._winner, self._utilities
 
         scores = []
-        final_hands_str = []
+        final_hands_str = []  # For logging
         for i in range(self.num_players):
             if 0 <= i < len(self.players) and hasattr(self.players[i], "hand"):
                 current_hand = self.players[i].hand
-                hand_str = [serialize_card(c) for c in current_hand]  # Use helper
-                final_hands_str.append(hand_str)
+                # Basic validation of hand contents before scoring
                 if not all(isinstance(card, Card) for card in current_hand):
                     logger.error(
-                        f"Calculate score: Player {i}'s hand contains non-Card objects: {current_hand}. Assigning high score."
+                        "Calculate score: Player %d's hand contains non-Card objects: %s. Assigning max score.", i, current_hand
                     )
-                    scores.append(999)
+                    scores.append(float("inf"))  # Assign effectively infinite score
+                    final_hands_str.append(
+                        [str(c) for c in current_hand]
+                    )  # Log representation
                 else:
                     hand_value = sum(card.value for card in current_hand)
                     scores.append(hand_value)
+                    final_hands_str.append([serialize_card(c) for c in current_hand])
             else:
                 logger.error(
-                    f"Calculate score: Player {i} invalid or missing hand. Assigning high score."
+                    "Calculate score: Player %d invalid or missing hand. Assigning max score.", i
                 )
-                scores.append(999)
+                scores.append(float("inf"))
                 final_hands_str.append(["ERROR"])
 
-        winner_calculated = None
-        utilities_calculated = [0.0] * self.num_players
+        winner_calculated: Optional[int] = None
+        utilities_calculated: List[float] = [0.0] * self.num_players  # Default to 0
 
-        if scores:
-            min_score = min(scores)
-            winners = [i for i, score in enumerate(scores) if score == min_score]
-
-            if len(winners) == 1:
-                winner_calculated = winners[0]
-            elif self.cambia_caller_id is not None and self.cambia_caller_id in winners:
-                # Cambia caller wins ties
-                winner_calculated = self.cambia_caller_id
-            elif len(winners) > 1:
-                # True tie (no Cambia caller or caller not involved in tie)
-                # Assign 0 utility to tied players
-                for p_idx in winners:
-                    utilities_calculated[p_idx] = 0.0
-                for p_idx in range(self.num_players):
-                    if p_idx not in winners:
-                        utilities_calculated[p_idx] = -1.0  # Losers get -1
-                winner_calculated = None  # Indicate tie
-            else:  # Should not happen if scores exist
-                logger.error("Score calculation error: No minimum score winners found.")
-
-            # If there was a single winner (or Cambia caller tie break)
-            if winner_calculated is not None:
-                utilities_calculated = [-1.0] * self.num_players
-                utilities_calculated[winner_calculated] = 1.0
-
-            # Log only when setting final attributes
-            if set_attributes:
-                if winner_calculated is not None:
-                    logger.info(
-                        f"Game Score Calc: Player {winner_calculated} wins with score {min_score}. Final Hands: {final_hands_str}"
-                    )
-                else:
-                    logger.info(
-                        f"Game Score Calc: Tie between players {winners} with score {min_score}. Utilities: {utilities_calculated}. Final Hands: {final_hands_str}"
-                    )
-
-        else:
+        if not scores:
             logger.error("Cannot calculate final scores: No player scores available.")
+            # Keep default utilities [0.0, 0.0] and winner None
+        else:
+            min_score = min(scores)
+            # Check if anyone actually achieved the minimum score (handles all inf case)
+            if min_score == float("inf"):
+                logger.warning(
+                    "All players have invalid hands or max score. Declaring a tie with 0 utility."
+                )
+                winner_calculated = None
+                utilities_calculated = [0.0] * self.num_players  # All tie with 0
+            else:
+                winners = [i for i, score in enumerate(scores) if score == min_score]
 
+                if len(winners) == 1:
+                    winner_calculated = winners[0]
+                    utilities_calculated = [-1.0] * self.num_players
+                    utilities_calculated[winner_calculated] = 1.0
+                elif len(winners) > 1:  # Tie situation
+                    # Check if Cambia caller breaks the tie among those tied
+                    if (
+                        self.cambia_caller_id is not None
+                        and self.cambia_caller_id in winners
+                    ):
+                        winner_calculated = self.cambia_caller_id
+                        utilities_calculated = [-1.0] * self.num_players
+                        utilities_calculated[winner_calculated] = 1.0
+                        logger.info(
+                            "Tie score (%d) broken by Cambia caller P%d.", min_score, winner_calculated
+                        )
+                    else:
+                        # True tie among winners list
+                        logger.info(
+                            "True tie between players %s with score %d.", winners, min_score
+                        )
+                        winner_calculated = None  # No single winner
+                        # Assign utilities: 0 for tied players, -1 for losers
+                        utilities_calculated = [
+                            -1.0
+                        ] * self.num_players  # Start all as losers
+                        for p_idx in winners:
+                            utilities_calculated[p_idx] = (
+                                0.0  # Tied players get 0 utility
+                            )
+                else:  # Should not happen if scores exist and min_score isn't inf
+                    logger.error(
+                        "Score calculation error: No minimum score winners found, but min score wasn't infinity."
+                    )
+                    winner_calculated = None
+                    utilities_calculated = [
+                        0.0
+                    ] * self.num_players  # Default to 0 utility tie
+
+        # Log the final result only when setting attributes
         if set_attributes:
+            log_msg = "Game Score Calc: "
+            if winner_calculated is not None:
+                log_msg += f"Player {winner_calculated} wins with score {scores[winner_calculated]}. "
+            else:  # Tie
+                tied_players = [
+                    i for i, util in enumerate(utilities_calculated) if util == 0.0
+                ]
+                log_msg += f"Tie between players {tied_players} (Score: {min_score}). "
+            log_msg += (
+                f"Utilities: {utilities_calculated}. Final Hands: {final_hands_str}"
+            )
+            logger.info(log_msg)
+
+            # Set the instance attributes
             self._winner = winner_calculated
             self._utilities = utilities_calculated
-            logger.debug(f"Final Utilities set: {self._utilities}")
+            logger.debug(
+                "Final winner/utilities set: W=%d, U=%s", self._winner, self._utilities
+            )
 
         return winner_calculated, utilities_calculated
-
-    def is_terminal(self) -> bool:
-        return self._game_over
-
-    def get_utility(self, player_id: int) -> float:
-        """Returns the final utility for the specified player."""
-        if not self.is_terminal():
-            logger.warning("get_utility called on non-terminal state!")
-            return 0.0
-        # Ensure scores are calculated if game ended but calculation hasn't run/set attributes
-        if (
-            self._game_over
-            and self._winner is None
-            and np.all(np.array(self._utilities) == 0)
-        ):
-            logger.debug(
-                "get_utility called on terminal state, but winner/utilities not set. Calculating scores now."
-            )
-            self._calculate_final_scores(set_attributes=True)
-        if 0 <= player_id < self.num_players:
-            return self._utilities[player_id]
-        logger.error(f"Invalid player index {player_id} requested for utility.")
-        return 0.0
-
-    def get_player_turn(self) -> int:
-        return self.current_player_index
-
-    def get_acting_player(self) -> int:
-        """Returns the index of the player who needs to act *now*."""
-        if self.snap_phase_active:
-            if self.snap_current_snapper_idx < len(self.snap_potential_snappers):
-                potential_snapper = self.snap_potential_snappers[
-                    self.snap_current_snapper_idx
-                ]
-                if 0 <= potential_snapper < len(self.players) and hasattr(
-                    self.players[potential_snapper], "hand"
-                ):
-                    return potential_snapper
-                else:
-                    logger.error(
-                        f"Snap phase acting player index {potential_snapper} invalid or missing hand."
-                    )
-                    return -1
-            else:
-                logger.error("Snap phase active but index out of bounds.")
-                return -1
-        elif self.pending_action and self.pending_action_player is not None:
-            pending_player = self.pending_action_player
-            if 0 <= pending_player < len(self.players) and hasattr(
-                self.players[pending_player], "hand"
-            ):
-                return pending_player
-            else:
-                logger.error(
-                    f"Pending action player index {pending_player} invalid or missing hand."
-                )
-                return -1
-        elif not self._game_over:
-            current_player = self.current_player_index
-            if 0 <= current_player < len(self.players) and hasattr(
-                self.players[current_player], "hand"
-            ):
-                return current_player
-            else:
-                logger.error(
-                    f"Current player index {current_player} invalid or missing hand in active game."
-                )
-                return -1
-        else:
-            return -1
-
-    def __str__(self) -> str:
-        state_desc = ""
-        actor = self.get_acting_player()
-        actor_str = f"P{actor}" if actor != -1 else "N/A"
-        if self.snap_phase_active:
-            state_desc = f"SnapPhase(Actor: {actor_str}, Target: {self.snap_discarded_card.rank if self.snap_discarded_card else 'N/A'})"
-        elif self.pending_action:
-            state_desc = f"Pending(Actor: {actor_str}, Action: {type(self.pending_action).__name__})"
-        elif self._game_over:
-            state_desc = (
-                f"GameOver(W:{self._winner}, U:{[f'{u:.1f}' for u in self._utilities]})"
-            )
-        else:
-            state_desc = f"Turn: {actor_str}"
-
-        discard_top_str = str(self.get_discard_top()) if self.discard_pile else "[]"
-        hand_lens = []
-        for i, p in enumerate(self.players):
-            if hasattr(p, "hand") and isinstance(p.hand, list):
-                hand_lens.append(len(p.hand))
-            else:
-                hand_lens.append("ERR")
-
-        return (
-            f"GameState(T#{self._turn_number}, {state_desc}, "
-            f"Stock:{len(self.stockpile)}, Disc:{discard_top_str}, "
-            f"Hands:{hand_lens}, "
-            f"Cambia:{self.cambia_caller_id}({self.turns_after_cambia}))"
-        )
