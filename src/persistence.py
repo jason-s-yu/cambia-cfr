@@ -1,11 +1,13 @@
-# src/persistence.py
-import joblib
-import os
-from typing import Tuple, Optional, Dict, Any, TypeAlias
-import logging
-import numpy as np
+"""src/persistence.py"""
 
-from .utils import PolicyDict, InfosetKey
+from typing import Optional, Dict, Any, TypeAlias
+import os
+import logging
+import pickle
+
+import joblib
+
+from .utils import InfosetKey
 
 logger = logging.getLogger(__name__)
 
@@ -14,14 +16,14 @@ ReachProbDict: TypeAlias = Dict[InfosetKey, float]
 
 
 def save_agent_data(data_to_save: Dict[str, Any], filepath: str):
-    """Saves the agent's learned data (regrets, strategy sums, reach sums, iteration count)."""
+    """Saves the agent's learned data to a file."""
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         joblib.dump(data_to_save, filepath)
         iteration = data_to_save.get("iteration", "N/A")
-        logger.info(f"Agent data saved to {filepath} at iteration {iteration}")
-    except Exception as e:
-        logger.error(f"Error saving agent data to {filepath}: {e}")
+        logger.info("Agent data saved to %s at iteration %s", filepath, iteration)
+    except (OSError, pickle.PicklingError) as e:
+        logger.error("Error saving agent data to %s: %s", filepath, e)
 
 
 def load_agent_data(filepath: str) -> Optional[Dict[str, Any]]:
@@ -37,16 +39,19 @@ def load_agent_data(filepath: str) -> Optional[Dict[str, Any]]:
                 or "reach_prob_sum" not in loaded_data
             ):
                 logger.warning(
-                    f"Loaded data from {filepath} missing expected keys. Check file integrity."
+                    "Loaded data from %s missing expected keys. Check file integrity.",
+                    filepath,
                 )
             logger.info(
-                f"Agent data loaded from {filepath}. Resuming from iteration {iteration}."
+                "Agent data loaded from %s. Resuming from iteration %d.",
+                filepath,
+                iteration,
             )
             # Return the whole dictionary
             return loaded_data
-        else:
-            logger.info(f"Agent data file not found at {filepath}. Starting fresh.")
-            return None
-    except Exception as e:
-        logger.error(f"Error loading agent data from {filepath}: {e}")
+
+        logger.info("Agent data file not found at %s. Starting fresh.", filepath)
+        return None
+    except (OSError, pickle.UnpicklingError, EOFError) as e:
+        logger.error("Error loading agent data from %s: %s", filepath, e)
         return None

@@ -1,4 +1,5 @@
-# src/card.py
+"""src/card.py"""
+
 from dataclasses import dataclass, field
 from typing import Optional, ClassVar, Dict
 import uuid
@@ -14,7 +15,6 @@ from .constants import (
     ALL_RANKS_STR,
     ALL_SUITS,
     RED_SUITS,
-    NUMERIC_RANKS_STR,
     JOKER_RANK_STR,  # Use JOKER_RANK_STR
 )
 
@@ -60,12 +60,12 @@ class Card:
             return -1 if self.suit in RED_SUITS else 13
         try:
             return self._value_map[self.rank]
-        except KeyError:
+        except KeyError as exc:
             # This should not happen if constants and validation are correct
             logger.error(
-                f"FATAL: Could not find value for rank '{self.rank}' in _value_map."
+                "FATAL: Could not find value for rank '%s' in _value_map.", self.rank
             )
-            raise ValueError(f"Invalid rank '{self.rank}' encountered.")
+            raise ValueError(f"Invalid rank '{self.rank}' encountered.") from exc
 
     def __post_init__(self):
         # Basic validation using constants

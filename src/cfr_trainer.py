@@ -1,32 +1,35 @@
-# src/cfr_trainer.py
-from typing import Callable, Dict, List, Optional, Tuple
-from collections import defaultdict, deque
+"""src/cfr_trainer.py"""
 
-import numpy as np
-import time
 import logging
 import copy
+import time
 import traceback
+from collections import defaultdict, deque
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 from tqdm import tqdm
 
-from .persistence import load_agent_data
+from .agent_state import AgentObservation, AgentState
+from .analysis_tools import AnalysisTools
+from .config import Config
+from .constants import (
+    NUM_PLAYERS,
+    ActionAbilityBlindSwapSelect,
+    ActionAbilityKingLookSelect,
+    ActionAbilityKingSwapDecision,
+    ActionAbilityPeekOtherSelect,
+    ActionAbilityPeekOwnSelect,
+    ActionDiscard,
+    ActionReplace,
+    ActionSnapOpponentMove,
+    CardObject,
+    DecisionContext,
+    GameAction,
+)
 from .game.engine import CambiaGameState
 from .game.types import StateDelta, UndoInfo
-from .constants import (
-    ActionAbilityKingSwapDecision,
-    GameAction,
-    NUM_PLAYERS,
-    CardObject,
-    ActionSnapOpponentMove,
-    ActionReplace,
-    ActionDiscard,
-    ActionAbilityPeekOwnSelect,
-    ActionAbilityPeekOtherSelect,
-    ActionAbilityKingLookSelect,
-    ActionAbilityBlindSwapSelect,
-    DecisionContext,
-)
-from .agent_state import AgentState, AgentObservation
+from .persistence import load_agent_data
 from .utils import (
     InfosetKey,
     PolicyDict,
@@ -34,21 +37,14 @@ from .utils import (
     get_rm_plus_strategy,
     normalize_probabilities,
 )
-from .config import Config
-from .analysis_tools import AnalysisTools
 
 logger = logging.getLogger(__name__)
 
-# How often to update the tqdm postfix within an iteration (every N nodes visited)
-TQDM_UPDATE_INTERVAL = 10000  # Adjust as needed for performance vs feedback frequency
+TQDM_UPDATE_INTERVAL = 10000
 
 
 class CFRTrainer:
-    """Implements the CFR+ algorithm for training a Cambia agent via self-play."""
-
-    def __init__(
-        self, config: Config, run_log_dir: Optional[str] = None
-    ):  # Accept run_log_dir
+    def __init__(self, config: Config, run_log_dir: Optional[str] = None):
         self.config = config
         self.num_players = NUM_PLAYERS
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -58,20 +54,17 @@ class CFRTrainer:
         self.reach_prob_sum: ReachProbDict = defaultdict(float)
         self.current_iteration = 0
         self.average_strategy: Optional[PolicyDict] = None
-        # Initialize AnalysisTools with run_log_dir if available
         analysis_log_dir = run_log_dir if run_log_dir else config.logging.log_dir
         analysis_log_prefix = config.logging.log_file_prefix
         self.analysis = AnalysisTools(config, analysis_log_dir, analysis_log_prefix)
         self.exploitability_results: List[Tuple[int, float]] = []
-        self.run_log_dir = run_log_dir  # Store for potential later use
-        self.max_depth_this_iter = 0  # Track max depth reached in current iteration
+        self.run_log_dir = run_log_dir
+        self.max_depth_this_iter = 0
 
     def load_data(self, filepath: Optional[str] = None):
-        """Loads previously saved training data."""
         path = filepath or self.config.persistence.agent_data_save_path
         loaded = load_agent_data(path)
         if loaded:
-            # Ensure keys loaded from joblib (potentially tuples) are converted to InfosetKey dataclass
             self.regret_sum = defaultdict(
                 lambda: np.array([], dtype=np.float64),
                 {
@@ -94,7 +87,6 @@ class CFRTrainer:
                 },
             )
             self.current_iteration = loaded.get("iteration", 0)
-            # Load exploitability history safely
             exploit_history = loaded.get("exploitability_results", [])
             if isinstance(exploit_history, list) and all(
                 isinstance(item, (tuple, list)) and len(item) == 2
@@ -108,7 +100,6 @@ class CFRTrainer:
                     "Invalid exploitability history format found in loaded data. Resetting."
                 )
                 self.exploitability_results = []
-
             logger.info("Resuming training from iteration %d", self.current_iteration + 1)
         else:
             logger.info("No saved data found or error loading. Starting fresh.")
@@ -119,11 +110,9 @@ class CFRTrainer:
             self.exploitability_results = []
 
     def save_data(self, filepath: Optional[str] = None):
-        """Saves the current training data."""
-        from .persistence import save_agent_data  # Local import OK here
+        from .persistence import save_agent_data
 
         path = filepath or self.config.persistence.agent_data_save_path
-        # Convert InfosetKey dataclasses back to tuples for saving with joblib/pickle
         data_to_save = {
             "regret_sum": {
                 k.astuple() if isinstance(k, InfosetKey) else k: v
@@ -138,35 +127,26 @@ class CFRTrainer:
                 for k, v in self.reach_prob_sum.items()
             },
             "iteration": self.current_iteration,
-            "exploitability_results": self.exploitability_results,  # Save exploitability history
+            "exploitability_results": self.exploitability_results,
         }
         save_agent_data(data_to_save, path)
 
     def train(self, num_iterations: Optional[int] = None):
-        """Runs the CFR+ training loop with tqdm progress bar."""
         total_iterations_to_run = (
             num_iterations or self.config.cfr_training.num_iterations
         )
-        start_iteration = (
-            self.current_iteration
-        )  # Iteration number starts from 0 internally
-        end_iteration = (
-            start_iteration + total_iterations_to_run
-        )  # Target iteration number (exclusive in range)
+        start_iteration = self.current_iteration
+        end_iteration = start_iteration + total_iterations_to_run
         exploitability_interval = self.config.cfr_training.exploitability_interval
-
         if total_iterations_to_run <= 0:
             logger.warning("Number of iterations to run must be positive.")
             return
-
         logger.info(
             "Starting CFR+ training from iteration %d up to %d...",
             start_iteration + 1,
             end_iteration,
         )
         loop_start_time = time.time()
-
-        # Setup tqdm Progress Bar
         progress_bar = tqdm(
             range(start_iteration, end_iteration),
             desc="CFR+ Training",
@@ -175,15 +155,11 @@ class CFRTrainer:
             unit="iter",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
-
-        # --- Training Loop ---
         for t in progress_bar:
             iter_start_time = time.time()
-            self.current_iteration = t + 1  # User-facing iteration number (starts from 1)
-            self.max_depth_this_iter = 0  # Reset max depth tracker
-            nodes_visited_counter = [0]  # Use mutable list for counter
-
-            # --- Initialize Game ---
+            self.current_iteration = t + 1
+            self.max_depth_this_iter = 0
+            nodes_visited_counter = [0]
             game_state = None
             try:
                 game_state = CambiaGameState(house_rules=self.config.cambia_rules)
@@ -199,11 +175,9 @@ class CFRTrainer:
                 )
                 progress_bar.set_postfix_str("Error init game, skipping")
                 continue
-
             reach_probs = np.ones(self.num_players, dtype=np.float64)
             initial_agent_states = []
             action_log_for_game: List[Dict] = []
-
             if not game_state.is_terminal():
                 initial_obs = self._create_observation(
                     None, None, game_state, -1, [], None
@@ -240,11 +214,9 @@ class CFRTrainer:
                 )
                 progress_bar.set_postfix_str("Error game terminal init, skipping")
                 continue
-
             if not initial_agent_states:
                 progress_bar.set_postfix_str("Error init agents, skipping")
                 continue
-
             final_utilities = None
             game_failed = False
             try:
@@ -258,7 +230,6 @@ class CFRTrainer:
                     nodes_visited_counter,
                     depth=0,
                 )
-
                 game_details = self.analysis.format_game_details_for_log(
                     game_state=game_state,
                     iteration=self.current_iteration,
@@ -266,7 +237,6 @@ class CFRTrainer:
                     action_sequence=action_log_for_game,
                 )
                 self.analysis.log_game_history(game_details)
-
             except RecursionError:
                 logger.error(
                     "Iter %d, Depth %d: Recursion depth exceeded on iteration %d! Saving progress and stopping.",
@@ -278,7 +248,7 @@ class CFRTrainer:
                 if action_log_for_game:
                     logger.error(
                         "Last actions:\n%s",
-                        "\n".join(["  %s" % e for e in action_log_for_game[-10:]]),
+                        "\n".join([f"  {e}" for e in action_log_for_game[-10:]]),
                     )
                 logger.error("Traceback:\n%s", traceback.format_exc())
                 progress_bar.set_postfix_str("RecursionError!")
@@ -292,12 +262,10 @@ class CFRTrainer:
                     e,
                 )
                 logger.error("State at Error: %s", game_state)
-                progress_bar.set_postfix_str("CFRError! %s" % type(e).__name__)
+                progress_bar.set_postfix_str(f"CFRError! {type(e).__name__}")
                 game_failed = True
-
             if game_failed:
                 continue
-
             iter_time = time.time() - iter_start_time
             last_exploit = (
                 self.exploitability_results[-1][1]
@@ -305,12 +273,11 @@ class CFRTrainer:
                 else float("inf")
             )
             exploit_str = (
-                ("Expl: %.3f" % last_exploit)
+                f"Expl: {last_exploit:.3f}"
                 if last_exploit != float("inf")
                 else "Expl: N/A"
             )
             nodes_this_iter_final = nodes_visited_counter[0]
-
             if (
                 exploitability_interval > 0
                 and self.current_iteration % exploitability_interval == 0
@@ -326,7 +293,7 @@ class CFRTrainer:
                         current_avg_strategy, self.config
                     )
                     self.exploitability_results.append((self.current_iteration, exploit))
-                    exploit_str = "Expl: %.3f" % exploit
+                    exploit_str = f"Expl: {exploit:.3f}"
                     exploit_calc_time = time.time() - exploit_start_time
                     logger.info(
                         "Exploitability calculated: %.4f (took %.2fs)",
@@ -338,26 +305,22 @@ class CFRTrainer:
                         "Could not compute average strategy for exploitability calculation."
                     )
                     exploit_str = "Expl: N/A"
-
             total_infosets = len(self.regret_sum)
             postfix_dict = {
-                "LastT": "%.2fs" % iter_time,
+                "LastT": f"{iter_time:.2f}s",
                 "NodesIter": f"{nodes_this_iter_final:,}",
                 "DepthMax": f"{self.max_depth_this_iter}",
                 exploit_str.split(":")[0].strip(): exploit_str.split(":")[1].strip(),
                 "TotalNodes": f"{total_infosets:,}",
             }
             progress_bar.set_postfix(postfix_dict, refresh=True)
-
             if self.current_iteration % self.config.cfr_training.save_interval == 0:
                 self.save_data()
-
         progress_bar.close()
         end_time = time.time()
         total_completed = self.current_iteration - start_iteration
         logger.info("Training loop finished %d iterations.", total_completed)
         logger.info("Total training time: %.2f seconds.", end_time - loop_start_time)
-
         logger.info("Computing final average strategy...")
         final_avg_strategy = self.compute_average_strategy()
         if final_avg_strategy:
@@ -377,7 +340,6 @@ class CFRTrainer:
             logger.info("Final exploitability: %.4f", final_exploit)
         else:
             logger.warning("Could not compute final average strategy.")
-
         self.save_data()
         logger.info("Final average strategy and data saved.")
 
@@ -392,14 +354,8 @@ class CFRTrainer:
         nodes_visited_counter: List[int],
         depth: int,
     ) -> np.ndarray:
-        """
-        Recursive CFR+ function. Operates on the *same* game_state object,
-        applying and undoing actions. Clones agent_states. Includes depth tracking
-        and periodic tqdm updates.
-        """
         self.max_depth_this_iter = max(self.max_depth_this_iter, depth)
         nodes_visited_counter[0] += 1
-
         if nodes_visited_counter[0] % TQDM_UPDATE_INTERVAL == 0:
             last_exploit = (
                 self.exploitability_results[-1][1]
@@ -407,20 +363,19 @@ class CFRTrainer:
                 else float("inf")
             )
             exploit_str = (
-                ("Expl: %.3f" % last_exploit)
+                f"Expl: {last_exploit:.3f}"
                 if last_exploit != float("inf")
                 else "Expl: N/A"
             )
             total_infosets = len(self.regret_sum)
             postfix_dict = {
                 "NodesIter": f"{nodes_visited_counter[0]:,}",
-                "Depth": "%d" % depth,
-                "DepthMax": "%d" % self.max_depth_this_iter,
+                "Depth": f"{depth}",
+                "DepthMax": f"{self.max_depth_this_iter}",
                 "TotalNodes": f"{total_infosets:,}",
                 exploit_str.split(":")[0].strip(): exploit_str.split(":")[1].strip(),
             }
             progress_bar.set_postfix(postfix_dict, refresh=False)
-
         current_context = DecisionContext.TERMINAL
         if game_state.is_terminal():
             return np.array(
@@ -456,7 +411,6 @@ class CFRTrainer:
                 current_context = DecisionContext.START_TURN
         else:
             current_context = DecisionContext.START_TURN
-
         player = game_state.get_acting_player()
         if player == -1:
             logger.error(
@@ -467,10 +421,8 @@ class CFRTrainer:
                 current_context.name,
             )
             return np.zeros(self.num_players, dtype=np.float64)
-
         current_agent_state = agent_states[player]
         opponent = 1 - player
-
         try:
             if not hasattr(current_agent_state, "own_hand") or not hasattr(
                 current_agent_state, "opponent_belief"
@@ -486,7 +438,7 @@ class CFRTrainer:
             base_infoset_tuple = current_agent_state.get_infoset_key()
             infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
         except Exception:
-            logger.error(
+            logger.exception(
                 "Iter %d, P%d, Depth %d: Error getting infoset key. AgentState: %s. GameState: %s. Context: %s",
                 iteration,
                 player,
@@ -494,26 +446,23 @@ class CFRTrainer:
                 current_agent_state,
                 game_state,
                 current_context.name,
-                exc_info=True,
             )
             return np.zeros(self.num_players, dtype=np.float64)
-
         try:
             legal_actions_set = game_state.get_legal_actions()
             legal_actions = sorted(list(legal_actions_set), key=repr)
         except Exception as e:
-            logger.error(
-                "Iter %d, P%d, Depth %d: Error getting legal actions. State: %s. InfosetKey: %s. Context: %s",
+            logger.exception(
+                "Iter %d, P%d, Depth %d: Error getting legal actions. State: %s. InfosetKey: %s. Context: %s: %s",
                 iteration,
                 player,
                 depth,
                 game_state,
                 infoset_key,
                 current_context.name,
-                exc_info=True,
+                e,
             )
             return np.zeros(self.num_players, dtype=np.float64)
-
         num_actions = len(legal_actions)
         if num_actions == 0:
             if not game_state.is_terminal():
@@ -549,7 +498,6 @@ class CFRTrainer:
                     [game_state.get_utility(i) for i in range(self.num_players)],
                     dtype=np.float64,
                 )
-
         current_regrets = self.regret_sum.get(infoset_key)
         if current_regrets is None or len(current_regrets) != num_actions:
             if current_regrets is not None:
@@ -565,7 +513,6 @@ class CFRTrainer:
                 )
             self.regret_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
             current_regrets = self.regret_sum[infoset_key]
-
         current_strategy_sum = self.strategy_sum.get(infoset_key)
         if current_strategy_sum is None or len(current_strategy_sum) != num_actions:
             if current_strategy_sum is not None:
@@ -580,12 +527,9 @@ class CFRTrainer:
                     current_context.name,
                 )
             self.strategy_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
-
         if infoset_key not in self.reach_prob_sum:
             self.reach_prob_sum[infoset_key] = 0.0
-
         strategy = get_rm_plus_strategy(current_regrets)
-
         player_reach = reach_probs[player]
         if player_reach > 1e-9:
             if self.config.cfr_plus_params.weighted_averaging_enabled:
@@ -596,12 +540,10 @@ class CFRTrainer:
             if weight > 0:
                 self.reach_prob_sum[infoset_key] += weight * player_reach
                 self.strategy_sum[infoset_key] += weight * player_reach * strategy
-
         action_utilities = np.zeros((num_actions, self.num_players), dtype=np.float64)
         node_value = np.zeros(self.num_players, dtype=np.float64)
         use_pruning = self.config.cfr_training.pruning_enabled
         pruning_threshold = self.config.cfr_training.pruning_threshold
-
         for i, action in enumerate(legal_actions):
             action_prob = strategy[i]
             node_positive_regret_sum = np.sum(np.maximum(0.0, current_regrets))
@@ -612,13 +554,10 @@ class CFRTrainer:
                 and node_positive_regret_sum > pruning_threshold
                 and iteration > self.config.cfr_plus_params.averaging_delay + 10
             )
-
             if should_prune:
                 continue
-
             if action_prob < 1e-9:
                 continue
-
             action_log_entry = {
                 "player": player,
                 "turn": game_state.get_turn_number(),
@@ -635,17 +574,15 @@ class CFRTrainer:
             undo_info: Optional[UndoInfo] = None
             state_after_action_desc = "ERROR"
             drawn_card_this_step: Optional[CardObject] = None
-
             try:
                 if isinstance(
                     action, (ActionReplace, ActionDiscard)
                 ) and game_state.pending_action_data.get("drawn_card"):
                     drawn_card_this_step = game_state.pending_action_data["drawn_card"]
-
                 state_delta, undo_info = game_state.apply_action(action)
                 state_after_action_desc = str(game_state)
             except Exception as apply_err:
-                logger.error(
+                logger.exception(
                     "Iter %d, P%d, Depth %d: Error applying action %s in state %s at infoset %s: %s",
                     iteration,
                     player,
@@ -659,7 +596,6 @@ class CFRTrainer:
                 action_log.append(action_log_entry)
                 undo_info = None
                 continue
-
             observation = self._create_observation(
                 None,
                 action,
@@ -668,7 +604,6 @@ class CFRTrainer:
                 game_state.snap_results_log,
                 drawn_card_this_step,
             )
-
             next_agent_states = []
             agent_update_failed = False
             for agent_idx, agent_state in enumerate(agent_states):
@@ -676,9 +611,9 @@ class CFRTrainer:
                 try:
                     player_specific_obs = self._filter_observation(observation, agent_idx)
                     cloned_agent.update(player_specific_obs)
-                except Exception:
+                except Exception as e:
                     logger.exception(
-                        "Iter %d, P%d, Depth %d: Error updating AgentState %d for action %s. Infoset: %s. Obs: %s",
+                        "Iter %d, P%d, Depth %d: Error updating AgentState %d for action %s. Infoset: %s. Obs: %s: %s",
                         iteration,
                         player,
                         depth,
@@ -686,22 +621,19 @@ class CFRTrainer:
                         action,
                         infoset_key,
                         observation,
-                        exc_info=True,
+                        e,
                     )
                     agent_update_failed = True
                     break
                 next_agent_states.append(cloned_agent)
-
             if agent_update_failed:
                 action_log_entry["outcome"] = "ERROR updating agent state"
                 action_log.append(action_log_entry)
                 if undo_info:
                     undo_info()
                 continue
-
             next_reach_probs = reach_probs.copy()
             next_reach_probs[player] *= action_prob
-
             try:
                 recursive_utilities = self._cfr_recursive(
                     game_state,
@@ -714,7 +646,7 @@ class CFRTrainer:
                     depth + 1,
                 )
                 action_utilities[i] = recursive_utilities
-            except RecursionError:
+            except RecursionError as rec_err:
                 logger.error(
                     "Iter %d, P%d, Depth %d: Recursion depth exceeded during action: %s. State: %s",
                     iteration,
@@ -722,41 +654,39 @@ class CFRTrainer:
                     depth,
                     action,
                     game_state,
-                    exc_info=False,
                 )
-                action_log_entry["outcome"] = "ERROR: RecursionError"
+                action_log_entry["outcome"] = f"ERROR: RecursionError - {rec_err}"
                 action_log.append(action_log_entry)
                 raise
             except Exception as recursive_err:
-                logger.error(
-                    "Iter %d, P%d, Depth %d: Error in recursive call for action %s. Infoset: %s",
+                logger.exception(
+                    "Iter %d, P%d, Depth %d: Error in recursive call for action %s. Infoset: %s: %s",
                     iteration,
                     player,
                     depth,
                     action,
                     infoset_key,
-                    exc_info=False,
+                    recursive_err,
                 )
-                action_log_entry["outcome"] = "ERROR in recursion: %s" % recursive_err
+                action_log_entry["outcome"] = f"ERROR in recursion: {recursive_err}"
                 action_log.append(action_log_entry)
                 if undo_info:
                     undo_info()
                 continue
-
             action_log_entry["outcome_utilities"] = action_utilities[i].tolist()
             action_log_entry["state_desc_after"] = state_after_action_desc
             action_log.append(action_log_entry)
-
             if undo_info:
                 try:
                     undo_info()
                 except Exception as undo_e:
                     logger.exception(
-                        "FATAL: Iter %d, P%d, Depth %d: Error undoing action %s. State corrupt.",
+                        "FATAL: Iter %d, P%d, Depth %d: Error undoing action %s. State corrupt: %s",
                         iteration,
                         player,
                         depth,
                         action,
+                        undo_e,
                     )
                     return np.zeros(self.num_players, dtype=np.float64)
             else:
@@ -768,9 +698,7 @@ class CFRTrainer:
                     action,
                 )
                 return np.zeros(self.num_players, dtype=np.float64)
-
         node_value = np.sum(strategy[:, np.newaxis] * action_utilities, axis=0)
-
         opponent_reach = reach_probs[opponent]
         if player_reach > 1e-9:
             player_action_values = action_utilities[:, player]
@@ -778,40 +706,44 @@ class CFRTrainer:
             instantaneous_regret = player_action_values - player_node_value
             update_weight = opponent_reach
             current_regrets_before_update = np.copy(self.regret_sum[infoset_key])
-
             try:
                 updated_regrets = (
                     current_regrets_before_update + update_weight * instantaneous_regret
                 )
                 self.regret_sum[infoset_key] = np.maximum(0.0, updated_regrets)
-            except Exception as e_regret:
-                logger.error(
-                    "Iter %d, P%d, Depth %d, Infoset %s, Context %s: Error during regret update: %s",
+            except ValueError as e_regret:  # More specific exception
+                logger.exception(
+                    "Iter %d, P%d, Depth %d, Infoset %s, Context %s: ValueError during regret update: %s",
                     iteration,
                     player,
                     depth,
                     infoset_key,
                     current_context.name,
                     e_regret,
-                    exc_info=True,
                 )
-
+            except Exception as e_regret:  # Catch-all with logging
+                logger.exception(
+                    "Iter %d, P%d, Depth %d, Infoset %s, Context %s: Unexpected error during regret update: %s",
+                    iteration,
+                    player,
+                    depth,
+                    infoset_key,
+                    current_context.name,
+                    e_regret,
+                )
         return node_value
 
     def _filter_observation(
         self, obs: AgentObservation, observer_id: int
     ) -> AgentObservation:
-        """Filters sensitive information from observation based on observer."""
         filtered_obs = copy.copy(obs)
         if obs.drawn_card and obs.acting_player != observer_id:
             if not isinstance(obs.action, ActionDiscard) and not (
                 isinstance(obs.action, ActionReplace) and obs.acting_player == observer_id
             ):
                 filtered_obs.drawn_card = None
-
         if obs.peeked_cards:
             new_peeked = {}
-            ability_card = None
             if (
                 obs.action
                 and isinstance(obs.action, ActionAbilityKingSwapDecision)
@@ -830,11 +762,8 @@ class CFRTrainer:
                 and obs.acting_player == observer_id
             ):
                 new_peeked = obs.peeked_cards
-
             filtered_obs.peeked_cards = new_peeked if new_peeked else None
-
         filtered_obs.snap_results = obs.snap_results
-
         return filtered_obs
 
     def _create_observation(
@@ -846,7 +775,6 @@ class CFRTrainer:
         snap_results: List[Dict],
         explicit_drawn_card: Optional[CardObject] = None,
     ) -> AgentObservation:
-        """Creates the observation object based on state change (uses next_state)."""
         discard_top = next_state.get_discard_top()
         hand_sizes = [
             next_state.get_player_card_count(i) for i in range(self.num_players)
@@ -858,7 +786,6 @@ class CFRTrainer:
         turn_num = next_state.get_turn_number()
         drawn_card = explicit_drawn_card
         peeked_cards_dict = None
-
         if (
             isinstance(next_state.pending_action, ActionAbilityKingSwapDecision)
             and next_state.pending_action_player == acting_player
@@ -875,7 +802,6 @@ class CFRTrainer:
                     (acting_player, pending_data["own_idx"]): pending_data["card1"],
                     (opp_idx, pending_data["opp_idx"]): pending_data["card2"],
                 }
-
         elif isinstance(action, ActionAbilityPeekOwnSelect):
             hand = next_state.get_player_hand(acting_player)
             if hand and 0 <= action.target_hand_index < len(hand):
@@ -893,9 +819,7 @@ class CFRTrainer:
                         action.target_opponent_hand_index
                     ]
                 }
-
         final_snap_results = next_state.snap_results_log
-
         obs = AgentObservation(
             acting_player=acting_player,
             action=action,
@@ -913,7 +837,6 @@ class CFRTrainer:
         return obs
 
     def compute_average_strategy(self) -> PolicyDict:
-        """Computes the average strategy using the CFR+ formula."""
         avg_strategy: PolicyDict = {}
         logger.info(
             "Computing average strategy from %d infosets...", len(self.strategy_sum)
@@ -921,17 +844,13 @@ class CFRTrainer:
         if not self.strategy_sum:
             logger.warning("Strategy sum is empty.")
             return avg_strategy
-
         zero_reach_count, nan_count, norm_issue_count, mismatched_dim_count = 0, 0, 0, 0
-
         for infoset_key, s_sum in self.strategy_sum.items():
             if isinstance(infoset_key, tuple):
                 infoset_key = InfosetKey(*infoset_key)
-
             r_sum = self.reach_prob_sum.get(infoset_key, 0.0)
             num_actions_in_sum = len(s_sum)
             normalized_strategy = np.array([])
-
             if r_sum > 1e-9:
                 normalized_strategy = s_sum / r_sum
                 if np.isnan(normalized_strategy).any():
@@ -961,7 +880,6 @@ class CFRTrainer:
                     if num_actions_in_sum > 0
                     else np.array([])
                 )
-
             regret_array = self.regret_sum.get(infoset_key)
             if regret_array is not None and len(regret_array) != len(normalized_strategy):
                 mismatched_dim_count += 1
@@ -978,9 +896,7 @@ class CFRTrainer:
                     if num_actions_regret > 0
                     else np.array([])
                 )
-
             avg_strategy[infoset_key] = normalized_strategy
-
         self.average_strategy = avg_strategy
         logger.info(
             "Average strategy computation complete (%d infosets).",
@@ -1003,7 +919,6 @@ class CFRTrainer:
         return avg_strategy
 
     def get_average_strategy(self) -> Optional[PolicyDict]:
-        """Returns the computed average strategy."""
         if self.average_strategy is None:
             logger.warning(
                 "Average strategy requested but not computed yet. Computing now..."

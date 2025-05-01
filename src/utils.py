@@ -1,10 +1,8 @@
-# src/utils.py
-import numpy as np
-from typing import TypeAlias, Dict, Tuple, NamedTuple, TYPE_CHECKING
-from dataclasses import dataclass
+"""src/utils.py"""
 
-if TYPE_CHECKING:
-    from .constants import CardBucket, StockpileEstimate, GamePhase, DecisionContext
+from typing import TypeAlias, Dict, Tuple
+from dataclasses import dataclass
+import numpy as np
 
 
 # Type alias for Regret/Strategy Dictionaries
@@ -34,14 +32,14 @@ def normalize_probabilities(probs: np.ndarray) -> np.ndarray:
     prob_sum = np.sum(probs)
     if prob_sum > 1e-9:  # Use tolerance for floating point
         return probs / prob_sum
-    else:
-        # If all probabilities are zero (or negative somehow), return uniform distribution
-        num_actions = len(probs)
-        if num_actions > 0:
-            # logger.debug(f"Normalizing zero/negative probabilities {probs} to uniform.")
-            return np.ones(num_actions) / num_actions
-        else:
-            return np.array([])  # No actions possible
+
+    # If all probabilities are zero (or negative somehow), return uniform distribution
+    num_actions = len(probs)
+    if num_actions > 0:
+        # logger.debug(f"Normalizing zero/negative probabilities {probs} to uniform.")
+        return np.ones(num_actions) / num_actions
+
+    return np.array([])  # No actions possible
 
 
 def get_rm_plus_strategy(regret_sum: np.ndarray) -> np.ndarray:

@@ -111,11 +111,12 @@ def load_config(
 ) -> Optional[Config]:  # Return Optional[Config]
     """Loads configuration from a YAML file."""
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
             if config_dict is None:
                 print(
-                    f"Warning: Config file '{config_path}' is empty or invalid. Using default configuration."
+                    f"Warning: Config file '{config_path}' is empty or invalid. "
+                    f"Using default configuration."
                 )
                 config_dict = {}  # Use empty dict to proceed with defaults
 
@@ -294,11 +295,12 @@ def load_config(
         yaml.YAMLError,
     ) as e:  # Catch more specific errors
         print(
-            f"Error loading or parsing config file '{config_path}': {e}. Check config structure/types."
+            f"Error loading or parsing config file '{config_path}': {e}. "
+            f"Check config structure/types."
         )
         print("Using default configuration.")
         return Config()  # Return default config object
-    except Exception as e:
+    except IOError as e:
         print(f"Unexpected error loading config file '{config_path}': {e}")
         # Optionally re-raise or return None/default
         # raise # Re-raise the exception for debugging

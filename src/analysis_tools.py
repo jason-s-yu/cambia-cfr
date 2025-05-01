@@ -1,4 +1,5 @@
-# src/analysis_tools.py
+"""src/analysis_tools.py"""
+
 import logging
 import json
 import os
@@ -6,16 +7,15 @@ from typing import Dict, Any, Optional, List
 from dataclasses import asdict
 import numpy as np
 
-# Import necessary types
 from .game.engine import CambiaGameState
-from .agent_state import AgentState  # Needed for Best Response Agent state
+from .agent_state import AgentState, AgentObservation
 from .constants import GameAction, DecisionContext, NUM_PLAYERS, CardObject
 from .config import Config
 from .utils import (
     InfosetKey,
     PolicyDict,
     normalize_probabilities,
-)  # Need policy dict type
+)
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +278,6 @@ class AnalysisTools:
 
     def _create_initial_observation(self, game_state: CambiaGameState) -> Any:
         """Helper to create a basic observation, e.g., after an action for BR agent update."""
-        from .agent_state import AgentObservation  # Local import
 
         obs = AgentObservation(
             acting_player=game_state.get_acting_player(),

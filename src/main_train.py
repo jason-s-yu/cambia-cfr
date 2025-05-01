@@ -1,12 +1,12 @@
-# src/main_train.py
+"""src/main_train.py"""
+
 import logging
-import logging.handlers  # Import handlers
+import logging.handlers
 import argparse
 import os
 import datetime
 import sys
-from tqdm import tqdm  # Import tqdm
-import time  # For custom namer
+from tqdm import tqdm
 
 from .config import load_config
 from .cfr_trainer import CFRTrainer

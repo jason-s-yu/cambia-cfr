@@ -145,8 +145,6 @@ class ActionAbilityKingSwapDecision(NamedTuple):
 class ActionPassSnap(NamedTuple):
     """Action to explicitly pass the opportunity to snap."""
 
-    pass  # No extra data needed
-
 
 class ActionSnapOwn(NamedTuple):
     # Player attempting snap is implicit (current player in snap phase)
