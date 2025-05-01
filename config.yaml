@@ -11,11 +11,11 @@ system:
 
 # CFR Training Parameters
 cfr_training:
-  num_iterations: 100000        # Total training iterations
-  save_interval: 5000           # Save progress every N iterations
+  num_iterations: 1000          # Total training iterations
+  save_interval: 1              # Save progress every N iterations
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
-  exploitability_interval: 1000 # Calculate exploitability every N iterations (0 to disable)
+  exploitability_interval: 1    # Calculate exploitability every N iterations (0 to disable)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
