@@ -1,4 +1,5 @@
-"""src/utils.py"""
+# src/utils.py
+"""Utility functions and type aliases for CFR."""
 
 from typing import TypeAlias, Dict, Tuple
 from dataclasses import dataclass
@@ -19,9 +20,37 @@ class InfosetKey:
     game_phase_value: int  # GamePhase.value
     decision_context_value: int  # DecisionContext.value
 
+    # Helper method for easy conversion to tuple, useful for legacy or simple dict keys
+    def astuple(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int, int, int, int]:
+        return (
+            self.own_hand_tuple,
+            self.opp_belief_tuple,
+            self.opp_card_count,
+            self.discard_top_bucket_value,
+            self.stockpile_size_cat_value,
+            self.game_phase_value,
+            self.decision_context_value,
+        )
+
 
 PolicyDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 ReachProbDict: TypeAlias = Dict[InfosetKey, float]  # Reach prob sum dictionary
+
+# Type aliases for worker results (local updates)
+LocalRegretUpdateDict: TypeAlias = Dict[
+    InfosetKey, np.ndarray
+]  # Accumulates opponent_reach * instantaneous_regret
+LocalStrategyUpdateDict: TypeAlias = Dict[
+    InfosetKey, np.ndarray
+]  # Accumulates weight * player_reach * strategy
+LocalReachProbUpdateDict: TypeAlias = Dict[
+    InfosetKey, float
+]  # Accumulates weight * player_reach
+
+# Type alias for the combined results returned by a single worker
+WorkerResult: TypeAlias = Tuple[
+    LocalRegretUpdateDict, LocalStrategyUpdateDict, LocalReachProbUpdateDict
+]
 
 
 def normalize_probabilities(probs: np.ndarray) -> np.ndarray:
@@ -36,7 +65,7 @@ def normalize_probabilities(probs: np.ndarray) -> np.ndarray:
     # If all probabilities are zero (or negative somehow), return uniform distribution
     num_actions = len(probs)
     if num_actions > 0:
-        # logger.debug(f"Normalizing zero/negative probabilities {probs} to uniform.")
+        # logger.debug("Normalizing zero/negative probabilities %s to uniform.", probs)
         return np.ones(num_actions) / num_actions
 
     return np.array([])  # No actions possible

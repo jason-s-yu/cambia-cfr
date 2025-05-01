@@ -1,5 +1,5 @@
 # src/config.py
-from typing import List, Dict, TypeVar, Optional  # Added Optional
+from typing import List, Dict, TypeVar, Optional
 from dataclasses import dataclass, field
 import os
 import yaml

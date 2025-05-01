@@ -87,6 +87,6 @@ def load_agent_data(filepath: str) -> Optional[Dict[str, Any]]:
         pickle.UnpicklingError,
         EOFError,
         ValueError,
-    ) as e:  # Added ValueError for potential joblib issues
+    ) as e:
         logger.error("Error loading agent data from %s: %s", filepath, e)
         return None

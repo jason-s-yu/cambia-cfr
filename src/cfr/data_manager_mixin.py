@@ -3,13 +3,18 @@
 
 import logging
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import numpy as np
 
-from ..constants import DecisionContext
 from ..persistence import load_agent_data, save_agent_data
-from ..utils import InfosetKey, PolicyDict, normalize_probabilities
+from ..utils import (
+    InfosetKey,
+    PolicyDict,
+    ReachProbDict,
+    WorkerResult,
+    normalize_probabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,40 +23,47 @@ class CFRDataManagerMixin:
     """Handles loading, saving, and computation of CFR policy data."""
 
     # Attributes expected to be initialized in the main class's __init__
-    # self.config: Config
-    # self.regret_sum: PolicyDict
-    # self.strategy_sum: PolicyDict
-    # self.reach_prob_sum: ReachProbDict
-    # self.current_iteration: int
-    # self.exploitability_results: List[Tuple[int, float]]
-    # self.average_strategy: Optional[PolicyDict]
-    # self._last_exploit_str: str
-    # self._total_infosets_str: str
+    config: "Config"  # Forward reference Config
+    regret_sum: PolicyDict
+    strategy_sum: PolicyDict
+    reach_prob_sum: ReachProbDict
+    current_iteration: int
+    exploitability_results: List[Tuple[int, float]]
+    average_strategy: Optional[PolicyDict]
+    # Internal display state attributes
+    _last_exploit_str: str
+    _total_infosets_str: str
 
     def load_data(self, filepath: Optional[str] = None):
         """Loads trainer state (policy dicts, iteration count) from a file."""
         path = filepath or self.config.persistence.agent_data_save_path
         loaded = load_agent_data(path)
         if loaded:
-            # Convert tuple keys back to InfosetKey if they exist from older saves
+            # Ensure defaultdict behavior after loading
             self.regret_sum = defaultdict(
                 lambda: np.array([], dtype=np.float64),
                 {
-                    InfosetKey(*k) if isinstance(k, tuple) else k: v
+                    InfosetKey(*k) if isinstance(k, tuple) else k: np.asarray(
+                        v, dtype=np.float64
+                    )  # Ensure numpy array
                     for k, v in loaded.get("regret_sum", {}).items()
                 },
             )
             self.strategy_sum = defaultdict(
                 lambda: np.array([], dtype=np.float64),
                 {
-                    InfosetKey(*k) if isinstance(k, tuple) else k: v
+                    InfosetKey(*k) if isinstance(k, tuple) else k: np.asarray(
+                        v, dtype=np.float64
+                    )  # Ensure numpy array
                     for k, v in loaded.get("strategy_sum", {}).items()
                 },
             )
             self.reach_prob_sum = defaultdict(
                 float,
                 {
-                    InfosetKey(*k) if isinstance(k, tuple) else k: v
+                    InfosetKey(*k) if isinstance(k, tuple) else k: float(
+                        v
+                    )  # Ensure float
                     for k, v in loaded.get("reach_prob_sum", {}).items()
                 },
             )
@@ -99,6 +111,7 @@ class CFRDataManagerMixin:
         path = filepath or self.config.persistence.agent_data_save_path
         # Save the state corresponding to the *completion* of self.current_iteration
         data_to_save = {
+            # Convert defaultdicts to regular dicts for saving
             "regret_sum": dict(self.regret_sum),
             "strategy_sum": dict(self.strategy_sum),
             "reach_prob_sum": dict(self.reach_prob_sum),
@@ -107,40 +120,131 @@ class CFRDataManagerMixin:
         }
         save_agent_data(data_to_save, path)
 
-    def compute_average_strategy(self) -> PolicyDict:
+    def _merge_local_updates(self, results: List[Optional[WorkerResult]]):
+        """
+        Merges the local updates collected from worker processes into the main
+        trainer's state dictionaries (regret_sum, strategy_sum, reach_prob_sum).
+
+        Args:
+            results: A list where each element is either a WorkerResult tuple
+                     (local_regret_updates, local_strategy_sum_updates, local_reach_prob_updates)
+                     or None if the worker failed.
+        """
+        if not results:
+            logger.warning("Received empty results list for merging.")
+            return
+
+        updated_infoset_keys = set()  # Track keys modified in this merge step
+
+        for worker_idx, result in enumerate(results):
+            if result is None:
+                logger.warning("Skipping merge for failed worker %d.", worker_idx)
+                continue
+
+            local_regret_updates, local_strategy_sum_updates, local_reach_prob_updates = (
+                result
+            )
+
+            # --- Merge Regret Updates ---
+            for infoset_key, local_regrets in local_regret_updates.items():
+                num_actions_local = len(local_regrets)
+                if num_actions_local == 0:
+                    continue  # Skip empty updates
+
+                updated_infoset_keys.add(infoset_key)
+                current_regrets = self.regret_sum.get(infoset_key)
+
+                if current_regrets is None:
+                    self.regret_sum[infoset_key] = (
+                        local_regrets  # Initialize with first worker's data
+                    )
+                elif len(current_regrets) != num_actions_local:
+                    logger.warning(
+                        "Merge Warn: Regret dimension mismatch for key %s. Global: %d, Worker %d: %d. Re-initializing global and adding.",
+                        infoset_key,
+                        len(current_regrets),
+                        worker_idx,
+                        num_actions_local,
+                    )
+                    # Re-initialize with worker data (might lose previous partial sums if dimensions change mid-iteration)
+                    self.regret_sum[infoset_key] = local_regrets
+                else:
+                    self.regret_sum[infoset_key] += local_regrets  # Accumulate
+
+            # --- Merge Strategy Sum Updates ---
+            for infoset_key, local_strategy_sum in local_strategy_sum_updates.items():
+                num_actions_local = len(local_strategy_sum)
+                if num_actions_local == 0:
+                    continue
+
+                updated_infoset_keys.add(infoset_key)  # Track potentially updated key
+                current_strategy_sum = self.strategy_sum.get(infoset_key)
+
+                if current_strategy_sum is None:
+                    self.strategy_sum[infoset_key] = local_strategy_sum
+                elif len(current_strategy_sum) != num_actions_local:
+                    logger.warning(
+                        "Merge Warn: Strategy Sum dimension mismatch for key %s. Global: %d, Worker %d: %d. Re-initializing global and adding.",
+                        infoset_key,
+                        len(current_strategy_sum),
+                        worker_idx,
+                        num_actions_local,
+                    )
+                    self.strategy_sum[infoset_key] = local_strategy_sum
+                else:
+                    self.strategy_sum[infoset_key] += local_strategy_sum
+
+            # --- Merge Reach Probability Sum Updates ---
+            for infoset_key, local_reach_prob in local_reach_prob_updates.items():
+                updated_infoset_keys.add(infoset_key)  # Track potentially updated key
+                # defaultdict handles initialization automatically
+                self.reach_prob_sum[infoset_key] += local_reach_prob
+
+        # --- Apply Regret Matching+ (non-negativity) AFTER all updates are summed ---
+        # Only apply to keys that were actually updated in this iteration
+        for key in updated_infoset_keys:
+            if (
+                key in self.regret_sum
+            ):  # Check existence in case it was only in strategy/reach updates
+                self.regret_sum[key] = np.maximum(0.0, self.regret_sum[key])
+
+        logger.debug(
+            "Merge complete. %d unique infosets updated.", len(updated_infoset_keys)
+        )
+
+    def compute_average_strategy(self) -> Optional[PolicyDict]:
         """
         Computes the average strategy from the accumulated strategy sums.
-
-        The average strategy at infoset I is given by:
-            avg_sigma(I, a) = strategy_sum(I, a) / reach_prob_sum(I)
-        Where:
-            strategy_sum(I, a) = sum_{t=1 to T} [ weight(t) * pi_i(I) * sigma_t(I, a) ]
-            reach_prob_sum(I) = sum_{t=1 to T} [ weight(t) * pi_i(I) ]
-            weight(t) = max(0, t - delay) if weighted, else 1.0
-            pi_i(I) is reach probability of player i at infoset I.
-            sigma_t(I, a) is the strategy at iteration t.
+        (No changes needed here for parallelism, relies on merged data)
         """
         avg_strategy: PolicyDict = {}
+        if not self.strategy_sum:
+            logger.warning("Cannot compute average strategy: Strategy sum is empty.")
+            return avg_strategy
+
         logger.info(
             "Computing average strategy from %d infosets...", len(self.strategy_sum)
         )
-        if not self.strategy_sum:
-            logger.warning("Strategy sum is empty.")
-            return avg_strategy
-
         zero_reach_count, nan_count, norm_issue_count, mismatched_dim_count = 0, 0, 0, 0
+
         for infoset_key, s_sum in self.strategy_sum.items():
-            # Ensure key is InfosetKey instance
-            if isinstance(infoset_key, tuple):
-                try:
-                    infoset_key = InfosetKey(*infoset_key)
-                except TypeError:
+            # Ensure key is InfosetKey instance (might not be needed if load_data ensures this)
+            if not isinstance(infoset_key, InfosetKey):
+                if isinstance(infoset_key, tuple):
+                    try:
+                        infoset_key = InfosetKey(*infoset_key)
+                    except Exception:
+                        logger.error(
+                            "Failed conversion to InfosetKey: %s",
+                            infoset_key,
+                            exc_info=True,
+                        )
+                        continue
+                else:
                     logger.error(
-                        "Failed to convert tuple %s to InfosetKey",
-                        infoset_key,
-                        exc_info=True,
+                        "Invalid key type in strategy_sum: %s", type(infoset_key)
                     )
-                    continue  # Skip this invalid key
+                    continue
 
             r_sum = self.reach_prob_sum.get(infoset_key, 0.0)
             num_actions_in_sum = len(s_sum)
@@ -149,7 +253,7 @@ class CFRDataManagerMixin:
             if r_sum > 1e-9:
                 normalized_strategy = s_sum / r_sum
 
-                # --- Sanity Checks ---
+                # Sanity Checks
                 if np.isnan(normalized_strategy).any():
                     nan_count += 1
                     logger.warning(
@@ -202,27 +306,19 @@ class CFRDataManagerMixin:
                     else np.array([])
                 )
 
-            # --- Dimension Check against Regrets ---
+            # Dimension Check against Regrets (important validation step)
             regret_array = self.regret_sum.get(infoset_key)
             if regret_array is not None and len(regret_array) != len(normalized_strategy):
                 mismatched_dim_count += 1
-                num_actions_regret = len(regret_array)
-                context_value = getattr(infoset_key, "decision_context_value", None)
-                context_name = (
-                    DecisionContext(context_value).name
-                    if context_value is not None
-                    else "N/A"
-                )
                 logger.warning(
-                    "Final avg strategy dim (%d) mismatch with regret (%d) for %s. Context: %s. Defaulting avg strategy to uniform based on *regret* dim.",
+                    "Final avg strategy dim (%d) mismatch with regret (%d) for %s. Defaulting avg strategy to uniform based on *regret* dim.",
                     len(normalized_strategy),
-                    num_actions_regret,
+                    len(regret_array),
                     infoset_key,
-                    context_name,
                 )
                 normalized_strategy = (
-                    np.ones(num_actions_regret) / num_actions_regret
-                    if num_actions_regret > 0
+                    np.ones(len(regret_array)) / len(regret_array)
+                    if len(regret_array) > 0
                     else np.array([])
                 )
             elif regret_array is None and len(normalized_strategy) > 0:
@@ -257,7 +353,7 @@ class CFRDataManagerMixin:
     def get_average_strategy(self) -> Optional[PolicyDict]:
         """Returns the computed average strategy, computing it if necessary."""
         if self.average_strategy is None:
-            logger.warning(
+            logger.info(  # Changed from warning to info
                 "Average strategy requested but not computed yet. Computing now..."
             )
             # Need to ensure self has compute_average_strategy method

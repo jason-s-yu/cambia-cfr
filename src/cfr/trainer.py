@@ -18,7 +18,6 @@ from ..utils import PolicyDict, ReachProbDict
 from .data_manager_mixin import CFRDataManagerMixin
 from .recursion_mixin import CFRRecursionMixin
 from .training_loop_mixin import CFRTrainingLoopMixin
-from .exceptions import GracefulShutdownException
 
 logger = logging.getLogger(__name__)
 

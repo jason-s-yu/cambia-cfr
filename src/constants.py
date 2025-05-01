@@ -155,10 +155,9 @@ class ActionSnapOpponent(NamedTuple):
     # Player attempting snap is implicit
     # This requires the snapper to know/guess the opponent's matching card index
     opponent_target_hand_index: (
-        int  # Which of *opponent's* cards to snap (must match rank) ### CLARIFIED ###
+        int  # Which of *opponent's* cards to snap (must match rank)
     )
     # Decision on which card to move comes *after* successful snap
-    # own_card_to_move_hand_index: int # Which of *own* cards to move into opponent's slot ### REMOVED - Now a separate step ###
 
 
 class ActionSnapOpponentMove(NamedTuple):  #
