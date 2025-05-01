@@ -1,7 +1,8 @@
 # src/config.py
-from dataclasses import dataclass, field
-import yaml
 from typing import List, Dict, TypeVar, Optional  # Added Optional
+from dataclasses import dataclass, field
+import os
+import yaml
 
 T = TypeVar("T")
 
@@ -23,6 +24,20 @@ def get_nested(data: Dict, keys: List[str], default: T) -> T:
     #     print(f"Warning: Type mismatch for config key {'/'.join(keys)}. Expected {type(default)}, got {type(current)}. Using default.")
     #     return default
     return current  # type: ignore
+
+
+def parse_num_workers(num_workers: str | int) -> int:
+    """Parse the number of workers, ensuring it's a positive integer."""
+    if isinstance(num_workers, int):
+        if num_workers < 0:
+            raise ValueError("num_workers must be a positive integer.")
+        if num_workers == 0:
+            return os.cpu_count() - 1
+    if isinstance(num_workers, str):
+        if num_workers.lower() == "auto":
+            return os.cpu_count() - 1
+        raise ValueError("num_workers must be 'auto' or a positive integer.")
+    return num_workers
 
 
 @dataclass
@@ -48,6 +63,9 @@ class CfrTrainingConfig:
     )
     exploitability_interval: int = (
         1000  # How often (in iterations) to calculate exploitability
+    )
+    num_workers: int = (
+        1  # Number of parallel workers for simulations. 1 for serial operation
     )
 
 
@@ -166,6 +184,13 @@ def load_config(
                         config_dict,
                         ["cfr_training", "exploitability_interval"],
                         CfrTrainingConfig.exploitability_interval,
+                    ),
+                    num_workers=parse_num_workers(
+                        get_nested(
+                            config_dict,
+                            ["cfr_training", "num_workers"],
+                            CfrTrainingConfig.num_workers,
+                        )
                     ),
                 ),
                 cfr_plus_params=CfrPlusParamsConfig(
