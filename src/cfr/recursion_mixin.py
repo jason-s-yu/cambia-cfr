@@ -597,19 +597,13 @@ class CFRRecursionMixin:
         if isinstance(action, ActionAbilityPeekOwnSelect) and acting_player != -1:
             hand = next_state.get_player_hand(acting_player)
             target_idx = action.target_hand_index
-            if (
-                hand
-                and 0 <= target_idx < len(hand)
-            ):
+            if hand and 0 <= target_idx < len(hand):
                 peeked_cards_dict = {(acting_player, target_idx): hand[target_idx]}
         elif isinstance(action, ActionAbilityPeekOtherSelect) and acting_player != -1:
             opp_idx = next_state.get_opponent_index(acting_player)
             opp_hand = next_state.get_player_hand(opp_idx)
             target_opp_idx = action.target_opponent_hand_index
-            if (
-                opp_hand
-                and 0 <= target_opp_idx < len(opp_hand)
-            ):
+            if opp_hand and 0 <= target_opp_idx < len(opp_hand):
                 peeked_cards_dict = {(opp_idx, target_opp_idx): opp_hand[target_opp_idx]}
         elif isinstance(action, ActionAbilityKingLookSelect) and acting_player != -1:
             # Re-fetch cards looked at for the observation (ideally passed from engine)
@@ -618,15 +612,9 @@ class CFRRecursionMixin:
             own_hand = next_state.get_player_hand(acting_player)
             opp_hand = next_state.get_player_hand(opp_real_idx)
             card1, card2 = None, None
-            if (
-                own_hand
-                and 0 <= own_idx < len(own_hand)
-            ):
+            if own_hand and 0 <= own_idx < len(own_hand):
                 card1 = own_hand[own_idx]
-            if (
-                opp_hand
-                and 0 <= opp_look_idx < len(opp_hand)
-            ):
+            if opp_hand and 0 <= opp_look_idx < len(opp_hand):
                 card2 = opp_hand[opp_look_idx]
             if card1 and card2:
                 peeked_cards_dict = {

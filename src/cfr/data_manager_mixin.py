@@ -13,6 +13,7 @@ from ..utils import InfosetKey, PolicyDict, normalize_probabilities
 
 logger = logging.getLogger(__name__)
 
+
 class CFRDataManagerMixin:
     """Handles loading, saving, and computation of CFR policy data."""
 

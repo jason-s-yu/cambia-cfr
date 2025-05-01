@@ -22,6 +22,7 @@ from .exceptions import GracefulShutdownException
 
 logger = logging.getLogger(__name__)
 
+
 # Ensure Mixin classes are defined before use or imported correctly
 class CFRTrainer(
     CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin
