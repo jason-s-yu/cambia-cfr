@@ -39,7 +39,11 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         self._determine_initial_serial()
 
         # Construct the initial filename
-        initial_filename = f"{self.base_pattern}_{self.current_serial:03d}.log"
+        if self.backupCount > 0:
+            pad_length = len(str(self.backupCount))
+        else:
+            pad_length = 4  # Default padding if backupCount is not set
+        initial_filename = f"{self.base_pattern}_{self.current_serial:0{pad_length}d}.log"
 
         # Initialize the parent class
         logging.handlers.BaseRotatingHandler.__init__(
