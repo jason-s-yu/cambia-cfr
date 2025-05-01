@@ -60,7 +60,9 @@ class CFRTrainer:
             lambda: np.array([], dtype=np.float64)
         )
         self.reach_prob_sum: ReachProbDict = defaultdict(float)
-        self.current_iteration = 0
+        self.current_iteration = (
+            0  # Represents the last *completed* iteration or 0 if fresh start
+        )
         self.average_strategy: Optional[PolicyDict] = None
         analysis_log_dir = run_log_dir if run_log_dir else config.logging.log_dir
         analysis_log_prefix = config.logging.log_file_prefix
@@ -77,6 +79,7 @@ class CFRTrainer:
         path = filepath or self.config.persistence.agent_data_save_path
         loaded = load_agent_data(path)
         if loaded:
+            # Convert tuple keys back to InfosetKey if they exist from older saves
             self.regret_sum = defaultdict(
                 lambda: np.array([], dtype=np.float64),
                 {
@@ -98,6 +101,7 @@ class CFRTrainer:
                     for k, v in loaded.get("reach_prob_sum", {}).items()
                 },
             )
+            # self.current_iteration now stores the last *completed* iteration
             self.current_iteration = loaded.get("iteration", 0)
             exploit_history = loaded.get("exploitability_results", [])
             if isinstance(exploit_history, list) and all(
@@ -121,13 +125,17 @@ class CFRTrainer:
                 self.exploitability_results = []
                 self._last_exploit_str = "N/A"
             self._total_infosets_str = f"{len(self.regret_sum):,}"
-            logger.info("Resuming training from iteration %d", self.current_iteration + 1)
+            # Adjust log message: We will re-run the iteration *after* the last completed one
+            logger.info(
+                "Resuming training. Will start execution from iteration %d.",
+                self.current_iteration + 1,
+            )
         else:
             logger.info("No saved data found or error loading. Starting fresh.")
             self.regret_sum = defaultdict(lambda: np.array([], dtype=np.float64))
             self.strategy_sum = defaultdict(lambda: np.array([], dtype=np.float64))
             self.reach_prob_sum = defaultdict(float)
-            self.current_iteration = 0
+            self.current_iteration = 0  # Start fresh means 0 completed iterations
             self.exploitability_results = []
             self._last_exploit_str = "N/A"
             self._total_infosets_str = "0"
@@ -136,20 +144,12 @@ class CFRTrainer:
         from .persistence import save_agent_data
 
         path = filepath or self.config.persistence.agent_data_save_path
+        # Save the state corresponding to the *completion* of self.current_iteration
         data_to_save = {
-            "regret_sum": {
-                k.astuple() if isinstance(k, InfosetKey) else k: v
-                for k, v in self.regret_sum.items()
-            },
-            "strategy_sum": {
-                k.astuple() if isinstance(k, InfosetKey) else k: v
-                for k, v in self.strategy_sum.items()
-            },
-            "reach_prob_sum": {
-                k.astuple() if isinstance(k, InfosetKey) else k: v
-                for k, v in self.reach_prob_sum.items()
-            },
-            "iteration": self.current_iteration,
+            "regret_sum": dict(self.regret_sum),
+            "strategy_sum": dict(self.strategy_sum),
+            "reach_prob_sum": dict(self.reach_prob_sum),
+            "iteration": self.current_iteration,  # Save the number of the iteration just finished
             "exploitability_results": self.exploitability_results,
         }
         save_agent_data(data_to_save, path)
@@ -158,16 +158,21 @@ class CFRTrainer:
         total_iterations_to_run = (
             num_iterations or self.config.cfr_training.num_iterations
         )
-        start_iteration = self.current_iteration
-        end_iteration = start_iteration + total_iterations_to_run
+        # last_completed_iteration is loaded into self.current_iteration
+        last_completed_iteration = self.current_iteration
+        # The first iteration to *run* is the one *after* the last completed one
+        start_iter_num = last_completed_iteration + 1
+        # The last iteration number to *run*
+        end_iter_num = last_completed_iteration + total_iterations_to_run
+
         exploitability_interval = self.config.cfr_training.exploitability_interval
         if total_iterations_to_run <= 0:
             logger.warning("Number of iterations to run must be positive.")
             return
         logger.info(
-            "Starting CFR+ training from iteration %d up to %d...",
-            start_iteration + 1,
-            end_iteration,
+            "Starting CFR+ training loop from iteration %d up to %d...",
+            start_iter_num,
+            end_iter_num,
         )
         loop_start_time = time.time()
 
@@ -180,11 +185,12 @@ class CFRTrainer:
         )
 
         # Create the main progress bar (position 1)
+        # The range should go from the first iteration to run up to (and including) the last one
         progress_bar = tqdm(
-            range(start_iteration, end_iteration),
+            range(start_iter_num, end_iter_num + 1),
             desc="CFR+ Training",
-            initial=start_iteration,
-            total=end_iteration,
+            # initial=start_iter_num, # tqdm initial assumes starting from 0, use total instead
+            total=total_iterations_to_run,  # Show progress relative to how many iterations *this run* performs
             unit="iter",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             position=1,  # Ensure it's below the status bar
@@ -192,21 +198,24 @@ class CFRTrainer:
         )
 
         try:
+            # Loop variable 't' represents the iteration number *currently being executed*
             for t in progress_bar:
                 # Check for shutdown request *before* starting the iteration's work
                 if self.shutdown_event.is_set():
                     logger.warning(
-                        "Shutdown detected before iteration %d. Stopping.", t + 1
+                        "Shutdown detected before starting iteration %d. Stopping.", t
                     )
+                    # Do not update self.current_iteration yet, save state as of last *completed* iteration
                     raise GracefulShutdownException("Shutdown detected before iteration")
 
                 iter_start_time = time.time()
-                self.current_iteration = t + 1
+                # Set the current iteration number being processed
+                self.current_iteration = t
                 self.max_depth_this_iter = 0
 
                 # Update status bar before starting iteration
                 status_bar.set_description_str(
-                    f"Iter {self.current_iteration}/{end_iteration} | Depth:0 | MaxD:0 | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+                    f"Iter {self.current_iteration}/{end_iter_num} | Depth:0 | MaxD:0 | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
                 )
 
                 game_state = None
@@ -223,7 +232,7 @@ class CFRTrainer:
                         e,
                     )
                     progress_bar.set_postfix_str("Error init game, skipping")
-                    continue
+                    continue  # Skip this iteration, don't save progress
                 reach_probs = np.ones(self.num_players, dtype=np.float64)
                 initial_agent_states = []
                 action_log_for_game: List[Dict] = []
@@ -262,14 +271,16 @@ class CFRTrainer:
                         self.current_iteration,
                     )
                     progress_bar.set_postfix_str("Error game terminal init, skipping")
-                    continue
+                    continue  # Skip this iteration
                 if not initial_agent_states:
                     progress_bar.set_postfix_str("Error init agents, skipping")
-                    continue
+                    continue  # Skip this iteration
+
                 final_utilities = None
                 game_failed = False
                 try:
                     # Pass the shutdown event down to the recursive function
+                    # iteration number passed down is the one currently running
                     final_utilities = self._cfr_recursive(
                         game_state,
                         initial_agent_states,
@@ -280,6 +291,7 @@ class CFRTrainer:
                         depth=0,
                         shutdown_event=self.shutdown_event,  # Pass event
                     )
+                    # Log history only if game completed without shutdown exception
                     game_details = self.analysis.format_game_details_for_log(
                         game_state=game_state,
                         iteration=self.current_iteration,
@@ -287,12 +299,15 @@ class CFRTrainer:
                         action_sequence=action_log_for_game,
                     )
                     self.analysis.log_game_history(game_details)
+
                 except GracefulShutdownException as shutdown_exc:
                     logger.warning(
                         "Graceful shutdown triggered during iteration %d.",
                         self.current_iteration,
                     )
+                    # Don't mark iteration as complete. The state saved will be from the *previous* iteration.
                     raise shutdown_exc  # Re-raise to be caught by outer handler
+
                 except RecursionError:
                     logger.error(
                         "Iter %d, MaxDepth %d: Recursion depth exceeded! Saving progress and stopping.",
@@ -308,8 +323,19 @@ class CFRTrainer:
                     logger.error("Traceback:\n%s", traceback.format_exc())
                     progress_bar.set_postfix_str("RecursionError!")
                     game_failed = True
+                    # Save progress *as of the last successfully completed iteration*
+                    # Since this iteration failed, self.current_iteration still holds 't', the failing one.
+                    # Save needs the *previous* iteration number.
+                    temp_iter = self.current_iteration  # Store failing iteration number
+                    self.current_iteration = (
+                        temp_iter - 1
+                    )  # Temporarily set to last completed for save
                     self.save_data()
-                    raise
+                    self.current_iteration = (
+                        temp_iter  # Restore for potential future use/logging
+                    )
+                    raise  # Re-raise the recursion error to stop training
+
                 except Exception as e:
                     logger.exception(
                         "Error during CFR recursion on iteration %d: %s",
@@ -319,8 +345,12 @@ class CFRTrainer:
                     logger.error("State at Error: %s", game_state)
                     progress_bar.set_postfix_str(f"CFRError! {type(e).__name__}")
                     game_failed = True
+                    # Optionally save progress from previous iteration here too, similar to RecursionError
+
                 if game_failed:
-                    continue
+                    continue  # Skip saving and exploitability for this failed iteration
+
+                # --- Iteration Completed Successfully ---
                 iter_time = time.time() - iter_start_time
 
                 # --- Calculate Exploitability Periodically ---
@@ -369,22 +399,44 @@ class CFRTrainer:
 
                 # Update the status bar description again after iteration finishes
                 status_bar.set_description_str(
-                    f"Iter {self.current_iteration}/{end_iteration} complete | Depth:N/A | MaxD:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
+                    f"Iter {self.current_iteration}/{end_iter_num} complete | Depth:N/A | MaxD:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}"
                 )
 
+                # Save progress for the completed iteration 't' (which is self.current_iteration)
                 if self.current_iteration % self.config.cfr_training.save_interval == 0:
                     self.save_data()
 
         except GracefulShutdownException:
-            # This catches the exception raised from _cfr_recursive or the loop start check
+            # Caught after re-raise from loop or recursion
             logger.warning(
                 "Graceful shutdown exception caught in train loop. Saving progress..."
             )
-            try:
-                self.save_data()
-                logger.info("Progress saved successfully.")
-            except Exception as save_e:
-                logger.error("Failed to save progress during shutdown: %s", save_e)
+            # self.current_iteration should hold the iteration number *during which* shutdown occurred.
+            # We need to save the state *as of the completion of the previous iteration*.
+            completed_iter_to_save = self.current_iteration - 1
+            if (
+                completed_iter_to_save >= 0
+            ):  # Only save if at least one iteration completed before shutdown
+                temp_iter = self.current_iteration  # Store current (interrupted) iter num
+                self.current_iteration = (
+                    completed_iter_to_save  # Set to last completed iter for saving
+                )
+                try:
+                    self.save_data()
+                    logger.info(
+                        "Progress saved successfully (state as of iteration %d completion).",
+                        self.current_iteration,
+                    )
+                except Exception as save_e:
+                    logger.error("Failed to save progress during shutdown: %s", save_e)
+                self.current_iteration = (
+                    temp_iter  # Restore potentially for consistency if needed elsewhere
+                )
+            else:
+                logger.warning(
+                    "Shutdown occurred before first iteration completed. No progress to save."
+                )
+
             # Re-raise KeyboardInterrupt so main can catch it
             raise KeyboardInterrupt("Graceful shutdown initiated")
 
@@ -393,9 +445,14 @@ class CFRTrainer:
         progress_bar.close()
 
         end_time = time.time()
-        total_completed = self.current_iteration - start_iteration
-        logger.info("Training loop finished %d iterations.", total_completed)
-        logger.info("Total training time: %.2f seconds.", end_time - loop_start_time)
+        total_completed_in_run = self.current_iteration - last_completed_iteration
+        logger.info("Training loop finished %d iterations.", total_completed_in_run)
+        logger.info(
+            "Total training time this run: %.2f seconds.", end_time - loop_start_time
+        )
+        logger.info(
+            "Current iteration count (last completed): %d", self.current_iteration
+        )
         logger.info("Computing final average strategy...")
         final_avg_strategy = self.compute_average_strategy()
         if final_avg_strategy:
@@ -411,6 +468,7 @@ class CFRTrainer:
                     (self.current_iteration, final_exploit)
                 )
             else:
+                # Update the last entry if it was for the same iteration
                 self.exploitability_results[-1] = (self.current_iteration, final_exploit)
             logger.info("Final exploitability: %.4f", final_exploit)
             self._last_exploit_str = (
@@ -422,10 +480,11 @@ class CFRTrainer:
 
         # Final update to status bar (can be useful in some terminals)
         tqdm.write(
-            f"Final State | MaxDepth:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}",
+            f"Final State (Iter {self.current_iteration}) | MaxDepth:{self.max_depth_this_iter} | Nodes:{self._total_infosets_str} | Expl:{self._last_exploit_str}",
             file=sys.stderr,
         )
 
+        # Final save includes the state after the very last iteration completed in the loop
         self.save_data()
         logger.info("Final average strategy and data saved.")
 
@@ -434,7 +493,7 @@ class CFRTrainer:
         game_state: CambiaGameState,
         agent_states: List[AgentState],
         reach_probs: np.ndarray,
-        iteration: int,
+        iteration: int,  # Iteration number currently being run
         action_log: List[Dict],
         status_bar: tqdm,  # Pass the status bar instead of progress bar
         depth: int,
@@ -624,6 +683,7 @@ class CFRTrainer:
         if player_reach > 1e-9:
             if self.config.cfr_plus_params.weighted_averaging_enabled:
                 delay = self.config.cfr_plus_params.averaging_delay
+                # Weight uses the *iteration number* currently running
                 weight = float(max(0, iteration - delay))
             else:
                 weight = 1.0
@@ -646,11 +706,22 @@ class CFRTrainer:
                 and player_reach > 1e-6
                 and current_regrets[i] <= pruning_threshold
                 and node_positive_regret_sum > pruning_threshold
+                # Only prune after averaging delay + buffer
                 and iteration > self.config.cfr_plus_params.averaging_delay + 10
             )
             if should_prune:
+                # If pruned, utility is assumed to be the current node value
+                # This avoids biasing towards branches explored early on
+                # action_utilities[i] = node_value # No, node_value isn't calculated yet. This seems wrong.
+                # For RM+, pruned actions contribute 0 regret later. Let's assign 0 utility for now.
+                action_utilities[i] = np.zeros(
+                    self.num_players, dtype=np.float64
+                )  # Or maybe -inf for the current player? Let's stick to 0.
                 continue
-            if action_prob < 1e-9:
+            if (
+                action_prob < 1e-9 and not should_prune
+            ):  # Also skip negligible probability actions unless pruning would have hit
+                action_utilities[i] = np.zeros(self.num_players, dtype=np.float64)
                 continue
 
             # --- Apply Action and Recurse ---
@@ -690,8 +761,11 @@ class CFRTrainer:
                 )
                 action_log_entry["outcome"] = f"ERROR applying action: {apply_err}"
                 action_log.append(action_log_entry)
-                undo_info = None
-                continue
+                # If action application fails, we cannot recurse. Assign 0 utility?
+                action_utilities[i] = np.zeros(self.num_players, dtype=np.float64)
+                undo_info = None  # Ensure undo is not called
+                continue  # Move to next action
+
             observation = self._create_observation(
                 None,
                 action,
@@ -722,14 +796,20 @@ class CFRTrainer:
                     agent_update_failed = True
                     break
                 next_agent_states.append(cloned_agent)
+
             if agent_update_failed:
                 action_log_entry["outcome"] = "ERROR updating agent state"
                 action_log.append(action_log_entry)
                 if undo_info:
                     undo_info()
-                continue
+                action_utilities[i] = np.zeros(
+                    self.num_players, dtype=np.float64
+                )  # Assign 0 utility on failure
+                continue  # Move to next action
+
             next_reach_probs = reach_probs.copy()
             next_reach_probs[player] *= action_prob
+
             try:
                 recursive_utilities = self._cfr_recursive(
                     game_state,
@@ -759,6 +839,7 @@ class CFRTrainer:
                             "Error undoing action during shutdown propagation: %s", undo_e
                         )
                 raise shutdown_exc  # Propagate up
+
             except RecursionError as rec_err:
                 logger.error(
                     "Iter %d, P%d, Depth %d: Recursion depth exceeded during action: %s. State: %s",
@@ -770,7 +851,10 @@ class CFRTrainer:
                 )
                 action_log_entry["outcome"] = f"ERROR: RecursionError - {rec_err}"
                 action_log.append(action_log_entry)
-                raise
+                if undo_info:  # Try to undo before raising
+                    undo_info()
+                raise  # Propagate recursion error up
+
             except Exception as recursive_err:
                 logger.exception(
                     "Iter %d, P%d, Depth %d: Error in recursive call for action %s. Infoset: %s: %s",
@@ -785,10 +869,16 @@ class CFRTrainer:
                 action_log.append(action_log_entry)
                 if undo_info:
                     undo_info()
-                continue
+                action_utilities[i] = np.zeros(
+                    self.num_players, dtype=np.float64
+                )  # Assign 0 utility on failure
+                continue  # Move to next action
+
+            # --- Log Action Outcome and Undo ---
             action_log_entry["outcome_utilities"] = action_utilities[i].tolist()
             action_log_entry["state_desc_after"] = state_after_action_desc
-            action_log.append(action_log_entry)
+            # Don't append to main log here, let caller do it only if no exception propagated
+
             if undo_info:
                 try:
                     undo_info()
@@ -801,10 +891,12 @@ class CFRTrainer:
                         action,
                         undo_e,
                     )
+                    # If undo fails, state is broken, return 0s to avoid using bad values
                     return np.zeros(self.num_players, dtype=np.float64)
             else:
+                # This case should ideally not happen if apply_action succeeded
                 logger.error(
-                    "Iter %d, P%d, Depth %d: Missing undo info for action %s. State corrupt.",
+                    "Iter %d, P%d, Depth %d: Missing undo info for action %s after successful recursion. State corrupt.",
                     iteration,
                     player,
                     depth,
@@ -815,26 +907,37 @@ class CFRTrainer:
         # --- Calculate Node Value & Update Regrets ---
         node_value = np.sum(strategy[:, np.newaxis] * action_utilities, axis=0)
         opponent_reach = reach_probs[opponent]
+
+        # Update regrets only if the player had a chance to reach this node
         if player_reach > 1e-9:
             player_action_values = action_utilities[:, player]
             player_node_value = node_value[player]
             instantaneous_regret = player_action_values - player_node_value
+
+            # Weight regret update by opponent's reach probability
             update_weight = opponent_reach
             current_regrets_before_update = np.copy(self.regret_sum[infoset_key])
+
             try:
                 updated_regrets = (
                     current_regrets_before_update + update_weight * instantaneous_regret
                 )
+                # Apply Regret Matching+: Ensure regrets are non-negative
                 self.regret_sum[infoset_key] = np.maximum(0.0, updated_regrets)
-            except ValueError as e_regret:
+
+            except (
+                ValueError
+            ) as e_regret:  # Catch potential dimension mismatches here too
                 logger.exception(
-                    "Iter %d, P%d, Depth %d, Infoset %s, Context %s: ValueError during regret update: %s",
+                    "Iter %d, P%d, Depth %d, Infoset %s, Context %s: ValueError during regret update: %s. CurrentRegrets: %s, InstantRegret: %s",
                     iteration,
                     player,
                     depth,
                     infoset_key,
                     current_context.name,
                     e_regret,
+                    current_regrets_before_update,
+                    instantaneous_regret,
                 )
             except Exception as e_regret:
                 logger.exception(
@@ -846,50 +949,80 @@ class CFRTrainer:
                     current_context.name,
                     e_regret,
                 )
+
+        # Append the detailed action logs for this node *after* successful return (no exception bubbled up)
+        # action_log.extend(local_action_log) # Modify action_log directly instead?
+        # Let's keep modifying action_log directly as before, seems simpler.
+
         return node_value
 
     def _filter_observation(
         self, obs: AgentObservation, observer_id: int
     ) -> AgentObservation:
-        filtered_obs = copy.copy(obs)
+        """Creates a player-specific view of the observation."""
+        filtered_obs = copy.copy(obs)  # Shallow copy is okay for most fields
+
+        # Mask drawn card unless observer is the actor OR it's a discard/replace action by anyone
+        # (discard/replace reveal the drawn card publicly when it hits the discard pile)
         if obs.drawn_card and obs.acting_player != observer_id:
-            if not isinstance(obs.action, ActionDiscard) and not (
-                isinstance(obs.action, ActionReplace) and obs.acting_player == observer_id
-            ):
+            # Keep drawn card visible if it was just discarded/replaced
+            if not isinstance(obs.action, (ActionDiscard, ActionReplace)):
                 filtered_obs.drawn_card = None
+
+        # Filter peeked cards to only show info revealed *to the observer*
         if obs.peeked_cards:
             new_peeked = {}
+            # Own Peek (7/8): Only observer sees their own card
             if (
-                obs.action
-                and isinstance(obs.action, ActionAbilityKingSwapDecision)
+                isinstance(obs.action, ActionAbilityPeekOwnSelect)
                 and obs.acting_player == observer_id
             ):
-                new_peeked = obs.peeked_cards
+                new_peeked = (
+                    obs.peeked_cards
+                )  # Observer sees the result of their own action
+            # Other Peek (9/T): Only observer sees the opponent card
             elif (
-                obs.action
-                and isinstance(obs.action, ActionAbilityPeekOwnSelect)
+                isinstance(obs.action, ActionAbilityPeekOtherSelect)
                 and obs.acting_player == observer_id
             ):
                 new_peeked = obs.peeked_cards
+            # King Look: Only observer sees *both* cards they looked at
             elif (
-                obs.action
-                and isinstance(obs.action, ActionAbilityPeekOtherSelect)
+                isinstance(obs.action, ActionAbilityKingLookSelect)
                 and obs.acting_player == observer_id
             ):
                 new_peeked = obs.peeked_cards
+            # King Swap Decision: If observer made the decision, they saw the cards during the Look phase.
+            # This info might need to be persisted or reconstructed if not directly in this obs.
+            # Assuming for now that peeked_cards is correctly populated *during the LookSelect phase* obs
+            # and might be None during the SwapDecision obs.
+            # Let's rely on AgentState memory for King look info.
+            elif isinstance(obs.action, ActionAbilityKingSwapDecision):
+                # If the agent needs the peeked info again here, it must recall it.
+                # Don't populate peeked_cards based on the SwapDecision action itself.
+                pass
+
             filtered_obs.peeked_cards = new_peeked if new_peeked else None
-        filtered_obs.snap_results = obs.snap_results
+        else:
+            filtered_obs.peeked_cards = None
+
+        # Snap results are public
+        filtered_obs.snap_results = obs.snap_results  # Keep snap results public
+
         return filtered_obs
 
     def _create_observation(
         self,
-        prev_state: Optional[CambiaGameState],
+        prev_state: Optional[CambiaGameState],  # Not currently used, but could be
         action: Optional[GameAction],
         next_state: CambiaGameState,
-        acting_player: int,
-        snap_results: List[Dict],
-        explicit_drawn_card: Optional[CardObject] = None,
+        acting_player: int,  # Player who took the action leading to next_state
+        snap_results: List[Dict],  # Snap results *during* the action processing
+        explicit_drawn_card: Optional[
+            CardObject
+        ] = None,  # Card drawn, if action was Draw...
     ) -> AgentObservation:
+        """Creates the observation object based on the state *after* the action."""
         discard_top = next_state.get_discard_top()
         hand_sizes = [
             next_state.get_player_card_count(i) for i in range(self.num_players)
@@ -899,50 +1032,68 @@ class CFRTrainer:
         who_called = next_state.cambia_caller_id
         game_over = next_state.is_terminal()
         turn_num = next_state.get_turn_number()
-        drawn_card = explicit_drawn_card
+
+        # Determine drawn_card visibility: Public if discarded/replaced, private otherwise
+        drawn_card_for_obs = None
+        if isinstance(action, (ActionDiscard, ActionReplace)):
+            # The card hitting the discard (either drawn or replaced) is public knowledge.
+            # However, the AgentObservation's drawn_card field semantically means
+            # "the card drawn from stockpile/discard this turn".
+            # If ActionDiscard, drawn_card = explicit_drawn_card
+            # If ActionReplace, drawn_card = explicit_drawn_card (the one replacing)
+            drawn_card_for_obs = explicit_drawn_card
+        elif (
+            explicit_drawn_card is not None and acting_player != -1
+        ):  # Draw action occurred
+            drawn_card_for_obs = (
+                explicit_drawn_card  # Will be filtered by _filter_observation
+            )
+
         peeked_cards_dict = None
-        if (
-            isinstance(next_state.pending_action, ActionAbilityKingSwapDecision)
-            and next_state.pending_action_player == acting_player
-        ):
-            pending_data = next_state.pending_action_data
-            if (
-                "own_idx" in pending_data
-                and "opp_idx" in pending_data
-                and "card1" in pending_data
-                and "card2" in pending_data
-            ):
-                opp_idx = next_state.get_opponent_index(acting_player)
-                peeked_cards_dict = {
-                    (acting_player, pending_data["own_idx"]): pending_data["card1"],
-                    (opp_idx, pending_data["opp_idx"]): pending_data["card2"],
-                }
-        elif isinstance(action, ActionAbilityPeekOwnSelect):
+        # Populate peeked cards only if the action *was* a peek/look action by the actor
+        if isinstance(action, ActionAbilityPeekOwnSelect) and acting_player != -1:
             hand = next_state.get_player_hand(acting_player)
-            if hand and 0 <= action.target_hand_index < len(hand):
-                peeked_cards_dict = {
-                    (acting_player, action.target_hand_index): hand[
-                        action.target_hand_index
-                    ]
-                }
-        elif isinstance(action, ActionAbilityPeekOtherSelect):
+            target_idx = action.target_hand_index
+            if hand and 0 <= target_idx < len(hand):
+                peeked_cards_dict = {(acting_player, target_idx): hand[target_idx]}
+        elif isinstance(action, ActionAbilityPeekOtherSelect) and acting_player != -1:
             opp_idx = next_state.get_opponent_index(acting_player)
             opp_hand = next_state.get_player_hand(opp_idx)
-            if opp_hand and 0 <= action.target_opponent_hand_index < len(opp_hand):
+            target_opp_idx = action.target_opponent_hand_index
+            if opp_hand and 0 <= target_opp_idx < len(opp_hand):
+                peeked_cards_dict = {(opp_idx, target_opp_idx): opp_hand[target_opp_idx]}
+        elif isinstance(action, ActionAbilityKingLookSelect) and acting_player != -1:
+            # Need to retrieve the cards that *were* looked at. GameState might not store this easily.
+            # Let's assume the GameState needs modification or this info isn't passed directly.
+            # HACK: For simulation, re-fetch from state (violates pure observation principle)
+            own_idx, opp_look_idx = action.own_hand_index, action.opponent_hand_index
+            opp_real_idx = next_state.get_opponent_index(acting_player)
+            own_hand = next_state.get_player_hand(acting_player)
+            opp_hand = next_state.get_player_hand(opp_real_idx)
+            if (
+                own_hand
+                and opp_hand
+                and 0 <= own_idx < len(own_hand)
+                and 0 <= opp_look_idx < len(opp_hand)
+            ):
                 peeked_cards_dict = {
-                    (opp_idx, action.target_opponent_hand_index): opp_hand[
-                        action.target_opponent_hand_index
-                    ]
+                    (acting_player, own_idx): own_hand[own_idx],
+                    (opp_real_idx, opp_look_idx): opp_hand[opp_look_idx],
                 }
-        final_snap_results = next_state.snap_results_log
+
+        # Snap results from the state *after* the action.
+        # Note: GameState stores snap_results_log which might persist; clear appropriately?
+        # Assuming snap_results passed in are the relevant ones for this transition.
+        final_snap_results = snap_results
+
         obs = AgentObservation(
             acting_player=acting_player,
             action=action,
             discard_top_card=discard_top,
             player_hand_sizes=hand_sizes,
             stockpile_size=stock_size,
-            drawn_card=drawn_card,
-            peeked_cards=peeked_cards_dict,
+            drawn_card=drawn_card_for_obs,  # Pass the potentially visible drawn card
+            peeked_cards=peeked_cards_dict,  # Pass peek info only if action caused it
             snap_results=final_snap_results,
             did_cambia_get_called=cambia_called,
             who_called_cambia=who_called,
@@ -961,17 +1112,37 @@ class CFRTrainer:
             return avg_strategy
         zero_reach_count, nan_count, norm_issue_count, mismatched_dim_count = 0, 0, 0, 0
         for infoset_key, s_sum in self.strategy_sum.items():
+            # Ensure key is InfosetKey instance
             if isinstance(infoset_key, tuple):
-                infoset_key = InfosetKey(*infoset_key)
+                try:
+                    infoset_key = InfosetKey(*infoset_key)
+                except TypeError:
+                    logger.error(
+                        "Failed to convert tuple %s to InfosetKey",
+                        infoset_key,
+                        exc_info=True,
+                    )
+                    continue  # Skip this invalid key
+
             r_sum = self.reach_prob_sum.get(infoset_key, 0.0)
             num_actions_in_sum = len(s_sum)
             normalized_strategy = np.array([])
+
             if r_sum > 1e-9:
+                # --- Weighted Averaging adjustment ---
+                # The sum s_sum already incorporates the weight (t-d)*pi*sigma
+                # The reach sum r_sum already incorporates the weight (t-d)*pi
+                # So simple division gives the weighted average strategy.
                 normalized_strategy = s_sum / r_sum
+
+                # --- Sanity Checks ---
                 if np.isnan(normalized_strategy).any():
                     nan_count += 1
                     logger.warning(
-                        "NaN found in avg strategy for %s. Using uniform.", infoset_key
+                        "NaN found in avg strategy for %s. Sum: %s, Reach: %s. Using uniform.",
+                        infoset_key,
+                        s_sum,
+                        r_sum,
                     )
                     normalized_strategy = (
                         np.ones(num_actions_in_sum) / num_actions_in_sum
@@ -983,35 +1154,72 @@ class CFRTrainer:
                     not np.isclose(current_sum, 1.0, atol=1e-6)
                     and len(normalized_strategy) > 0
                 ):
-                    normalized_strategy = normalize_probabilities(normalized_strategy)
-                    if not np.isclose(np.sum(normalized_strategy), 1.0, atol=1e-6):
+                    # Attempt re-normalization, might indicate precision issues earlier
+                    normalized_strategy_reanorm = normalize_probabilities(
+                        normalized_strategy
+                    )
+                    if not np.isclose(
+                        np.sum(normalized_strategy_reanorm), 1.0, atol=1e-6
+                    ):
                         norm_issue_count += 1
-                        logger.warning("Avg strategy re-norm failed for %s", infoset_key)
-            else:
+                        logger.warning(
+                            "Avg strategy re-norm failed for %s (Sum: %s -> %s). Using uniform.",
+                            infoset_key,
+                            current_sum,
+                            np.sum(normalized_strategy_reanorm),
+                        )
+                        normalized_strategy = (
+                            np.ones(num_actions_in_sum) / num_actions_in_sum
+                            if num_actions_in_sum > 0
+                            else np.array([])
+                        )
+                    else:
+                        normalized_strategy = normalized_strategy_reanorm
+
+            else:  # Zero reach sum
+                # If strategy sum is non-zero but reach is zero, something is odd.
                 if np.any(s_sum != 0):
                     zero_reach_count += 1
+                    logger.warning(
+                        "Infoset %s has zero reach sum but non-zero strategy sum %s. Using uniform.",
+                        infoset_key,
+                        s_sum,
+                    )
+                # Default to uniform strategy if reach is zero
                 normalized_strategy = (
                     np.ones(num_actions_in_sum) / num_actions_in_sum
                     if num_actions_in_sum > 0
                     else np.array([])
                 )
+
+            # --- Dimension Check against Regrets ---
             regret_array = self.regret_sum.get(infoset_key)
+            # Check if regret exists and has same dimension as the *computed* normalized strategy
             if regret_array is not None and len(regret_array) != len(normalized_strategy):
                 mismatched_dim_count += 1
                 num_actions_regret = len(regret_array)
                 logger.warning(
-                    "Avg strategy dim (%d) mismatch with regret (%d) for %s. Context: %s. Defaulting avg strategy.",
+                    "Final avg strategy dim (%d) mismatch with regret (%d) for %s. Context: %s. Defaulting avg strategy to uniform based on *regret* dim.",
                     len(normalized_strategy),
                     num_actions_regret,
                     infoset_key,
                     DecisionContext(infoset_key.decision_context_value).name,
                 )
+                # Use regret dimension for uniform strategy if mismatch occurs
                 normalized_strategy = (
                     np.ones(num_actions_regret) / num_actions_regret
                     if num_actions_regret > 0
                     else np.array([])
                 )
+            elif regret_array is None and len(normalized_strategy) > 0:
+                # Strategy exists but regret doesn't? Should not happen if initialized correctly.
+                logger.warning(
+                    "Infoset %s has strategy sum but no regret sum entry. Using calculated strategy.",
+                    infoset_key,
+                )
+
             avg_strategy[infoset_key] = normalized_strategy
+
         self.average_strategy = avg_strategy
         logger.info(
             "Average strategy computation complete (%d infosets).",
