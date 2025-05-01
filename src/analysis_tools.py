@@ -8,7 +8,10 @@ import numpy as np
 from collections import deque
 
 # Import necessary types
-from .game_engine import CambiaGameState, PlayerState, StateDelta, UndoInfo
+from .game.engine import CambiaGameState
+from .game.player_state import PlayerState
+from .game.types import StateDelta, UndoInfo
+from .game.helpers import serialize_card
 from .agent_state import AgentState # Needed for Best Response Agent state
 from .constants import GameAction, DecisionContext, NUM_PLAYERS, CardObject
 from .card import Card

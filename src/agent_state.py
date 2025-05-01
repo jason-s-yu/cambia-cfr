@@ -209,8 +209,10 @@ class AgentState:
                 if isinstance(action, ActionReplace):
                     # Use observation.drawn_card which should now be correctly populated
                     drawn_card_from_obs = observation.drawn_card
+                    target_idx = action.target_hand_index
+                    # ## TEMP DEBUG ## Log drawn card for Replace action
+                    logger.debug(f"## TEMP DEBUG ## Agent {self.player_id} handling Replace action for index {target_idx}. Drawn card in observation: {drawn_card_from_obs}")
                     if drawn_card_from_obs:
-                        target_idx = action.target_hand_index
                         drawn_bucket = get_card_bucket(drawn_card_from_obs)
                         if target_idx in self.own_hand:
                             # Update the known card info directly

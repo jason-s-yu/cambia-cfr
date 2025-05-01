@@ -8,7 +8,8 @@ import copy
 import traceback
 from tqdm import tqdm
 
-from .game_engine import CambiaGameState, StateDelta, UndoInfo
+from .game.engine import CambiaGameState
+from .game.types import StateDelta, UndoInfo
 from .constants import (
      ActionAbilityKingSwapDecision, GameAction, NUM_PLAYERS, CardObject,
      ActionPassSnap, ActionSnapOwn, ActionSnapOpponent, ActionSnapOpponentMove,
@@ -24,6 +25,9 @@ from .analysis_tools import AnalysisTools
 from .card import Card # Import Card for type hint
 
 logger = logging.getLogger(__name__)
+
+# How often to update the tqdm postfix within an iteration (every N nodes visited)
+TQDM_UPDATE_INTERVAL = 10000 # Adjust as needed for performance vs feedback frequency
 
 class CFRTrainer:
     """Implements the CFR+ algorithm for training a Cambia agent via self-play."""
@@ -42,6 +46,7 @@ class CFRTrainer:
         self.analysis = AnalysisTools(config, analysis_log_dir, analysis_log_prefix)
         self.exploitability_results: List[Tuple[int, float]] = []
         self.run_log_dir = run_log_dir # Store for potential later use
+        self.max_depth_this_iter = 0 # Track max depth reached in current iteration
 
     def load_data(self, filepath: Optional[str] = None):
         """Loads previously saved training data."""
@@ -120,6 +125,8 @@ class CFRTrainer:
         for t in progress_bar:
             iter_start_time = time.time()
             self.current_iteration = t + 1 # User-facing iteration number (starts from 1)
+            self.max_depth_this_iter = 0 # Reset max depth tracker
+            nodes_visited_counter = [0] # Use mutable list for counter
 
             # --- Initialize Game ---
             game_state = None
@@ -165,7 +172,11 @@ class CFRTrainer:
             game_failed = False
             try:
                  # --- Run CFR Recursion ---
-                 final_utilities = self._cfr_recursive(game_state, initial_agent_states, reach_probs, self.current_iteration, action_log_for_game, depth=0)
+                 # Pass progress bar and counter list
+                 final_utilities = self._cfr_recursive(
+                     game_state, initial_agent_states, reach_probs, self.current_iteration,
+                     action_log_for_game, progress_bar, nodes_visited_counter, depth=0
+                 )
 
                  # --- Log Completed Game ---
                  game_details = self.analysis.format_game_details_for_log(
@@ -195,6 +206,7 @@ class CFRTrainer:
             iter_time = time.time() - iter_start_time
             last_exploit = self.exploitability_results[-1][1] if self.exploitability_results else float('inf')
             exploit_str = f"Expl: {last_exploit:.3f}" if last_exploit != float('inf') else "Expl: N/A"
+            nodes_this_iter_final = nodes_visited_counter[0] # Get final count
 
             # --- Calculate Exploitability Periodically ---
             if exploitability_interval > 0 and self.current_iteration % exploitability_interval == 0:
@@ -211,14 +223,16 @@ class CFRTrainer:
                       logger.warning("Could not compute average strategy for exploitability calculation.")
                       exploit_str = "Expl: N/A"
 
-            # --- Update Progress Bar Postfix ---
-            infoset_count = len(self.regret_sum)
+            # --- Update Progress Bar Postfix (Final for iteration) ---
+            total_infosets = len(self.regret_sum)
             postfix_dict = {
                 "LastT": f"{iter_time:.2f}s",
-                "InfoSets": f"{infoset_count:,}",
-                exploit_str.split(':')[0].strip(): exploit_str.split(':')[1].strip() # Add exploitability nicely
+                "NodesIter": f"{nodes_this_iter_final:,}", # Nodes visited in this iteration
+                "DepthMax": f"{self.max_depth_this_iter}", # Max depth reached in this iteration
+                "TotalNodes": f"{total_infosets:,}", # Total unique infosets seen
+                exploit_str.split(':')[0].strip(): exploit_str.split(':')[1].strip()
             }
-            progress_bar.set_postfix(postfix_dict, refresh=True)
+            progress_bar.set_postfix(postfix_dict, refresh=True) # Use final stats
 
             # --- Periodic Saving ---
             if self.current_iteration % self.config.cfr_training.save_interval == 0:
@@ -250,11 +264,41 @@ class CFRTrainer:
         logger.info("Final average strategy and data saved.")
 
 
-    def _cfr_recursive(self, game_state: CambiaGameState, agent_states: List[AgentState], reach_probs: np.ndarray, iteration: int, action_log: List[Dict], depth: int) -> np.ndarray:
+    def _cfr_recursive(self,
+                      game_state: CambiaGameState,
+                      agent_states: List[AgentState],
+                      reach_probs: np.ndarray,
+                      iteration: int,
+                      action_log: List[Dict],
+                      progress_bar: tqdm, # Pass the tqdm object
+                      nodes_visited_counter: List[int], # Pass counter as mutable list
+                      depth: int
+                      ) -> np.ndarray:
         """
         Recursive CFR+ function. Operates on the *same* game_state object,
-        applying and undoing actions. Clones agent_states. Includes depth tracking.
+        applying and undoing actions. Clones agent_states. Includes depth tracking
+        and periodic tqdm updates.
         """
+        # --- Update Depth and Node Count ---
+        self.max_depth_this_iter = max(self.max_depth_this_iter, depth)
+        nodes_visited_counter[0] += 1
+
+        # --- Periodic tqdm Postfix Update ---
+        if nodes_visited_counter[0] % TQDM_UPDATE_INTERVAL == 0:
+            # Get latest exploitability result
+            last_exploit = self.exploitability_results[-1][1] if self.exploitability_results else float('inf')
+            exploit_str = f"Expl: {last_exploit:.3f}" if last_exploit != float('inf') else "Expl: N/A"
+            total_infosets = len(self.regret_sum)
+            # Update postfix with current iteration stats
+            postfix_dict = {
+                "NodesIter": f"{nodes_visited_counter[0]:,}",
+                "Depth": f"{depth}", # Current depth
+                "DepthMax": f"{self.max_depth_this_iter}",
+                "TotalNodes": f"{total_infosets:,}",
+                exploit_str.split(':')[0].strip(): exploit_str.split(':')[1].strip()
+            }
+            progress_bar.set_postfix(postfix_dict, refresh=False) # Refresh=False avoids potential slowdowns
+
         # --- Determine Decision Context ---
         current_context = DecisionContext.TERMINAL
         if game_state.is_terminal():
@@ -307,20 +351,17 @@ class CFRTrainer:
         # 3. Initialize/Validate Infoset Data Dimensions
         current_regrets = self.regret_sum.get(infoset_key)
         if current_regrets is None or len(current_regrets) != num_actions:
-             # Log first occurrence per infoset key to reduce noise
-             # if current_regrets is not None and not getattr(self, '_logged_mismatch', set()).intersection({infoset_key}):
-             #      logger.warning(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Regret dimension mismatch! Existing: {len(current_regrets)}, Expected: {num_actions}. Context: {current_context.name}. Re-initializing.")
-             #      if not hasattr(self, '_logged_mismatch'): self._logged_mismatch = set()
-             #      self._logged_mismatch.add(infoset_key)
+             # ## TEMP DEBUG ## Log dimension mismatch for regrets
+             if current_regrets is not None:
+                  logger.warning(f"## TEMP DEBUG ## Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Regret dimension mismatch! Existing: {len(current_regrets)}, Expected: {num_actions}. Context: {current_context.name}. Re-initializing.")
              self.regret_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
              current_regrets = self.regret_sum[infoset_key]
 
         current_strategy_sum = self.strategy_sum.get(infoset_key)
         if current_strategy_sum is None or len(current_strategy_sum) != num_actions:
-             # if current_strategy_sum is not None and not getattr(self, '_logged_mismatch', set()).intersection({infoset_key}): # Reuse flag
-             #      logger.warning(f"Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Strategy sum dimension mismatch! Existing: {len(current_strategy_sum)}, Expected: {num_actions}. Context: {current_context.name}. Re-initializing.")
-             #      if not hasattr(self, '_logged_mismatch'): self._logged_mismatch = set()
-             #      self._logged_mismatch.add(infoset_key)
+             # ## TEMP DEBUG ## Log dimension mismatch for strategy sums
+             if current_strategy_sum is not None:
+                  logger.warning(f"## TEMP DEBUG ## Iter {iteration}, P{player}, Depth {depth}, Infoset {infoset_key}: Strategy sum dimension mismatch! Existing: {len(current_strategy_sum)}, Expected: {num_actions}. Context: {current_context.name}. Re-initializing.")
              self.strategy_sum[infoset_key] = np.zeros(num_actions, dtype=np.float64)
 
         if infoset_key not in self.reach_prob_sum: self.reach_prob_sum[infoset_key] = 0.0
@@ -350,7 +391,12 @@ class CFRTrainer:
 
             node_positive_regret_sum = np.sum(np.maximum(0.0, current_regrets))
             # Pruning condition: positive regret for action <= threshold AND sum of positive regrets > threshold
-            should_prune = (use_pruning and player_reach > 1e-9 and current_regrets[i] <= pruning_threshold and node_positive_regret_sum > pruning_threshold and iteration > 10)
+            # Also add minimum reach probability and iteration count conditions for stability
+            should_prune = (use_pruning and
+                            player_reach > 1e-6 and # Ensure reach is significant
+                            current_regrets[i] <= pruning_threshold and
+                            node_positive_regret_sum > pruning_threshold and
+                            iteration > self.config.cfr_plus_params.averaging_delay + 10) # Start pruning after averaging kicks in
 
             if should_prune:
                  # logger.debug(f"Iter {iteration}, P{player}, Depth {depth}: Pruning action {action}")
@@ -405,7 +451,11 @@ class CFRTrainer:
 
             try:
                  # logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Context {current_context.name}: Recursing ({i+1}/{num_actions}) for action: {action}")
-                 recursive_utilities = self._cfr_recursive(game_state, next_agent_states, next_reach_probs, iteration, action_log, depth + 1)
+                 # Pass progress bar and counter down
+                 recursive_utilities = self._cfr_recursive(
+                     game_state, next_agent_states, next_reach_probs, iteration,
+                     action_log, progress_bar, nodes_visited_counter, depth + 1
+                 )
                  action_utilities[i] = recursive_utilities
                  # logger.debug(f"Iter {iteration}, P{player}, Depth {depth}, Context {current_context.name}: Returned from recursion for {action}. Util: {recursive_utilities}")
             except RecursionError:
@@ -458,18 +508,35 @@ class CFRTrainer:
     # --- Helper Methods (_filter_observation, _create_observation, compute_average_strategy, get_average_strategy) ---
     def _filter_observation(self, obs: AgentObservation, observer_id: int) -> AgentObservation:
          """ Filters sensitive information from observation based on observer."""
-         filtered_obs = copy.copy(obs)
+         filtered_obs = copy.copy(obs) # Shallow copy is fine for most fields
+         # Filter drawn card (only visible to drawer unless discarded/replaced)
          if obs.drawn_card and obs.acting_player != observer_id:
-              # Hide drawn card unless it was discarded (public via discard_top) or replaced by observer
               if not isinstance(obs.action, ActionDiscard) and not (isinstance(obs.action, ActionReplace) and obs.acting_player == observer_id):
                    filtered_obs.drawn_card = None
+
+         # Filter peeked cards (only visible to peeker or peeked player if relevant)
+         # KingLook: Both peeked cards are visible to the King user. Opponent sees nothing.
+         # PeekOwn (7/8): Only peeker sees their own card.
+         # PeekOther (9/T): Only peeker sees opponent's card.
          if obs.peeked_cards:
-              filtered_peek = {}
-              for (p_idx, h_idx), card in obs.peeked_cards.items():
-                   # Reveal peek if observer is the peeker OR observer is the one being peeked
-                   if p_idx == observer_id or obs.acting_player == observer_id:
-                        filtered_peek[(p_idx, h_idx)] = card
-              filtered_obs.peeked_cards = filtered_peek if filtered_peek else None
+              new_peeked = {}
+              ability_card = None
+              if obs.action and isinstance(obs.action, ActionAbilityKingSwapDecision) and obs.acting_player == observer_id:
+                  # King user sees both during swap decision phase
+                  new_peeked = obs.peeked_cards
+              elif obs.action and isinstance(obs.action, ActionAbilityPeekOwnSelect) and obs.acting_player == observer_id:
+                  # PeekOwn user sees own card
+                  new_peeked = obs.peeked_cards
+              elif obs.action and isinstance(obs.action, ActionAbilityPeekOtherSelect) and obs.acting_player == observer_id:
+                  # PeekOther user sees opponent card
+                  new_peeked = obs.peeked_cards
+              # Add cases if observation needs to include peeks *of* the observer by the opponent (optional)
+
+              filtered_obs.peeked_cards = new_peeked if new_peeked else None
+
+         # Snap results are public
+         filtered_obs.snap_results = obs.snap_results # Already public
+
          return filtered_obs
 
     def _create_observation(self,
@@ -492,38 +559,31 @@ class CFRTrainer:
          drawn_card = explicit_drawn_card # Use explicitly passed card first
          peeked_cards_dict = None # Dictionary to hold peek results {(player_idx, hand_idx): Card}
 
-         # Check pending state for drawn card info (redundant if explicit_drawn_card is passed, but safe fallback)
-         # This state might be cleared by the time observation is created for Replace action.
-         if drawn_card is None and next_state.pending_action and next_state.pending_action_player == acting_player:
-              pending_data = next_state.pending_action_data
-              # If the pending action implies a card was just drawn (e.g., Discard choice AFTER draw)
-              if isinstance(next_state.pending_action, ActionDiscard):
-                   drawn_card = pending_data.get("drawn_card")
+         # If the current state is pending a KingSwapDecision, extract peeked info
+         if isinstance(next_state.pending_action, ActionAbilityKingSwapDecision) and next_state.pending_action_player == acting_player:
+               pending_data = next_state.pending_action_data
+               if "own_idx" in pending_data and "opp_idx" in pending_data and "card1" in pending_data and "card2" in pending_data:
+                    opp_idx = next_state.get_opponent_index(acting_player)
+                    peeked_cards_dict = {
+                         (acting_player, pending_data["own_idx"]): pending_data["card1"],
+                         (opp_idx, pending_data["opp_idx"]): pending_data["card2"]
+                    }
+                    # logger.debug(f"Observation created during KingSwapDecision: Peeked {peeked_cards_dict}") # Debug
 
-              # Check for peeked cards stored during King Look selection
-              elif isinstance(next_state.pending_action, ActionAbilityKingSwapDecision):
-                   if "own_idx" in pending_data and "opp_idx" in pending_data and "card1" in pending_data and "card2" in pending_data:
-                        opp_idx = next_state.get_opponent_index(acting_player)
-                        peeked_cards_dict = {
-                            (acting_player, pending_data["own_idx"]): pending_data["card1"],
-                            (opp_idx, pending_data["opp_idx"]): pending_data["card2"]
-                        }
-
-         # Check action itself for peek results (relevant after Peek/Look actions)
-         # Important: Needs access to the *next* state's hands to get the card objects
-         if isinstance(action, ActionAbilityPeekOwnSelect):
+         # Check action itself for peek results (relevant immediately after Peek/LookSelect actions)
+         elif isinstance(action, ActionAbilityPeekOwnSelect):
               hand = next_state.get_player_hand(acting_player)
               if hand and 0 <= action.target_hand_index < len(hand):
                   peeked_cards_dict = {(acting_player, action.target_hand_index): hand[action.target_hand_index]}
+                  # logger.debug(f"Observation created after PeekOwnSelect: Peeked {peeked_cards_dict}") # Debug
          elif isinstance(action, ActionAbilityPeekOtherSelect):
               opp_idx = next_state.get_opponent_index(acting_player)
               opp_hand = next_state.get_player_hand(opp_idx)
               if opp_hand and 0 <= action.target_opponent_hand_index < len(opp_hand):
                   peeked_cards_dict = {(opp_idx, action.target_opponent_hand_index): opp_hand[action.target_opponent_hand_index]}
-         # KingLookSelect action itself doesn't reveal cards; the subsequent SwapDecision state holds them
-         # So the peeked_cards_dict from pending_action check above covers King ability reveals.
+                  # logger.debug(f"Observation created after PeekOtherSelect: Peeked {peeked_cards_dict}") # Debug
 
-         # Get the most recent snap results log from the game state
+         # Get the snap results log from the game state (relevant after Discard/Replace/Snap actions)
          final_snap_results = next_state.snap_results_log # This should be the log *after* the action
 
          obs = AgentObservation(
@@ -533,7 +593,7 @@ class CFRTrainer:
              player_hand_sizes=hand_sizes,
              stockpile_size=stock_size,
              drawn_card=drawn_card, # Card drawn by acting player (if applicable)
-             peeked_cards=peeked_cards_dict, # Cards revealed by peeks/looks
+             peeked_cards=peeked_cards_dict, # Cards revealed by peeks/looks this step
              snap_results=final_snap_results, # Log of snap events in this turn phase
              did_cambia_get_called=cambia_called,
              who_called_cambia=who_called,
@@ -561,21 +621,22 @@ class CFRTrainer:
              if r_sum > 1e-9:
                   normalized_strategy = s_sum / r_sum
                   if np.isnan(normalized_strategy).any():
-                       nan_count += 1; normalized_strategy = np.ones(num_actions_in_sum) / num_actions_in_sum if num_actions_in_sum > 0 else np.array([])
+                       nan_count += 1; logger.warning(f"NaN found in avg strategy for {infoset_key}. Using uniform."); normalized_strategy = np.ones(num_actions_in_sum) / num_actions_in_sum if num_actions_in_sum > 0 else np.array([])
                   current_sum = np.sum(normalized_strategy)
                   if not np.isclose(current_sum, 1.0, atol=1e-6) and len(normalized_strategy) > 0:
                         normalized_strategy = normalize_probabilities(normalized_strategy)
-                        if not np.isclose(np.sum(normalized_strategy), 1.0, atol=1e-6): norm_issue_count += 1; logger.warning(f"Avg strategy re-norm failed: {infoset_key}")
+                        if not np.isclose(np.sum(normalized_strategy), 1.0, atol=1e-6): norm_issue_count += 1; logger.warning(f"Avg strategy re-norm failed for {infoset_key}")
              else:
                   # Only count as zero reach if strategy sum was non-zero (implies node was visited)
                   if np.any(s_sum != 0): zero_reach_count += 1;
+                  # Use uniform if node was visited but reach sum is zero (can happen with pruning/float issues)
                   normalized_strategy = np.ones(num_actions_in_sum) / num_actions_in_sum if num_actions_in_sum > 0 else np.array([])
 
              regret_array = self.regret_sum.get(infoset_key)
              # Compare average strategy dimensions against regret dimensions
              if regret_array is not None and len(regret_array) != len(normalized_strategy):
                  mismatched_dim_count += 1; num_actions_regret = len(regret_array)
-                 logger.warning(f"Avg strategy dim ({len(normalized_strategy)}) mismatch with regret ({num_actions_regret}) for {infoset_key}. Defaulting avg strategy.")
+                 logger.warning(f"Avg strategy dim ({len(normalized_strategy)}) mismatch with regret ({num_actions_regret}) for {infoset_key}. Context: {DecisionContext(infoset_key.decision_context_value).name}. Defaulting avg strategy.")
                  # Use regret dimension as the source of truth for action count
                  normalized_strategy = np.ones(num_actions_regret) / num_actions_regret if num_actions_regret > 0 else np.array([])
 
