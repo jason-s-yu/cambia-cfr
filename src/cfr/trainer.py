@@ -12,7 +12,7 @@ import numpy as np
 from ..analysis_tools import AnalysisTools
 from ..config import Config
 from ..constants import NUM_PLAYERS
-from ..utils import PolicyDict, ReachProbDict
+from ..utils import PolicyDict, ReachProbDict, LogQueue
 
 # Import mixins
 from .data_manager_mixin import CFRDataManagerMixin
@@ -35,6 +35,7 @@ class CFRTrainer(
         config: Config,
         run_log_dir: Optional[str] = None,
         shutdown_event: Optional[threading.Event] = None,
+        log_queue: Optional[LogQueue] = None,
     ):
         """
         Initializes the CFRTrainer.
@@ -43,9 +44,11 @@ class CFRTrainer(
             config: Configuration object.
             run_log_dir: Directory for logs specific to this run.
             shutdown_event: Threading event to signal graceful shutdown.
+            log_queue: Multiprocessing queue for worker logging.
         """
         self.config = config
         self.num_players = NUM_PLAYERS
+        self.log_queue = log_queue
 
         # Initialize data structures (managed primarily by CFRDataManagerMixin)
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -56,9 +59,7 @@ class CFRTrainer(
         self.average_strategy: Optional[PolicyDict] = None
 
         # Training state
-        self.current_iteration = (
-            0  # Represents the last *completed* iteration or 0 if fresh start
-        )
+        self.current_iteration = 0
         self.exploitability_results: List[Tuple[int, float]] = []
 
         # Analysis and Logging
@@ -67,7 +68,7 @@ class CFRTrainer(
         self.analysis = AnalysisTools(config, analysis_log_dir, analysis_log_prefix)
         self.run_log_dir = run_log_dir
 
-        # Internal state for progress display/debugging (managed by loop/recursion mixins)
+        # Internal state for progress display/debugging
         self.max_depth_this_iter = 0
         self._last_exploit_str = "N/A"
         self._total_infosets_str = "0"
@@ -77,7 +78,3 @@ class CFRTrainer(
 
         logger.info("CFRTrainer initialized with %d players.", self.num_players)
         logger.debug("Config loaded: %s", self.config)
-
-    # The actual methods (train, _cfr_recursive, load_data, etc.) are now
-    # expected to be provided by the inherited mixin classes.
-    # Example: self.train() will call CFRTrainingLoopMixin.train(self)

@@ -3,6 +3,7 @@
 
 from typing import TypeAlias, Dict, Tuple
 from dataclasses import dataclass
+import multiprocessing
 import numpy as np
 
 
@@ -51,6 +52,9 @@ LocalReachProbUpdateDict: TypeAlias = Dict[
 WorkerResult: TypeAlias = Tuple[
     LocalRegretUpdateDict, LocalStrategyUpdateDict, LocalReachProbUpdateDict
 ]
+
+# Type alias for the logging queue
+LogQueue: TypeAlias = multiprocessing.Queue
 
 
 def normalize_probabilities(probs: np.ndarray) -> np.ndarray:
