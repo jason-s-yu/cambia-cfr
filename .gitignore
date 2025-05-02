@@ -3,6 +3,7 @@ game_history.jsonl
 cambia_history.jsonl
 logs/
 *.old
+strategy/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

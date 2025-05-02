@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CambiaGameState(
     QueryMixin, SnapLogicMixin, AbilityMixin
-):  # Add mixins to inheritance
+):
     """
     Represents the true, objective state of a 1v1 Cambia game.
     Uses delta-based updates and mixins for modularity.
@@ -648,7 +648,7 @@ class CambiaGameState(
                 if reshuffle_outcome_deltas:
                     penalty_deltas.extend(
                         reshuffle_outcome_deltas
-                    )  # Add reshuffle delta(s)
+                    )
                     logger.debug("Reshuffled during penalty draw %d/%d", i + 1, num_cards)
                 else:  # Cannot reshuffle
                     logger.warning(

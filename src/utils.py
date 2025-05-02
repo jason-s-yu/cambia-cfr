@@ -2,7 +2,7 @@
 """Utility functions and type aliases for CFR."""
 
 from typing import TypeAlias, Dict, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import multiprocessing
 import numpy as np
 
@@ -23,6 +23,7 @@ class InfosetKey:
 
     # Helper method for easy conversion to tuple, useful for legacy or simple dict keys
     def astuple(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int, int, int, int]:
+        """Converts InfosetKey to a plain tuple."""
         return (
             self.own_hand_tuple,
             self.opp_belief_tuple,
@@ -37,6 +38,16 @@ class InfosetKey:
 PolicyDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 ReachProbDict: TypeAlias = Dict[InfosetKey, float]  # Reach prob sum dictionary
 
+
+@dataclass
+class WorkerStats:
+    """Statistics reported by a worker for a single simulation."""
+
+    max_depth: int = 0
+    nodes_visited: int = 0
+    # Add other stats as needed (e.g., time taken, specific events)
+
+
 # Type aliases for worker results (local updates)
 LocalRegretUpdateDict: TypeAlias = Dict[
     InfosetKey, np.ndarray
@@ -48,10 +59,17 @@ LocalReachProbUpdateDict: TypeAlias = Dict[
     InfosetKey, float
 ]  # Accumulates weight * player_reach
 
+
 # Type alias for the combined results returned by a single worker
-WorkerResult: TypeAlias = Tuple[
-    LocalRegretUpdateDict, LocalStrategyUpdateDict, LocalReachProbUpdateDict
-]
+@dataclass
+class WorkerResult:
+    """Combined results and stats from a single worker simulation."""
+
+    regret_updates: LocalRegretUpdateDict = field(default_factory=dict)
+    strategy_updates: LocalStrategyUpdateDict = field(default_factory=dict)
+    reach_prob_updates: LocalReachProbUpdateDict = field(default_factory=dict)
+    stats: WorkerStats = field(default_factory=WorkerStats)
+
 
 # Type alias for the logging queue
 LogQueue: TypeAlias = multiprocessing.Queue

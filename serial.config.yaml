@@ -44,7 +44,7 @@ cambia_rules:
 # Persistence Settings
 persistence:
   # Path relative to execution directory where agent data is saved/loaded
-  agent_data_save_path: "cambia_cfr_agent_level1.joblib"
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.3-l1-s1-20250501.joblib"
 
 # Logging Configuration
 logging:

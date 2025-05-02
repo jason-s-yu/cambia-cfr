@@ -1,0 +1,56 @@
+# API Client Settings (for online play)
+api:
+  base_url: "http://localhost:8080"
+  auth:
+    email: "someone@example.com"
+    password: "password"
+
+# System Settings
+system:
+  recursion_limit: 10000 # Python default is 1000
+
+# CFR Training Parameters
+cfr_training:
+  num_iterations: 10000         # Total training iterations
+  save_interval: 100            # Save progress every N iterations
+  pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
+  pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
+  exploitability_interval: 100  # Calculate exploitability every N iterations (0 to disable)
+  num_workers: 2                # Number of parallel workers for simulations (1 for sequential)
+
+# CFR+ Specific Parameters
+cfr_plus_params:
+  weighted_averaging_enabled: true # Use weighted averaging for strategy sum (t-d)
+  averaging_delay: 100             # Delay 'd' for weighted averaging (start weight at iter d+1)
+
+# Agent Parameters
+agent_params:
+  memory_level: 1           # 0: Perfect Recall, 1: Event Decay, 2: Event+Time Decay
+  time_decay_turns: 3       # Turns until time decay (only for memory_level 2)
+
+# Cambia Game Rules (MUST match target environment/server)
+cambia_rules:
+  allowDrawFromDiscardPile: false  # Can players draw the top discard?
+  allowReplaceAbilities: false   # Do abilities trigger when replacing instead of discarding?
+  snapRace: false                # If multiple players snap, who acts first? (False=Turn order)
+  penaltyDrawCount: 2            # Cards drawn for failed snap attempt
+  use_jokers: 2                  # Number of Jokers in the deck (0, 1, or 2)
+  cards_per_player: 4            # Initial hand size
+  initial_view_count: 2          # Cards initially peeked by players
+  cambia_allowed_round: 0        # First round (0-indexed) Cambia can be called (0 = immediately)
+  allowOpponentSnapping: false   # Can players snap cards in opponent's hand?
+  max_game_turns: 200            # Maximum turns before game ends automatically (0 = no limit)
+
+# Persistence Settings
+persistence:
+  # Path relative to execution directory where agent data is saved/loaded
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.0-l1-p0-20250501.joblib"
+
+# Logging Configuration
+logging:
+  log_level_file: "DEBUG"       # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level_console: "ERROR"    # Logging level for the console
+  log_dir: "logs"               # Directory to store log files
+  log_file_prefix: "cambia"     # Prefix for log files within the run directory
+  log_max_bytes: 9437184        # Max size before rotation (~9MB = 9 * 1024 * 1024)
+  log_backup_count: 9999        # Max number of backup log files
