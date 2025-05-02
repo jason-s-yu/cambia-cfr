@@ -22,7 +22,7 @@ from .worker import run_cfr_simulation_worker
 logger = logging.getLogger(__name__)
 
 # Timeout for waiting on worker pool join during shutdown (seconds)
-# Removed as pool.join doesn't support timeout
+# Currently not used as pool.join doesn't support timeout
 # POOL_JOIN_TIMEOUT = 10.0
 
 
@@ -129,8 +129,8 @@ class CFRTrainingLoopMixin:
                     t,
                     self.config,
                     regret_snapshot,
-                    log_queue,
-                )  # Pass queue
+                    log_queue,  # Pass queue
+                )
                 # Initialize results list with Nones
                 results: List[Optional[WorkerResult]] = [None] * num_workers
                 sim_failed_count = 0
@@ -231,11 +231,20 @@ class CFRTrainingLoopMixin:
                                         # Store WorkerStats object for display
                                         self._worker_statuses[worker_id] = result.stats
                                 except Exception as pool_e:
+                                    # Log more specific error here before the generic message
+                                    logger.error(
+                                        "!!! Exception type '%s' encountered fetching result for worker %d iter %d.",
+                                        type(pool_e).__name__,
+                                        worker_id,
+                                        t,
+                                    )
+                                    # Log the generic message which includes the exception string
                                     logger.error(
                                         "Error fetching result for worker %d iter %d: %s",
                                         worker_id,
                                         t,
                                         pool_e,
+                                        exc_info=False,  # Avoid double traceback if logger propagates
                                     )
                                     results[worker_id] = None  # Mark as failed worker
                                     completed_worker_count += 1
@@ -317,7 +326,8 @@ class CFRTrainingLoopMixin:
                         )
                         continue
                 else:
-                    valid_results = results  # type: ignore # Checked above
+                    # All results should be valid WorkerResult objects
+                    valid_results = results  # Keep existing type hint logic
 
                 # Ensure postfix is a dict before setting str
                 progress_bar.set_postfix(
@@ -332,7 +342,7 @@ class CFRTrainingLoopMixin:
                 merge_start_time = time.time()
                 try:
                     # Pass only the list of valid WorkerResult objects
-                    self._merge_local_updates(valid_results)
+                    self._merge_local_updates(valid_results)  # type: ignore
                     merge_time = time.time() - merge_start_time
                     logger.debug("Iter %d merge took %.3fs", t, merge_time)
                 except Exception:

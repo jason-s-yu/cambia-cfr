@@ -8,6 +8,7 @@ import copy
 import logging
 import logging.handlers
 from collections import defaultdict
+import sys
 from typing import Dict, List, Optional, Tuple, TypeAlias
 
 import numpy as np
@@ -466,135 +467,165 @@ def run_cfr_simulation_worker(
     """Top-level function executed by each worker process."""
     # !!! IMPORTANT: Setup logging FIRST using the queue !!!
     iteration, config, regret_sum_snapshot, log_queue, worker_id = worker_args
-    worker_root_logger = logging.getLogger()  # Get root logger for this process
-    if log_queue:
-        # Avoid adding handler if it already exists
-        if not any(
-            isinstance(h, logging.handlers.QueueHandler) and h.queue is log_queue
-            for h in worker_root_logger.handlers
-        ):
-            # Remove any handlers inherited via fork (if any)
-            for handler in worker_root_logger.handlers[:]:
-                worker_root_logger.removeHandler(handler)
-            # Add the queue handler
-            queue_handler = logging.handlers.QueueHandler(log_queue)
-            worker_root_logger.addHandler(queue_handler)
-            # Set worker logger level to DEBUG to send everything to the queue
-            worker_root_logger.setLevel(logging.DEBUG)
-            # Now safe to get and use child loggers
-            logger = logging.getLogger(__name__)
-            logger.info("Worker %d logging initialized via QueueHandler.", worker_id)
-    else:
-        # Fallback or error handling if queue is not provided
-        worker_root_logger.addHandler(logging.NullHandler())
-        logger = logging.getLogger(__name__)  # Get logger even if queue fails
-
-    # --- Now wrap the main worker logic in a try...except block ---
+    logger = None  # Initialize logger variable
     try:
-        worker_stats = WorkerStats()  # Initialize stats for this run
-        logger.debug("Worker %d starting iteration %d.", worker_id, iteration)
-
-        # --- Initialize Game and Agent States ---
-        game_state = CambiaGameState(house_rules=config.cambia_rules)
-        initial_agent_states = []
-        initial_hands_for_log = [list(p.hand) for p in game_state.players]
-        initial_peeks_for_log = [p.initial_peek_indices for p in game_state.players]
-
-        if not game_state.is_terminal():
-            # Create initial observation *before* initializing agents
-            initial_obs = _create_observation(None, None, game_state, -1, [], None)
-            for i in range(NUM_PLAYERS):
-                agent = AgentState(
-                    player_id=i,
-                    opponent_id=game_state.get_opponent_index(i),
-                    memory_level=config.agent_params.memory_level,
-                    time_decay_turns=config.agent_params.time_decay_turns,
-                    initial_hand_size=len(initial_hands_for_log[i]),
-                    config=config,
-                )
-                # Pass the single initial observation to all agents
-                agent.initialize(
-                    initial_obs, initial_hands_for_log[i], initial_peeks_for_log[i]
-                )
-                initial_agent_states.append(agent)
+        worker_root_logger = logging.getLogger()  # Get root logger for this process
+        if log_queue:
+            # Avoid adding handler if it already exists
+            if not any(
+                isinstance(h, logging.handlers.QueueHandler) and h.queue is log_queue
+                for h in worker_root_logger.handlers
+            ):
+                # Remove any handlers inherited via fork (if any)
+                for handler in worker_root_logger.handlers[:]:
+                    worker_root_logger.removeHandler(handler)
+                # Add the queue handler
+                queue_handler = logging.handlers.QueueHandler(log_queue)
+                worker_root_logger.addHandler(queue_handler)
+                # Set worker logger level to DEBUG to send everything to the queue
+                worker_root_logger.setLevel(logging.DEBUG)
+                # Now safe to get and use child loggers
+                logger = logging.getLogger(__name__)  # Assign logger here
+                logger.info("Worker %d logging initialized via QueueHandler.", worker_id)
         else:
-            logger.error(
-                "Worker %d: Game terminal at init. State: %s", worker_id, game_state
-            )
-            return None  # Cannot start traversal
+            # Fallback or error handling if queue is not provided
+            if (
+                not worker_root_logger.hasHandlers()
+            ):  # Add NullHandler only if no other handlers exist
+                worker_root_logger.addHandler(logging.NullHandler())
+            logger = logging.getLogger(__name__)  # Get logger even if queue fails
+            logger.warning(
+                "Worker %d running without queue logging.", worker_id
+            )  # Log a warning if possible
 
-        if len(initial_agent_states) != NUM_PLAYERS:
-            logger.error("Worker %d: Failed to initialize all agent states.", worker_id)
+        # --- Now wrap the main worker logic in a try...except block ---
+        # This inner try...except catches errors within the simulation logic
+        try:
+            worker_stats = WorkerStats()  # Initialize stats for this run
+            logger.debug("Worker %d starting iteration %d.", worker_id, iteration)
+
+            # --- Initialize Game and Agent States ---
+            game_state = CambiaGameState(house_rules=config.cambia_rules)
+            initial_agent_states = []
+            initial_hands_for_log = [list(p.hand) for p in game_state.players]
+            initial_peeks_for_log = [p.initial_peek_indices for p in game_state.players]
+
+            if not game_state.is_terminal():
+                # Create initial observation *before* initializing agents
+                initial_obs = _create_observation(None, None, game_state, -1, [], None)
+                for i in range(NUM_PLAYERS):
+                    agent = AgentState(
+                        player_id=i,
+                        opponent_id=game_state.get_opponent_index(i),
+                        memory_level=config.agent_params.memory_level,
+                        time_decay_turns=config.agent_params.time_decay_turns,
+                        initial_hand_size=len(initial_hands_for_log[i]),
+                        config=config,
+                    )
+                    # Pass the single initial observation to all agents
+                    agent.initialize(
+                        initial_obs, initial_hands_for_log[i], initial_peeks_for_log[i]
+                    )
+                    initial_agent_states.append(agent)
+            else:
+                logger.error(
+                    "Worker %d: Game terminal at init. State: %s", worker_id, game_state
+                )
+                return None  # Cannot start traversal
+
+            if len(initial_agent_states) != NUM_PLAYERS:
+                logger.error(
+                    "Worker %d: Failed to initialize all agent states.", worker_id
+                )
+                return None
+
+            # --- Determine Updating Player & Iteration Weight ---
+            updating_player = iteration % NUM_PLAYERS
+            if config.cfr_plus_params.weighted_averaging_enabled:
+                delay = config.cfr_plus_params.averaging_delay
+                # Iteration weight starts from 1 at iter d+1
+                weight = float(max(0, (iteration + 1) - (delay + 1)))
+            else:
+                weight = 1.0
+
+            # --- Initialize Local Update Dictionaries ---
+            local_regret_updates: LocalRegretUpdateDict = defaultdict(
+                lambda: np.array([], dtype=np.float64)
+            )
+            local_strategy_sum_updates: LocalStrategyUpdateDict = defaultdict(
+                lambda: np.array([], dtype=np.float64)
+            )
+            local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
+
+            # --- Run Traversal ---
+            _traverse_game_for_worker(
+                game_state=game_state,
+                agent_states=initial_agent_states,
+                reach_probs=np.ones(
+                    NUM_PLAYERS, dtype=np.float64
+                ),  # Initial reach is 1 for both
+                iteration=iteration,
+                updating_player=updating_player,
+                weight=weight,
+                regret_sum_snapshot=regret_sum_snapshot,
+                config=config,
+                local_regret_updates=local_regret_updates,
+                local_strategy_sum_updates=local_strategy_sum_updates,
+                local_reach_prob_updates=local_reach_prob_updates,
+                depth=0,
+                worker_stats=worker_stats,  # Pass stats object
+            )
+
+            logger.debug(
+                "Worker %d finished iteration %d. MaxDepth: %d, Nodes: %d",
+                worker_id,
+                iteration,
+                worker_stats.max_depth,
+                worker_stats.nodes_visited,
+            )
+            # Return WorkerResult dataclass instance
+            return WorkerResult(
+                regret_updates=dict(local_regret_updates),
+                strategy_updates=dict(local_strategy_sum_updates),
+                reach_prob_updates=dict(local_reach_prob_updates),
+                stats=worker_stats,
+            )
+
+        except Exception as e_inner:
+            # Log exception using the configured queue handler *inside the worker*
+            # Use the logger instance obtained after setup
+            if logger:  # Check if logger was initialized
+                logger.error(
+                    "!!! Unhandled Error in worker %d iter %d simulation: %s !!!",
+                    worker_id,
+                    iteration,
+                    e_inner,
+                    exc_info=True,  # Include traceback in the log sent via queue
+                )
+            else:  # Fallback print if logger failed
+                print(
+                    f"!!! FATAL WORKER ERROR (Worker {worker_id}, Iter {iteration}): {e_inner} !!!",
+                    file=sys.stderr,
+                )
+            # Return None to indicate failure *without* pickling the exception
             return None
 
-        # --- Determine Updating Player & Iteration Weight ---
-        updating_player = iteration % NUM_PLAYERS
-        if config.cfr_plus_params.weighted_averaging_enabled:
-            delay = config.cfr_plus_params.averaging_delay
-            # Iteration weight starts from 1 at iter d+1
-            weight = float(max(0, (iteration + 1) - (delay + 1)))
-        else:
-            weight = 1.0
+    # This outer try...except catches errors during logger setup itself
+    except Exception as e_outer:
+        # Cannot use logger here as setup might have failed
+        print(
+            f"!!! CRITICAL Error during worker {worker_id} init (Iter {iteration}): {e_outer} !!!",
+            file=sys.stderr,
+        )
+        # Print traceback manually if possible
+        import traceback
 
-        # --- Initialize Local Update Dictionaries ---
-        local_regret_updates: LocalRegretUpdateDict = defaultdict(
-            lambda: np.array([], dtype=np.float64)
-        )
-        local_strategy_sum_updates: LocalStrategyUpdateDict = defaultdict(
-            lambda: np.array([], dtype=np.float64)
-        )
-        local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
-
-        # --- Run Traversal ---
-        _traverse_game_for_worker(
-            game_state=game_state,
-            agent_states=initial_agent_states,
-            reach_probs=np.ones(
-                NUM_PLAYERS, dtype=np.float64
-            ),  # Initial reach is 1 for both
-            iteration=iteration,
-            updating_player=updating_player,
-            weight=weight,
-            regret_sum_snapshot=regret_sum_snapshot,
-            config=config,
-            local_regret_updates=local_regret_updates,
-            local_strategy_sum_updates=local_strategy_sum_updates,
-            local_reach_prob_updates=local_reach_prob_updates,
-            depth=0,
-            worker_stats=worker_stats,  # Pass stats object
-        )
-
-        logger.debug(
-            "Worker %d finished iteration %d. MaxDepth: %d, Nodes: %d",
-            worker_id,
-            iteration,
-            worker_stats.max_depth,
-            worker_stats.nodes_visited,
-        )
-        # Return WorkerResult dataclass instance
-        return WorkerResult(
-            regret_updates=dict(local_regret_updates),
-            strategy_updates=dict(local_strategy_sum_updates),
-            reach_prob_updates=dict(local_reach_prob_updates),
-            stats=worker_stats,
-        )
-
-    except Exception as e:
-        # Log exception using the configured queue handler *inside the worker*
-        # Use the logger instance obtained after setup
-        logger.error(
-            "!!! Unhandled Error in worker %d iter %d: %s !!!",
-            worker_id,
-            iteration,
-            e,
-            exc_info=True,  # Include traceback in the log sent via queue
-        )
-        # Return None to indicate failure *without* pickling the exception
-        return None
+        traceback.print_exc(file=sys.stderr)
+        return None  # Indicate failure
 
 
 # --- Helper functions needed by _traverse_game_for_worker ---
-# (Implementation unchanged from v0.7.3, but ensure consistency)
+# (Implementation unchanged from v0.7.4, but ensure consistency)
 def _create_observation(
     prev_state: Optional[
         CambiaGameState
