@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 WorkerStatusInfo = Union[str, WorkerStats, Tuple[str, int, int]]
 
 
+def format_infoset_count(count: int) -> str:
+    """Formats a large number with k/M suffixes."""
+    if count < 1000:
+        return str(count)
+    elif count < 1_000_000:
+        return f"{count // 1000}k"
+    else:
+        return f"{count / 1_000_000:.1f}M"
+
+
 class CFRTrainingLoopMixin:
     """Handles the overall CFR+ training loop, progress, and scheduling, supporting parallelism."""
 
@@ -51,7 +61,7 @@ class CFRTrainingLoopMixin:
     compute_average_strategy: Callable[..., Optional[PolicyDict]]
     # Internal state
     _last_exploit_str: str = "N/A"
-    _total_infosets_str: str = "0k"  # Initialize with 'k' notation
+    _total_infosets_str: str = "0"  # Initialize without 'k'
     _worker_statuses: Dict[int, WorkerStatusInfo] = {}
     _total_run_time_start: float = 0.0  # Track start time
 
@@ -84,7 +94,7 @@ class CFRTrainingLoopMixin:
         pool: Optional[multiprocessing.pool.Pool] = None
         self._worker_statuses = {i: "Idle" for i in range(num_workers)}
         # Update total infosets display initially
-        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+        self._total_infosets_str = format_infoset_count(len(self.regret_sum))
         progress_bar: Optional[tqdm] = None
 
         try:
@@ -98,12 +108,12 @@ class CFRTrainingLoopMixin:
                 leave=True,
                 file=sys.stderr,
             )
-            # Use kNodes in initial postfix
+            # Use Infosets in initial postfix
             progress_bar.set_postfix(
                 {
                     "LastT": "N/A",
                     "Expl": self._last_exploit_str,
-                    "kNodes": self._total_infosets_str,
+                    "Infosets": self._total_infosets_str,
                 },
                 refresh=False,
             )
@@ -119,7 +129,7 @@ class CFRTrainingLoopMixin:
                     i: ("Starting", 0, 0) for i in range(num_workers)
                 }
                 # Update total infoset count for display before starting iteration logic
-                self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+                self._total_infosets_str = format_infoset_count(len(self.regret_sum))
                 self._update_status_display(progress_bar, t, end_iter_num)
 
                 try:
@@ -154,21 +164,37 @@ class CFRTrainingLoopMixin:
                         )
                         results[0] = result
                         completed_worker_count = 1
-                        if result is None:
-                            sim_failed_count += 1
-                            self._worker_statuses[0] = "Failed"
-                        elif isinstance(result, WorkerResult):
-                            self._worker_statuses[0] = result.stats
-                        else:
+                        if result is None or not isinstance(result, WorkerResult):
                             logger.error(
-                                "Worker 0 returned unexpected type: %s", type(result)
+                                "Worker 0 returned unexpected type or None: %s",
+                                type(result),
                             )
                             self._worker_statuses[0] = "Error (Return Type)"
                             sim_failed_count += 1
+                            # Add error to stats if possible from a potential partial return
+                            if isinstance(result, WorkerResult) and isinstance(
+                                result.stats, WorkerStats
+                            ):
+                                result.stats.error_count += 1
+                            elif isinstance(
+                                self._worker_statuses[0], WorkerStats
+                            ):  # Should not happen
+                                self._worker_statuses[0].error_count += 1
+                        elif isinstance(result, WorkerResult):
+                            self._worker_statuses[0] = result.stats
                     except Exception:
                         logger.exception("Error during sequential simulation iter %d.", t)
                         sim_failed_count += 1
-                        self._worker_statuses[0] = "Error"
+                        # Try to capture stats with error count if status was already WorkerStats
+                        if isinstance(self._worker_statuses[0], WorkerStats):
+                            self._worker_statuses[0].error_count += 1
+                            self._worker_statuses[0] = (
+                                f"Error ({type(e).__name__})"  # Overwrite with error string
+                            )
+                        else:
+                            self._worker_statuses[0] = (
+                                "Error (Exception)"  # Default error message
+                            )
                     self._update_status_display(progress_bar, t, end_iter_num)
 
                 else:
@@ -246,23 +272,34 @@ class CFRTrainingLoopMixin:
                                     )
                                     results[worker_id] = result
                                     completed_worker_count += 1
-                                    if result is None:
+                                    if result is None or not isinstance(
+                                        result, WorkerResult
+                                    ):
                                         sim_failed_count += 1
-                                        self._worker_statuses[worker_id] = (
-                                            f"Failed (Iter {t})"
-                                        )
+                                        # Try to get stats if it's a WorkerResult without data
+                                        if isinstance(
+                                            result, WorkerResult
+                                        ) and isinstance(result.stats, WorkerStats):
+                                            self._worker_statuses[worker_id] = (
+                                                result.stats
+                                            )  # Keep stats
+                                            if (
+                                                self._worker_statuses[
+                                                    worker_id
+                                                ].error_count
+                                                == 0
+                                            ):
+                                                self._worker_statuses[
+                                                    worker_id
+                                                ].error_count = (
+                                                    1  # Ensure error is counted
+                                                )
+                                        else:
+                                            self._worker_statuses[worker_id] = (
+                                                f"Failed (Iter {t}, Type: {type(result).__name__})"
+                                            )
                                     elif isinstance(result, WorkerResult):
                                         self._worker_statuses[worker_id] = result.stats
-                                    else:
-                                        logger.error(
-                                            "Worker %d returned unexpected type: %s",
-                                            worker_id,
-                                            type(result),
-                                        )
-                                        self._worker_statuses[worker_id] = (
-                                            "Error (Return Type)"
-                                        )
-                                        sim_failed_count += 1
                                 except multiprocessing.TimeoutError:
                                     async_results[worker_id] = async_res  # Put back
                                     continue
@@ -274,12 +311,12 @@ class CFRTrainingLoopMixin:
                                         pool_e,
                                         exc_info=False,
                                     )
-                                    results[worker_id] = None
+                                    results[worker_id] = None  # Indicate failure
                                     completed_worker_count += 1
                                     sim_failed_count += 1
-                                    self._worker_statuses[worker_id] = (
-                                        f"Error ({type(pool_e).__name__})"
-                                    )
+                                    # Create basic stats with error count for summary
+                                    error_stats = WorkerStats(error_count=1)
+                                    self._worker_statuses[worker_id] = error_stats
 
                             self._update_status_display(progress_bar, t, end_iter_num)
                             if completed_worker_count < num_workers:
@@ -300,7 +337,7 @@ class CFRTrainingLoopMixin:
                         {
                             "LastT": "N/A",
                             "Expl": self._last_exploit_str,
-                            "kNodes": self._total_infosets_str,
+                            "Infosets": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -316,36 +353,46 @@ class CFRTrainingLoopMixin:
                         num_workers,
                         t,
                     )
-                    valid_results = [res for res in results if res is not None]
-                    if not valid_results:
+                    # Filter results to only include successful WorkerResult objects for merging
+                    valid_results = [
+                        res for res in results if isinstance(res, WorkerResult)
+                    ]
+                    if not valid_results or all(
+                        r.regret_updates is None for r in valid_results
+                    ):  # Check if data is actually present
                         progress_bar.set_postfix(
                             {
                                 "LastT": "N/A",
                                 "Expl": self._last_exploit_str,
-                                "kNodes": self._total_infosets_str,
+                                "Infosets": self._total_infosets_str,
                             },
                             refresh=False,
                         )
-                        progress_bar.set_postfix_str("All Sims FAILED", refresh=True)
+                        progress_bar.set_postfix_str(
+                            "All Sims FAILED (No Data)", refresh=True
+                        )
                         logger.error(
-                            "All simulations failed for iteration %d. Skipping merge.", t
+                            "All simulations failed or returned no update data for iteration %d. Skipping merge.",
+                            t,
                         )
                         continue
-                else:
-                    valid_results = results
+                else:  # No failures
+                    valid_results = [
+                        res for res in results if isinstance(res, WorkerResult)
+                    ]
 
                 progress_bar.set_postfix(
                     {
                         "LastT": "N/A",
                         "Expl": self._last_exploit_str,
-                        "kNodes": self._total_infosets_str,
+                        "Infosets": self._total_infosets_str,
                     },
                     refresh=False,
                 )
                 progress_bar.set_postfix_str("Merging...", refresh=False)
                 merge_start_time = time.time()
                 try:
-                    self._merge_local_updates(valid_results)  # type: ignore
+                    self._merge_local_updates(valid_results)  # Pass only valid results
                     merge_time = time.time() - merge_start_time
                     logger.debug("Iter %d merge took %.3fs", t, merge_time)
                 except Exception:
@@ -354,7 +401,7 @@ class CFRTrainingLoopMixin:
                         {
                             "LastT": "N/A",
                             "Expl": self._last_exploit_str,
-                            "kNodes": self._total_infosets_str,
+                            "Infosets": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -364,7 +411,7 @@ class CFRTrainingLoopMixin:
                 # --- Iteration Completed ---
                 iter_time = time.time() - iter_start_time
                 # Update total infoset count string AFTER merge for the postfix
-                self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+                self._total_infosets_str = format_infoset_count(len(self.regret_sum))
 
                 exploit_calc_time = 0.0
                 if exploitability_interval > 0 and t % exploitability_interval == 0:
@@ -372,7 +419,7 @@ class CFRTrainingLoopMixin:
                         {
                             "LastT": f"{iter_time:.2f}s",
                             "Expl": self._last_exploit_str,
-                            "kNodes": self._total_infosets_str,
+                            "Infosets": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -385,7 +432,7 @@ class CFRTrainingLoopMixin:
                             {
                                 "LastT": f"{iter_time:.2f}s",
                                 "Expl": self._last_exploit_str,
-                                "kNodes": self._total_infosets_str,
+                                "Infosets": self._total_infosets_str,
                             },
                             refresh=False,
                         )
@@ -413,7 +460,7 @@ class CFRTrainingLoopMixin:
                 postfix_dict = {
                     "LastT": f"{iter_time:.2f}s",
                     "Expl": self._last_exploit_str,
-                    "kNodes": self._total_infosets_str,
+                    "Infosets": self._total_infosets_str,
                 }
                 progress_bar.set_postfix(postfix_dict, refresh=True)
                 # Final status display update for this iteration
@@ -565,14 +612,14 @@ class CFRTrainingLoopMixin:
             logger.warning("Could not compute final average strategy.")
             self._last_exploit_str = "N/A (Avg Err)"
 
-        # Update final kNodes count
-        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+        # Update final Infosets count
+        self._total_infosets_str = format_infoset_count(len(self.regret_sum))
 
         # Save final data and write summary (Summary write now happens in finally too)
         self.save_data()  # type: ignore
         logger.info("Final average strategy and data saved.")
 
-        final_status_msg = f"\nFinished. Iter: {self.current_iteration} | kNodes: {self._total_infosets_str} | Expl: {self._last_exploit_str}"
+        final_status_msg = f"\nFinished. Iter: {self.current_iteration} | Infosets: {self._total_infosets_str} | Expl: {self._last_exploit_str}"
         print(final_status_msg, file=sys.stderr)
 
     def _update_status_display(
@@ -582,18 +629,18 @@ class CFRTrainingLoopMixin:
         if not progress_bar:
             return
 
-        # --- Update postfix for the main bar (using kNodes) ---
+        # --- Update postfix for the main bar (using Infosets) ---
         last_t_value = "N/A"
         if isinstance(progress_bar.postfix, dict):
             last_t_value = progress_bar.postfix.get("LastT", "N/A")
         elif isinstance(progress_bar.postfix, str):
             last_t_value = "N/A"  # Should not happen with dict usage
-        # Recalculate kNodes string based on current regret_sum size
-        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+        # Recalculate Infosets string based on current regret_sum size
+        self._total_infosets_str = format_infoset_count(len(self.regret_sum))
         current_postfix_dict = {
             "LastT": last_t_value,
             "Expl": self._last_exploit_str,
-            "kNodes": self._total_infosets_str,
+            "Infosets": self._total_infosets_str,
         }
         progress_bar.set_postfix(current_postfix_dict, refresh=False)
 
@@ -610,7 +657,7 @@ class CFRTrainingLoopMixin:
                 if isinstance(status_info, WorkerStats):
                     # Format final stats with 'k' for nodes
                     nodes_k = status_info.nodes_visited // 1000
-                    status_str = f"Done (D:{status_info.max_depth}, N:{nodes_k}k)"
+                    status_str = f"Done (D:{status_info.max_depth}, N:{nodes_k}k, W:{status_info.warning_count}, E:{status_info.error_count})"
                 elif isinstance(status_info, tuple) and len(status_info) == 3:
                     # Format live stats with 'k' for nodes
                     state, depth, nodes = status_info
@@ -681,44 +728,63 @@ class CFRTrainingLoopMixin:
                 if num_workers > 0:
                     total_nodes = 0
                     max_depth_overall = 0
+                    total_warnings = 0
+                    total_errors = 0
                     completed_workers = 0
-                    failed_workers = 0
-                    error_workers = 0
+                    failed_workers = (
+                        0  # Workers returning non-WorkerStats or with error status string
+                    )
+                    error_in_stats_workers = (
+                        0  # Workers returning WorkerStats but error_count > 0
+                    )
 
                     for i in range(num_workers):
                         status_info = self._worker_statuses.get(i)
                         status_line = f"Worker {i}: "
                         if isinstance(status_info, WorkerStats):
-                            # Write full node count in summary file
-                            status_line += f"Completed (Max Depth: {status_info.max_depth}, Nodes Visited: {status_info.nodes_visited:,})"
+                            # Write full node count, warnings, errors
+                            status_line += f"Completed (Max Depth: {status_info.max_depth}, Nodes Visited: {status_info.nodes_visited:,}, Warnings: {status_info.warning_count}, Errors: {status_info.error_count})"
                             total_nodes += status_info.nodes_visited
                             max_depth_overall = max(
                                 max_depth_overall, status_info.max_depth
                             )
+                            total_warnings += status_info.warning_count
+                            total_errors += status_info.error_count
+                            if status_info.error_count > 0:
+                                error_in_stats_workers += 1
                             completed_workers += 1
                         elif isinstance(status_info, str):
                             status_line += status_info  # e.g., "Failed", "Error", "Idle"
-                            if "Fail" in status_info:
+                            if "Fail" in status_info or "Error" in status_info:
                                 failed_workers += 1
-                            if "Error" in status_info:
-                                error_workers += 1
+                                total_errors += (
+                                    1  # Count failure/error string as an error
+                                )
                         else:
                             status_line += (
                                 f"Unknown Final State ({type(status_info).__name__})"
                             )
-                            error_workers += 1  # Count unknowns as errors
+                            failed_workers += 1  # Count unknown as failure
+                            total_errors += 1
                         f.write(status_line + "\n")
 
                     f.write("\n--- Aggregated Worker Stats ---\n")
-                    f.write(f"Completed Workers: {completed_workers}\n")
-                    f.write(f"Failed Workers: {failed_workers}\n")
-                    f.write(f"Error Workers: {error_workers}\n")
+                    f.write(f"Completed Workers (Returned Stats): {completed_workers}\n")
+                    f.write(f"Failed/Error Workers (String Status): {failed_workers}\n")
+                    f.write(f"Workers with Errors in Stats: {error_in_stats_workers}\n")
                     f.write(
                         f"Total Nodes Visited (Sum Across Completed Workers): {total_nodes:,}\n"
                     )
                     f.write(
                         f"Max Depth Reached (Overall Across Completed Workers): {max_depth_overall}\n"
                     )
+                    f.write(
+                        f"Total Warnings Logged (Sum Across Completed Workers): {total_warnings}\n"
+                    )
+                    f.write(
+                        f"Total Errors Logged (Sum Across Completed Workers + Failed): {total_errors}\n"
+                    )
+
                 else:  # Sequential
                     f.write("Sequential execution (1 worker).\n")
                     status_info = self._worker_statuses.get(0)
@@ -726,6 +792,8 @@ class CFRTrainingLoopMixin:
                         f.write(f"  Final Status: Completed\n")
                         f.write(f"  Max Depth: {status_info.max_depth}\n")
                         f.write(f"  Nodes Visited: {status_info.nodes_visited:,}\n")
+                        f.write(f"  Warnings: {status_info.warning_count}\n")
+                        f.write(f"  Errors: {status_info.error_count}\n")
                     elif isinstance(status_info, str):
                         f.write(f"  Final Status: {status_info}\n")
 

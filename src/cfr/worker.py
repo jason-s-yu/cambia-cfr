@@ -100,6 +100,7 @@ def _traverse_game_for_worker(
                 worker_id,
                 pq_e,
             )
+            worker_stats.error_count += 1
 
     # Base Case
     if game_state.is_terminal():
@@ -112,6 +113,7 @@ def _traverse_game_for_worker(
         logger.error(
             "Worker %d: Max recursion depth (%d) reached. Returning 0.", worker_id, depth
         )
+        worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     # --- Determine Context, Acting Player, Infoset Key ---
@@ -141,6 +143,7 @@ def _traverse_game_for_worker(
                 worker_id,
                 type(pending).__name__,
             )
+            worker_stats.warning_count += 1
             current_context = DecisionContext.START_TURN  # Fallback
     else:  # Normal start of turn
         current_context = DecisionContext.START_TURN
@@ -153,6 +156,7 @@ def _traverse_game_for_worker(
             depth,
             game_state,
         )
+        worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
     current_agent_state = agent_states[player]
     opponent = 1 - player
@@ -167,6 +171,7 @@ def _traverse_game_for_worker(
                 depth,
                 current_agent_state,
             )
+            worker_stats.error_count += 1
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         base_infoset_tuple = current_agent_state.get_infoset_key()
         if not isinstance(current_context, DecisionContext):
@@ -175,6 +180,7 @@ def _traverse_game_for_worker(
                 worker_id,
                 type(current_context),
             )
+            worker_stats.error_count += 1
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
     except Exception as e_key:
@@ -192,6 +198,7 @@ def _traverse_game_for_worker(
             ),
             exc_info=True,
         )
+        worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     # --- Get Legal Actions ---
@@ -208,6 +215,7 @@ def _traverse_game_for_worker(
             game_state,
             exc_info=True,
         )
+        worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
     num_actions = len(legal_actions)
 
@@ -225,6 +233,8 @@ def _traverse_game_for_worker(
                     else current_context
                 ),
             )
+            worker_stats.error_count += 1
+            # Non-terminal state bug candidate (Backlog #1)
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         else:  # Correctly terminal
             return np.array(
@@ -245,6 +255,7 @@ def _traverse_game_for_worker(
                 len(current_regrets),
                 num_actions,
             )
+            worker_stats.warning_count += 1
         strategy = np.ones(num_actions) / num_actions if num_actions > 0 else np.array([])
         if (
             infoset_key not in local_regret_updates
@@ -281,6 +292,7 @@ def _traverse_game_for_worker(
                 num_actions,
                 infoset_key,
             )
+            worker_stats.error_count += 1
 
     action_utilities = np.zeros((num_actions, NUM_PLAYERS), dtype=np.float64)
     node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
@@ -294,6 +306,7 @@ def _traverse_game_for_worker(
                 len(strategy),
                 infoset_key,
             )
+            worker_stats.error_count += 1
             continue
         action_prob = strategy[i]
         if action_prob < 1e-9:
@@ -316,6 +329,7 @@ def _traverse_game_for_worker(
                     action,
                     game_state,
                 )
+                worker_stats.error_count += 1
                 action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
                 continue
 
@@ -330,6 +344,7 @@ def _traverse_game_for_worker(
                 game_state,
                 exc_info=True,
             )
+            worker_stats.error_count += 1
             continue
 
         # Create observation and update agent states
@@ -360,6 +375,7 @@ def _traverse_game_for_worker(
                     observation,
                     exc_info=True,
                 )
+                worker_stats.error_count += 1
                 agent_update_failed = True
                 break
             next_agent_states.append(cloned_agent)
@@ -375,6 +391,7 @@ def _traverse_game_for_worker(
                         undo_e,
                         exc_info=True,
                     )
+                    worker_stats.error_count += 1
             continue
 
         temp_reach_probs = reach_probs.copy()
@@ -410,6 +427,7 @@ def _traverse_game_for_worker(
                 game_state,
                 exc_info=True,
             )
+            worker_stats.error_count += 1
             action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
         # Undo action
@@ -425,6 +443,7 @@ def _traverse_game_for_worker(
                     undo_e,
                     exc_info=True,
                 )
+                worker_stats.error_count += 1
                 return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     # --- Calculate Node Value & Accumulate Regret Update ---
@@ -462,6 +481,7 @@ def _traverse_game_for_worker(
                     local_regret_updates[infoset_key].shape,
                     infoset_key,
                 )
+                worker_stats.error_count += 1
 
     return node_value
 
@@ -479,6 +499,7 @@ def run_cfr_simulation_worker(
 ) -> Optional[WorkerResult]:
     """Top-level function executed by each worker process. Sets up per-worker logging."""
     logger = None  # Initialize logger variable
+    worker_stats = WorkerStats()  # Initialize stats early for exception handling
     (
         iteration,
         config,
@@ -538,6 +559,7 @@ def run_cfr_simulation_worker(
                 f"!!! CRITICAL Error setting up logging for worker {worker_id}: {log_setup_e} !!!",
                 file=sys.stderr,
             )
+            worker_stats.error_count += 1  # Count logging setup error
             # Add a NullHandler to prevent "No handler found" warnings
             if not worker_root_logger.hasHandlers():
                 worker_root_logger.addHandler(logging.NullHandler())
@@ -545,7 +567,6 @@ def run_cfr_simulation_worker(
 
         # --- Now wrap the main worker logic ---
         try:
-            worker_stats = WorkerStats()
             # logger.debug("Worker %d starting iteration %d.", worker_id, iteration) # Reduced noise
 
             # Initialize Game and Agent States
@@ -574,13 +595,15 @@ def run_cfr_simulation_worker(
                 logger.error(
                     "Worker %d: Game terminal at init. State: %s", worker_id, game_state
                 )
-                return None
+                worker_stats.error_count += 1
+                return WorkerResult(stats=worker_stats)  # Return stats even on error
 
             if len(initial_agent_states) != NUM_PLAYERS:
                 logger.error(
                     "Worker %d: Failed to initialize all agent states.", worker_id
                 )
-                return None
+                worker_stats.error_count += 1
+                return WorkerResult(stats=worker_stats)  # Return stats even on error
 
             # Determine Updating Player & Iteration Weight
             updating_player = iteration % NUM_PLAYERS
@@ -627,6 +650,7 @@ def run_cfr_simulation_worker(
             )
 
         except Exception as e_inner:
+            worker_stats.error_count += 1  # Count inner simulation error
             if logger:  # Log if logger was successfully set up
                 logger.error(
                     "!!! Unhandled Error in worker %d iter %d simulation: %s !!!",
@@ -640,10 +664,12 @@ def run_cfr_simulation_worker(
                     f"!!! FATAL WORKER ERROR (Worker {worker_id}, Iter {iteration}): {e_inner} !!!",
                     file=sys.stderr,
                 )
-            return None
+            # Return only stats on inner error
+            return WorkerResult(stats=worker_stats)
 
     # This outer try...except catches errors during initial setup before logger might exist
     except Exception as e_outer:
+        worker_stats.error_count += 1  # Count outer setup error
         print(
             f"!!! CRITICAL Error during worker {worker_id} init (Iter {iteration}): {e_outer} !!!",
             file=sys.stderr,
@@ -651,7 +677,9 @@ def run_cfr_simulation_worker(
         import traceback
 
         traceback.print_exc(file=sys.stderr)
-        return None
+        # Return only stats on outer error
+        return WorkerResult(stats=worker_stats)
+
     finally:
         # Explicitly shutdown logging for the worker process?
         # logging.shutdown() # Maybe needed depending on start method / OS

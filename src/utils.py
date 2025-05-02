@@ -45,6 +45,8 @@ class WorkerStats:
 
     max_depth: int = 0
     nodes_visited: int = 0
+    warning_count: int = 0
+    error_count: int = 0
     # Add other stats as needed (e.g., time taken, specific events)
 
 
