@@ -16,7 +16,9 @@ from tqdm import tqdm
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import load_config
 from .cfr.trainer import CFRTrainer
-from .utils import LogQueue
+
+# Modify LogQueue Type Alias if necessary, or keep using it for both queues
+from .utils import LogQueue as GenericQueue
 from .cfr.exceptions import GracefulShutdownException  # Import exception
 
 # Global logger instance (initialized after setup)
@@ -55,7 +57,7 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logging(config, verbose: bool, log_queue: LogQueue):
+def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use GenericQueue
     """Configures logging using a QueueListener for multiprocessing."""
     global queue_listener, main_process_queue_handler  # Add main handler to globals
 
@@ -233,7 +235,9 @@ def main():
     try:
         # Create and start the manager
         manager = multiprocessing.Manager()
-        log_queue: LogQueue = manager.Queue(-1)
+        log_queue: GenericQueue = manager.Queue(-1)
+        # Create the new progress queue
+        progress_queue: GenericQueue = manager.Queue(-1)
 
         # Setup logging using the manager's queue
         run_log_dir, run_timestamp = setup_logging(config, args.verbose, log_queue)
@@ -261,13 +265,14 @@ def main():
             except Exception as e:
                 logger.error("Failed to set recursion limit: %s", e)
 
-        # Initialize trainer
+        # Initialize trainer, passing both queues
         try:
             trainer = CFRTrainer(
                 config,
                 run_log_dir=run_log_dir,
                 shutdown_event=shutdown_event,
-                log_queue=log_queue,  # Pass the manager's queue
+                log_queue=log_queue,
+                progress_queue=progress_queue,  # Pass progress queue
             )
         except Exception:
             logger.exception("Failed to initialize CFRTrainer:")
@@ -329,6 +334,8 @@ def main():
         if queue_listener:
             print("Stopping log queue listener...", file=sys.stderr)
             try:
+                # Before stopping, add a sentinel or wait briefly?
+                # No, stopping should handle remaining items gracefully.
                 queue_listener.stop()
                 print("Log queue listener stopped.", file=sys.stderr)
             except Exception as ql_e:
@@ -337,7 +344,7 @@ def main():
             # but manager shutdown is the main race condition target
             time.sleep(0.1)
 
-        # 3. Shut down the Manager
+        # 3. Shut down the Manager (this closes both log_queue and progress_queue)
         if manager:
             print("Shutting down multiprocessing manager...", file=sys.stderr)
             try:

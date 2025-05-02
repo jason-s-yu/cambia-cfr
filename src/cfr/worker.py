@@ -10,6 +10,7 @@ import logging.handlers
 from collections import defaultdict
 import sys
 from typing import Dict, List, Optional, Tuple, TypeAlias
+import queue  # For queue.Empty, queue.Full exceptions
 
 import numpy as np
 
@@ -39,7 +40,7 @@ from ..utils import (
     LocalStrategyUpdateDict,
     LocalReachProbUpdateDict,
     WorkerResult,
-    LogQueue,
+    LogQueue as GenericQueue,  # Rename for clarity
     WorkerStats,
 )
 
@@ -48,6 +49,8 @@ from ..utils import (
 # logger = logging.getLogger(__name__) # Get logger inside the function after setup
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
+ProgressQueue: TypeAlias = GenericQueue  # Use same type alias for progress queue
+PROGRESS_UPDATE_NODE_INTERVAL = 1000  # Send update every N nodes
 
 
 # --- Traversal Logic (largely unchanged, ensure logging uses logger.) ---
@@ -65,6 +68,8 @@ def _traverse_game_for_worker(
     local_reach_prob_updates: LocalReachProbUpdateDict,
     depth: int,
     worker_stats: WorkerStats,
+    progress_queue: Optional[ProgressQueue],
+    worker_id: int,
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
     logger = logging.getLogger(__name__)  # Get logger instance for this function scope
@@ -72,6 +77,29 @@ def _traverse_game_for_worker(
     # Update stats
     worker_stats.nodes_visited += 1
     worker_stats.max_depth = max(worker_stats.max_depth, depth)
+
+    # --- Send Progress Update Periodically ---
+    if progress_queue and (
+        worker_stats.nodes_visited % PROGRESS_UPDATE_NODE_INTERVAL == 0
+    ):
+        try:
+            progress_update = (
+                worker_id,
+                worker_stats.max_depth,
+                worker_stats.nodes_visited,
+            )
+            progress_queue.put_nowait(progress_update)
+        except queue.Full:
+            # If the queue is full, just skip the update for now
+            # logger.debug("Progress queue full for worker %d, skipping update.", worker_id)
+            pass
+        except Exception as pq_e:
+            # Log error but don't crash the worker
+            logger.error(
+                "Error putting progress update on queue for worker %d: %s",
+                worker_id,
+                pq_e,
+            )
 
     # Base Case
     if game_state.is_terminal():
@@ -81,7 +109,9 @@ def _traverse_game_for_worker(
 
     # Check depth limit (prevent infinite recursion)
     if depth >= config.system.recursion_limit:
-        logger.error("Worker: Max recursion depth (%d) reached. Returning 0.", depth)
+        logger.error(
+            "Worker %d: Max recursion depth (%d) reached. Returning 0.", worker_id, depth
+        )
         # Treat as terminal with neutral utility
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
@@ -110,7 +140,8 @@ def _traverse_game_for_worker(
             current_context = DecisionContext.SNAP_MOVE
         else:
             logger.warning(
-                "Worker: Unknown pending action type (%s) for context.",
+                "Worker %d: Unknown pending action type (%s) for context.",
+                worker_id,
                 type(pending).__name__,
             )
             current_context = DecisionContext.START_TURN  # Fallback
@@ -121,7 +152,8 @@ def _traverse_game_for_worker(
     player = game_state.get_acting_player()
     if player == -1:
         logger.error(
-            "Worker: Could not determine acting player depth %d. State: %s",
+            "Worker %d: Could not determine acting player depth %d. State: %s",
+            worker_id,
             depth,
             game_state,
         )
@@ -134,7 +166,8 @@ def _traverse_game_for_worker(
             current_agent_state, "opponent_belief"
         ):
             logger.error(
-                "Worker: Agent state P%d invalid for key gen depth %d. State: %s",
+                "Worker %d: Agent state P%d invalid for key gen depth %d. State: %s",
+                worker_id,
                 player,
                 depth,
                 current_agent_state,
@@ -144,14 +177,16 @@ def _traverse_game_for_worker(
         # Ensure context is valid Enum member before accessing value
         if not isinstance(current_context, DecisionContext):
             logger.error(
-                "Worker: Invalid context type '%s' for infoset key.",
+                "Worker %d: Invalid context type '%s' for infoset key.",
+                worker_id,
                 type(current_context),
             )
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
     except Exception as e_key:
         logger.error(
-            "Worker: Error getting infoset key P%d depth %d: %s. State: %s, Context: %s",
+            "Worker %d: Error getting infoset key P%d depth %d: %s. State: %s, Context: %s",
+            worker_id,
             player,
             depth,
             e_key,
@@ -172,7 +207,8 @@ def _traverse_game_for_worker(
         legal_actions = sorted(list(legal_actions_set), key=repr)
     except Exception as e_legal:
         logger.error(
-            "Worker: Error getting legal actions P%d depth %d: %s. State: %s",
+            "Worker %d: Error getting legal actions P%d depth %d: %s. State: %s",
+            worker_id,
             player,
             depth,
             e_legal,
@@ -189,7 +225,8 @@ def _traverse_game_for_worker(
         if not game_state.is_terminal():
             # This log might still appear if the underlying cause in the engine isn't fixed yet.
             logger.error(  # Keep as ERROR
-                "Worker: No legal actions P%d depth %d, but state non-terminal! State: %s Context: %s",
+                "Worker %d: No legal actions P%d depth %d, but state non-terminal! State: %s Context: %s",
+                worker_id,
                 player,
                 depth,
                 game_state,
@@ -217,7 +254,8 @@ def _traverse_game_for_worker(
         # Handle missing key or dimension mismatch
         if current_regrets is not None:  # Dimension mismatch
             logger.warning(
-                "Worker: Regret dim mismatch key %s. Snap:%d Need:%d. Using uniform.",
+                "Worker %d: Regret dim mismatch key %s. Snap:%d Need:%d. Using uniform.",
+                worker_id,
                 infoset_key,
                 len(current_regrets),
                 num_actions,
@@ -260,7 +298,8 @@ def _traverse_game_for_worker(
             local_reach_prob_updates[infoset_key] += weight * player_reach
         else:
             logger.error(
-                "Worker: Strategy len %d != num_actions %d for key %s. Skip strat update.",
+                "Worker %d: Strategy len %d != num_actions %d for key %s. Skip strat update.",
+                worker_id,
                 len(strategy),
                 num_actions,
                 infoset_key,
@@ -273,7 +312,8 @@ def _traverse_game_for_worker(
     for i, action in enumerate(legal_actions):
         if i >= len(strategy):
             logger.error(
-                "Worker: Action index %d OOB for strategy len %d. Key: %s",
+                "Worker %d: Action index %d OOB for strategy len %d. Key: %s",
+                worker_id,
                 i,
                 len(strategy),
                 infoset_key,
@@ -299,7 +339,8 @@ def _traverse_game_for_worker(
             state_delta, undo_info = game_state.apply_action(action)
             if not callable(undo_info):
                 logger.error(
-                    "Worker: apply_action for %s returned invalid undo_info. State:%s",
+                    "Worker %d: apply_action for %s returned invalid undo_info. State:%s",
+                    worker_id,
                     action,
                     game_state,
                 )
@@ -309,7 +350,8 @@ def _traverse_game_for_worker(
 
         except Exception as apply_err:
             logger.error(
-                "Worker: Error applying action %s P%d depth %d: %s. State:%s",
+                "Worker %d: Error applying action %s P%d depth %d: %s. State:%s",
+                worker_id,
                 action,
                 player,
                 depth,
@@ -337,7 +379,8 @@ def _traverse_game_for_worker(
                 cloned_agent.update(player_specific_obs)
             except Exception as e_update:
                 logger.error(
-                    "Worker: Error updating agent state P%d after action %s depth %d: %s. State(post-action):%s Obs:%s",
+                    "Worker %d: Error updating agent state P%d after action %s depth %d: %s. State(post-action):%s Obs:%s",
+                    worker_id,
                     agent_idx,
                     action,
                     depth,
@@ -357,7 +400,8 @@ def _traverse_game_for_worker(
                     undo_info()
                 except Exception as undo_e:
                     logger.error(
-                        "Worker: Error undoing after agent update fail: %s",
+                        "Worker %d: Error undoing after agent update fail: %s",
+                        worker_id,
                         undo_e,
                         exc_info=True,
                     )
@@ -383,11 +427,14 @@ def _traverse_game_for_worker(
                 local_reach_prob_updates,
                 depth + 1,  # Increment depth
                 worker_stats,  # Pass stats object along
+                progress_queue,  # Pass progress queue along
+                worker_id,  # Pass worker id along
             )
             action_utilities[i] = recursive_utilities
         except Exception as recursive_err:
             logger.error(
-                "Worker: Error in recursive call action %s depth %d: %s. State:%s",
+                "Worker %d: Error in recursive call action %s depth %d: %s. State:%s",
+                worker_id,
                 action,
                 depth,
                 recursive_err,
@@ -404,7 +451,8 @@ def _traverse_game_for_worker(
                 # This is computationally expensive, rely on logging/testing for now.
             except Exception as undo_e:
                 logger.error(
-                    "Worker: Error undoing action %s depth %d: %s. State likely corrupt. Returning zero.",
+                    "Worker %d: Error undoing action %s depth %d: %s. State likely corrupt. Returning zero.",
+                    worker_id,
                     action,
                     depth,
                     undo_e,
@@ -419,7 +467,7 @@ def _traverse_game_for_worker(
     valid_strategy_for_value_calc = (
         strategy
         if len(strategy) == num_actions
-        else np.ones(num_actions) / num_actions if num_actions > 0 else np.array([])
+        else (np.ones(num_actions) / num_actions if num_actions > 0 else np.array([]))
     )
     if len(valid_strategy_for_value_calc) > 0:
         node_value = np.sum(
@@ -446,7 +494,8 @@ def _traverse_game_for_worker(
                 local_regret_updates[infoset_key] += update_weight * instantaneous_regret
             else:
                 logger.error(
-                    "Worker: Regret calculation shape mismatch. Inst: %s, Local: %s. Key: %s",
+                    "Worker %d: Regret calculation shape mismatch. Inst: %s, Local: %s. Key: %s",
+                    worker_id,
                     instantaneous_regret.shape,
                     local_regret_updates[infoset_key].shape,
                     infoset_key,
@@ -460,13 +509,16 @@ def run_cfr_simulation_worker(
         int,
         Config,
         RegretSnapshotDict,
-        Optional[LogQueue],
-        int,  # Pass LogQueue, worker_id
+        Optional[GenericQueue],
+        Optional[ProgressQueue],
+        int,
     ],
 ) -> Optional[WorkerResult]:  # Return the WorkerResult dataclass
     """Top-level function executed by each worker process."""
     # !!! IMPORTANT: Setup logging FIRST using the queue !!!
-    iteration, config, regret_sum_snapshot, log_queue, worker_id = worker_args
+    iteration, config, regret_sum_snapshot, log_queue, progress_queue, worker_id = (
+        worker_args  # Unpack args
+    )
     logger = None  # Initialize logger variable
     try:
         worker_root_logger = logging.getLogger()  # Get root logger for this process
@@ -486,7 +538,7 @@ def run_cfr_simulation_worker(
                 worker_root_logger.setLevel(logging.DEBUG)
                 # Now safe to get and use child loggers
                 logger = logging.getLogger(__name__)  # Assign logger here
-                logger.info("Worker %d logging initialized via QueueHandler.", worker_id)
+                # logger.info("Worker %d logging initialized via QueueHandler.", worker_id) # Reduced noise
         else:
             # Fallback or error handling if queue is not provided
             if (
@@ -502,7 +554,7 @@ def run_cfr_simulation_worker(
         # This inner try...except catches errors within the simulation logic
         try:
             worker_stats = WorkerStats()  # Initialize stats for this run
-            logger.debug("Worker %d starting iteration %d.", worker_id, iteration)
+            # logger.debug("Worker %d starting iteration %d.", worker_id, iteration) # Reduced noise
 
             # --- Initialize Game and Agent States ---
             game_state = CambiaGameState(house_rules=config.cambia_rules)
@@ -574,15 +626,11 @@ def run_cfr_simulation_worker(
                 local_reach_prob_updates=local_reach_prob_updates,
                 depth=0,
                 worker_stats=worker_stats,  # Pass stats object
+                progress_queue=progress_queue,  # Pass progress queue
+                worker_id=worker_id,  # Pass worker id
             )
 
-            logger.debug(
-                "Worker %d finished iteration %d. MaxDepth: %d, Nodes: %d",
-                worker_id,
-                iteration,
-                worker_stats.max_depth,
-                worker_stats.nodes_visited,
-            )
+            # logger.debug("Worker %d finished iteration %d. MaxDepth: %d, Nodes: %d", worker_id, iteration, worker_stats.max_depth, worker_stats.nodes_visited) # Reduced noise
             # Return WorkerResult dataclass instance
             return WorkerResult(
                 regret_updates=dict(local_regret_updates),

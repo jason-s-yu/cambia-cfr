@@ -12,7 +12,9 @@ import numpy as np
 from ..analysis_tools import AnalysisTools
 from ..config import Config
 from ..constants import NUM_PLAYERS
-from ..utils import PolicyDict, ReachProbDict, LogQueue
+
+# Use GenericQueue type alias or keep LogQueue if naming is clear
+from ..utils import PolicyDict, ReachProbDict, LogQueue as GenericQueue
 
 # Import mixins
 from .data_manager_mixin import CFRDataManagerMixin
@@ -35,7 +37,8 @@ class CFRTrainer(
         config: Config,
         run_log_dir: Optional[str] = None,
         shutdown_event: Optional[threading.Event] = None,
-        log_queue: Optional[LogQueue] = None,
+        log_queue: Optional[GenericQueue] = None,  # Use GenericQueue
+        progress_queue: Optional[GenericQueue] = None,
     ):
         """
         Initializes the CFRTrainer.
@@ -45,10 +48,12 @@ class CFRTrainer(
             run_log_dir: Directory for logs specific to this run.
             shutdown_event: Threading event to signal graceful shutdown.
             log_queue: Multiprocessing queue for worker logging.
+            progress_queue: Multiprocessing queue for worker progress updates.
         """
         self.config = config
         self.num_players = NUM_PLAYERS
         self.log_queue = log_queue
+        self.progress_queue = progress_queue  # Store progress queue
 
         # Initialize data structures (managed primarily by CFRDataManagerMixin)
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
