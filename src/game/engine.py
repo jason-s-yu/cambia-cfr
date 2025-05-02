@@ -21,7 +21,6 @@ from ._ability_mixin import AbilityMixin
 # Use relative imports for modules outside the 'game' package but within 'src'
 from ..card import Card, create_standard_deck
 from ..constants import (
-    # Keep only constants actually used in *this* file after refactoring
     NUM_PLAYERS,
     GameAction,
     ActionDrawStockpile,

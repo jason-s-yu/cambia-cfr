@@ -8,13 +8,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-# Assuming analysis_tools.py is in the parent directory relative to cfr
 from ..analysis_tools import AnalysisTools
 from ..config import Config
 from ..constants import NUM_PLAYERS
 
-# Use GenericQueue type alias or keep LogQueue if naming is clear
-from ..utils import PolicyDict, ReachProbDict, LogQueue as GenericQueue
+from ..utils import PolicyDict, ReachProbDict, LogQueue as ProgressQueue
 
 # Import mixins
 from .data_manager_mixin import CFRDataManagerMixin
@@ -36,9 +34,9 @@ class CFRTrainer(
         self,
         config: Config,
         run_log_dir: Optional[str] = None,
+        run_timestamp: Optional[str] = None,
         shutdown_event: Optional[threading.Event] = None,
-        log_queue: Optional[GenericQueue] = None,  # Use GenericQueue
-        progress_queue: Optional[GenericQueue] = None,
+        progress_queue: Optional[ProgressQueue] = None,
     ):
         """
         Initializes the CFRTrainer.
@@ -46,14 +44,13 @@ class CFRTrainer(
         Args:
             config: Configuration object.
             run_log_dir: Directory for logs specific to this run.
+            run_timestamp: Timestamp string for this run.
             shutdown_event: Threading event to signal graceful shutdown.
-            log_queue: Multiprocessing queue for worker logging.
             progress_queue: Multiprocessing queue for worker progress updates.
         """
         self.config = config
         self.num_players = NUM_PLAYERS
-        self.log_queue = log_queue
-        self.progress_queue = progress_queue  # Store progress queue
+        self.progress_queue = progress_queue
 
         # Initialize data structures (managed primarily by CFRDataManagerMixin)
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -68,10 +65,13 @@ class CFRTrainer(
         self.exploitability_results: List[Tuple[int, float]] = []
 
         # Analysis and Logging
+        # Use run_log_dir if provided, fallback to config dir
         analysis_log_dir = run_log_dir if run_log_dir else config.logging.log_dir
         analysis_log_prefix = config.logging.log_file_prefix
+        # Pass timestamp to analysis tools if needed (e.g. for naming output files)
         self.analysis = AnalysisTools(config, analysis_log_dir, analysis_log_prefix)
         self.run_log_dir = run_log_dir
+        self.run_timestamp = run_timestamp
 
         # Internal state for progress display/debugging
         self.max_depth_this_iter = 0
@@ -83,3 +83,5 @@ class CFRTrainer(
 
         logger.info("CFRTrainer initialized with %d players.", self.num_players)
         logger.debug("Config loaded: %s", self.config)
+        logger.debug("Run Log Directory: %s", self.run_log_dir)
+        logger.debug("Run Timestamp: %s", self.run_timestamp)

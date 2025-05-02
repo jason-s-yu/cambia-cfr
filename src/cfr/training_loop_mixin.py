@@ -8,15 +8,15 @@ import time
 import copy
 import multiprocessing
 import multiprocessing.pool
-import queue  # For queue.Empty
+import queue
+import os
 from typing import Any, Callable, Optional, List, Tuple, Dict, Union
 
 from tqdm import tqdm
 
 from ..analysis_tools import AnalysisTools
 
-# Adjust import if GenericQueue alias is used elsewhere
-from ..utils import WorkerResult, PolicyDict, LogQueue as GenericQueue, WorkerStats
+from ..utils import WorkerResult, PolicyDict, WorkerStats, LogQueue as ProgressQueue
 from ..config import Config
 from .exceptions import GracefulShutdownException
 from .worker import run_cfr_simulation_worker
@@ -24,8 +24,7 @@ from .worker import run_cfr_simulation_worker
 
 logger = logging.getLogger(__name__)
 
-# Timeout for waiting on worker pool join during shutdown (seconds)
-# Currently not used as pool.join doesn't support timeout
+# Timeout for waiting on worker pool join during shutdown (seconds) - Not used directly
 # POOL_JOIN_TIMEOUT = 10.0
 
 # Define a type for worker status storage
@@ -35,25 +34,26 @@ WorkerStatusInfo = Union[str, WorkerStats, Tuple[str, int, int]]
 class CFRTrainingLoopMixin:
     """Handles the overall CFR+ training loop, progress, and scheduling, supporting parallelism."""
 
-    # Attributes expected to be initialized in the main class's __init__
+    # Attributes expected from main class
     config: Config
     analysis: "AnalysisTools"
     shutdown_event: "threading.Event"
     current_iteration: int
     exploitability_results: List[Tuple[int, float]]
     regret_sum: PolicyDict
-    log_queue: Optional[GenericQueue]
-    progress_queue: Optional[GenericQueue]
-    # Attributes expected from CFRDataManagerMixin
+    progress_queue: Optional[ProgressQueue]
+    run_log_dir: Optional[str]
+    run_timestamp: Optional[str]
+    # Attributes from CFRDataManagerMixin
     load_data: Callable[..., Any]
     save_data: Callable[..., Any]
     _merge_local_updates: Callable[[List[Optional[WorkerResult]]], None]
     compute_average_strategy: Callable[..., Optional[PolicyDict]]
-    # Internal state for display
+    # Internal state
     _last_exploit_str: str = "N/A"
-    _total_infosets_str: str = "0"
-    # Store worker status: str, WorkerStats (final), or Tuple[str, depth, nodes] (live)
+    _total_infosets_str: str = "0k"  # Initialize with 'k' notation
     _worker_statuses: Dict[int, WorkerStatusInfo] = {}
+    _total_run_time_start: float = 0.0  # Track start time
 
     def train(self, num_iterations: Optional[int] = None):
         """Runs the main CFR+ training loop, potentially in parallel."""
@@ -66,8 +66,9 @@ class CFRTrainingLoopMixin:
 
         exploitability_interval = self.config.cfr_training.exploitability_interval
         num_workers = self.config.cfr_training.num_workers
-        log_queue = self.log_queue  # Get queue from instance
-        progress_queue = self.progress_queue  # Get progress queue
+        progress_queue = self.progress_queue
+        run_log_dir = self.run_log_dir
+        run_timestamp = self.run_timestamp
 
         logger.info(
             "Starting CFR+ training from iteration %d up to %d (%d workers).",
@@ -79,13 +80,14 @@ class CFRTrainingLoopMixin:
             logger.warning("Number of iterations to run must be positive.")
             return
 
-        loop_start_time = time.time()
-        pool: Optional[multiprocessing.pool.Pool] = None  # Keep track of the pool object
+        self._total_run_time_start = time.time()
+        pool: Optional[multiprocessing.pool.Pool] = None
         self._worker_statuses = {i: "Idle" for i in range(num_workers)}
-        progress_bar: Optional[tqdm] = None  # Initialize progress bar reference
+        # Update total infosets display initially
+        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+        progress_bar: Optional[tqdm] = None
 
         try:
-            # Use a single tqdm bar for overall progress
             progress_bar = tqdm(
                 range(start_iter_num, end_iter_num + 1),
                 desc=f"CFR+ Training ({num_workers}W)",
@@ -96,11 +98,12 @@ class CFRTrainingLoopMixin:
                 leave=True,
                 file=sys.stderr,
             )
+            # Use kNodes in initial postfix
             progress_bar.set_postfix(
                 {
                     "LastT": "N/A",
                     "Expl": self._last_exploit_str,
-                    "Nodes": self._total_infosets_str,
+                    "kNodes": self._total_infosets_str,
                 },
                 refresh=False,
             )
@@ -112,10 +115,11 @@ class CFRTrainingLoopMixin:
 
                 iter_start_time = time.time()
                 self.current_iteration = t
-                # Reset worker statuses: Use tuple ("Starting", 0, 0) for live update structure
                 self._worker_statuses = {
                     i: ("Starting", 0, 0) for i in range(num_workers)
                 }
+                # Update total infoset count for display before starting iteration logic
+                self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
                 self._update_status_display(progress_bar, t, end_iter_num)
 
                 try:
@@ -129,12 +133,10 @@ class CFRTrainingLoopMixin:
                         f"Could not prepare regret snapshot for iter {t}"
                     ) from e
 
-                # Pass progress_queue to worker args
                 worker_base_args = (
                     t,
                     self.config,
                     regret_snapshot,
-                    log_queue,
                     progress_queue,
                 )
                 results: List[Optional[WorkerResult]] = [None] * num_workers
@@ -142,12 +144,11 @@ class CFRTrainingLoopMixin:
                 completed_worker_count = 0
 
                 if num_workers == 1:
-                    self._worker_statuses[0] = ("Running", 0, 0)  # Initial running status
+                    # Sequential execution
+                    self._worker_statuses[0] = ("Running", 0, 0)
                     self._update_status_display(progress_bar, t, end_iter_num)
                     try:
-                        worker_args = worker_base_args + (0,)  # worker_id = 0
-                        # No easy way to get live updates in sequential mode without major refactor
-                        # We'll just show the final stats after completion
+                        worker_args = worker_base_args + (0, run_log_dir, run_timestamp)
                         result: Optional[WorkerResult] = run_cfr_simulation_worker(
                             worker_args
                         )
@@ -157,7 +158,7 @@ class CFRTrainingLoopMixin:
                             sim_failed_count += 1
                             self._worker_statuses[0] = "Failed"
                         elif isinstance(result, WorkerResult):
-                            self._worker_statuses[0] = result.stats  # Final stats
+                            self._worker_statuses[0] = result.stats
                         else:
                             logger.error(
                                 "Worker 0 returned unexpected type: %s", type(result)
@@ -170,9 +171,10 @@ class CFRTrainingLoopMixin:
                         self._worker_statuses[0] = "Error"
                     self._update_status_display(progress_bar, t, end_iter_num)
 
-                else:  # Parallel execution
+                else:
+                    # Parallel execution
                     worker_args_list = [
-                        worker_base_args + (worker_id,)
+                        worker_base_args + (worker_id, run_log_dir, run_timestamp)
                         for worker_id in range(num_workers)
                     ]
                     async_results: Dict[int, multiprocessing.pool.AsyncResult] = {}
@@ -184,35 +186,29 @@ class CFRTrainingLoopMixin:
                         self._update_status_display(progress_bar, t, end_iter_num)
 
                         pool = multiprocessing.Pool(processes=num_workers)
-
                         for worker_id, args in enumerate(worker_args_list):
                             async_results[worker_id] = pool.apply_async(
                                 run_cfr_simulation_worker, (args,)
                             )
-                            self._worker_statuses[worker_id] = (
-                                "Running",
-                                0,
-                                0,
-                            )  # Initial running status
+                            self._worker_statuses[worker_id] = ("Running", 0, 0)
 
                         pool.close()
                         self._update_status_display(progress_bar, t, end_iter_num)
 
-                        # --- Result and Progress Collection Loop ---
+                        # Result and Progress Collection Loop
                         while completed_worker_count < num_workers:
                             if self.shutdown_event.is_set():
                                 raise GracefulShutdownException(
                                     "Shutdown during worker execution"
                                 )
 
-                            # --- Check for Progress Updates ---
+                            # Check for Progress Updates
                             if progress_queue:
                                 try:
-                                    while True:  # Process all available updates
+                                    while True:
                                         prog_w_id, prog_d, prog_n = (
                                             progress_queue.get_nowait()
                                         )
-                                        # Update status only if worker is still considered running
                                         current_status = self._worker_statuses.get(
                                             prog_w_id
                                         )
@@ -226,26 +222,24 @@ class CFRTrainingLoopMixin:
                                                 prog_n,
                                             )
                                 except queue.Empty:
-                                    pass  # No more progress updates for now
+                                    pass
                                 except Exception as prog_e:
                                     logger.error(
                                         "Error reading progress queue: %s", prog_e
                                     )
 
-                            # --- Check for Completed Workers ---
+                            # Check for Completed Workers
                             ready_workers = [
-                                worker_id
-                                for worker_id, res in async_results.items()
+                                wid
+                                for wid, res in async_results.items()
                                 if res and res.ready()
                             ]
-
                             for worker_id in ready_workers:
                                 if worker_id not in async_results:
                                     continue
                                 async_res = async_results.pop(worker_id, None)
                                 if async_res is None:
                                     continue
-
                                 try:
                                     result: Optional[WorkerResult] = async_res.get(
                                         timeout=0.1
@@ -258,7 +252,6 @@ class CFRTrainingLoopMixin:
                                             f"Failed (Iter {t})"
                                         )
                                     elif isinstance(result, WorkerResult):
-                                        # Store final WorkerStats object upon completion
                                         self._worker_statuses[worker_id] = result.stats
                                     else:
                                         logger.error(
@@ -275,12 +268,6 @@ class CFRTrainingLoopMixin:
                                     continue
                                 except Exception as pool_e:
                                     logger.error(
-                                        "!!! Exception type '%s' fetching result worker %d iter %d.",
-                                        type(pool_e).__name__,
-                                        worker_id,
-                                        t,
-                                    )
-                                    logger.error(
                                         "Error fetching result worker %d iter %d: %s",
                                         worker_id,
                                         t,
@@ -294,11 +281,9 @@ class CFRTrainingLoopMixin:
                                         f"Error ({type(pool_e).__name__})"
                                     )
 
-                            # Update display after checking progress and completion
                             self._update_status_display(progress_bar, t, end_iter_num)
-
                             if completed_worker_count < num_workers:
-                                time.sleep(0.1)  # Avoid busy-waiting
+                                time.sleep(0.1)
 
                     except GracefulShutdownException:
                         raise
@@ -310,13 +295,12 @@ class CFRTrainingLoopMixin:
                         raise e
 
                 # --- Process Results (Merge) ---
-                # (Merge logic remains the same)
                 if sim_failed_count == num_workers and num_workers > 0:
                     progress_bar.set_postfix(
                         {
                             "LastT": "N/A",
                             "Expl": self._last_exploit_str,
-                            "Nodes": self._total_infosets_str,
+                            "kNodes": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -325,7 +309,6 @@ class CFRTrainingLoopMixin:
                         "All simulations failed for iteration %d. Skipping merge.", t
                     )
                     continue
-
                 if sim_failed_count > 0:
                     logger.warning(
                         "%d/%d worker sims failed for iter %d.",
@@ -339,7 +322,7 @@ class CFRTrainingLoopMixin:
                             {
                                 "LastT": "N/A",
                                 "Expl": self._last_exploit_str,
-                                "Nodes": self._total_infosets_str,
+                                "kNodes": self._total_infosets_str,
                             },
                             refresh=False,
                         )
@@ -355,14 +338,14 @@ class CFRTrainingLoopMixin:
                     {
                         "LastT": "N/A",
                         "Expl": self._last_exploit_str,
-                        "Nodes": self._total_infosets_str,
+                        "kNodes": self._total_infosets_str,
                     },
                     refresh=False,
                 )
                 progress_bar.set_postfix_str("Merging...", refresh=False)
                 merge_start_time = time.time()
                 try:
-                    self._merge_local_updates(valid_results)
+                    self._merge_local_updates(valid_results)  # type: ignore
                     merge_time = time.time() - merge_start_time
                     logger.debug("Iter %d merge took %.3fs", t, merge_time)
                 except Exception:
@@ -371,7 +354,7 @@ class CFRTrainingLoopMixin:
                         {
                             "LastT": "N/A",
                             "Expl": self._last_exploit_str,
-                            "Nodes": self._total_infosets_str,
+                            "kNodes": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -379,9 +362,9 @@ class CFRTrainingLoopMixin:
                     continue
 
                 # --- Iteration Completed ---
-                # (Rest of iteration completion logic remains the same)
                 iter_time = time.time() - iter_start_time
-                self._total_infosets_str = f"{len(self.regret_sum):,}"
+                # Update total infoset count string AFTER merge for the postfix
+                self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
 
                 exploit_calc_time = 0.0
                 if exploitability_interval > 0 and t % exploitability_interval == 0:
@@ -389,7 +372,7 @@ class CFRTrainingLoopMixin:
                         {
                             "LastT": f"{iter_time:.2f}s",
                             "Expl": self._last_exploit_str,
-                            "Nodes": self._total_infosets_str,
+                            "kNodes": self._total_infosets_str,
                         },
                         refresh=False,
                     )
@@ -402,7 +385,7 @@ class CFRTrainingLoopMixin:
                             {
                                 "LastT": f"{iter_time:.2f}s",
                                 "Expl": self._last_exploit_str,
-                                "Nodes": self._total_infosets_str,
+                                "kNodes": self._total_infosets_str,
                             },
                             refresh=False,
                         )
@@ -426,28 +409,26 @@ class CFRTrainingLoopMixin:
                         )
                         self._last_exploit_str = "N/A (Avg Err)"
 
+                # Update postfix with final iter time and potentially new exploitability
                 postfix_dict = {
                     "LastT": f"{iter_time:.2f}s",
                     "Expl": self._last_exploit_str,
-                    "Nodes": self._total_infosets_str,
+                    "kNodes": self._total_infosets_str,
                 }
                 progress_bar.set_postfix(postfix_dict, refresh=True)
-                self._update_status_display(
-                    progress_bar, t, end_iter_num
-                )  # Final update for iter
+                # Final status display update for this iteration
+                self._update_status_display(progress_bar, t, end_iter_num)
 
                 if t % self.config.cfr_training.save_interval == 0:
                     progress_bar.set_postfix(postfix_dict, refresh=False)
                     progress_bar.set_postfix_str("Saving...", refresh=True)
-                    self.save_data()
-                    progress_bar.set_postfix(postfix_dict, refresh=True)
+                    self.save_data()  # type: ignore
+                    progress_bar.set_postfix(
+                        postfix_dict, refresh=True
+                    )  # Restore normal postfix
 
         # --- Main Loop Exception Handling ---
-        # (Exception handling logic remains the same, including pool termination)
-        except (
-            GracefulShutdownException,
-            KeyboardInterrupt,
-        ) as shutdown_exc:
+        except (GracefulShutdownException, KeyboardInterrupt) as shutdown_exc:
             exception_type = type(shutdown_exc).__name__
             logger.warning(
                 "Shutdown/Interrupt (%s) caught in train loop. Terminating pool and saving progress...",
@@ -457,9 +438,6 @@ class CFRTrainingLoopMixin:
                 logger.warning("Terminating worker pool due to %s...", exception_type)
                 pool.terminate()
                 try:
-                    logger.debug(
-                        "Joining worker pool after %s terminate...", exception_type
-                    )
                     pool.join()
                     logger.debug("Worker pool joined after %s.", exception_type)
                 except Exception as join_e:
@@ -478,11 +456,7 @@ class CFRTrainingLoopMixin:
                 self.current_iteration = completed_iter_to_save
                 try:
                     self.save_data()
-                    logger.info(
-                        "Progress saved successfully after %s (state as of iter %d completion).",
-                        exception_type,
-                        self.current_iteration,
-                    )
+                    logger.info("Progress saved successfully after %s (state as of iter %d completion).", exception_type, self.current_iteration)  # type: ignore
                 except Exception as save_e:
                     logger.error(
                         "Failed to save progress during shutdown (%s): %s",
@@ -490,7 +464,9 @@ class CFRTrainingLoopMixin:
                         save_e,
                     )
                 finally:
-                    self.current_iteration = saved_iter
+                    self.current_iteration = (
+                        saved_iter  # Restore for potential summary write
+                    )
             else:
                 logger.warning(
                     "Shutdown (%s) before first new iteration completed or loaded. No progress to save.",
@@ -498,14 +474,13 @@ class CFRTrainingLoopMixin:
                 )
             raise GracefulShutdownException(
                 f"{exception_type} processed"
-            ) from shutdown_exc
+            ) from shutdown_exc  # Re-raise specific exception
         except Exception as main_loop_e:
             logger.exception("Unhandled exception in main training loop:")
             if num_workers > 1 and pool is not None:
                 logger.warning("Terminating worker pool due to unhandled error...")
                 pool.terminate()
                 try:
-                    logger.debug("Joining worker pool after error terminate...")
                     pool.join()
                     logger.debug("Worker pool joined after error.")
                 except Exception as join_e:
@@ -525,17 +500,16 @@ class CFRTrainingLoopMixin:
                 self.current_iteration = completed_iter_to_save
                 try:
                     self.save_data()
-                    logger.info(
-                        "Emergency save completed for iteration %d.",
-                        self.current_iteration,
-                    )
+                    logger.info("Emergency save completed for iteration %d.", self.current_iteration)  # type: ignore
                 except Exception as save_e:
                     logger.error("Emergency save failed: %s", save_e)
                 finally:
-                    self.current_iteration = saved_iter
+                    self.current_iteration = (
+                        saved_iter  # Restore for potential summary write
+                    )
             raise main_loop_e
         finally:
-            # Final pool cleanup just in case
+            # Final pool cleanup
             if num_workers > 1 and pool is not None:
                 logger.warning(
                     "Terminating/Joining pool in main finally block (unexpected loop exit?)."
@@ -552,17 +526,16 @@ class CFRTrainingLoopMixin:
             # Cleanup progress bar
             if progress_bar:
                 progress_bar.close()
-            num_status_lines = num_workers + 2 if num_workers > 0 else 0
-            if sys.stderr.isatty() and num_status_lines > 0:
-                pass
+            # Write summary file AFTER potential save in finally block
+            self._write_run_summary()
 
         # --- Training Loop Finished Normally ---
-        # (Final summary, exploitability, save logic remains the same)
         end_time = time.time()
         total_completed_in_run = self.current_iteration - last_completed_iteration
         logger.info("Training loop finished %d iterations.", total_completed_in_run)
         logger.info(
-            "Total training time this run: %.2f seconds.", end_time - loop_start_time
+            "Total training time this run: %.2f seconds.",
+            end_time - self._total_run_time_start,
         )
         logger.info(
             "Current iteration count (last completed): %d", self.current_iteration
@@ -582,6 +555,7 @@ class CFRTrainingLoopMixin:
                     (self.current_iteration, final_exploit)
                 )
             else:
+                # Update last entry if calculation happened at the very end
                 self.exploitability_results[-1] = (self.current_iteration, final_exploit)
             logger.info("Final exploitability: %.4f", final_exploit)
             self._last_exploit_str = (
@@ -590,10 +564,16 @@ class CFRTrainingLoopMixin:
         else:
             logger.warning("Could not compute final average strategy.")
             self._last_exploit_str = "N/A (Avg Err)"
-        final_status_msg = f"\nFinished. Iter: {self.current_iteration} | Nodes: {self._total_infosets_str} | Expl: {self._last_exploit_str}"
-        print(final_status_msg, file=sys.stderr)
-        self.save_data()
+
+        # Update final kNodes count
+        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
+
+        # Save final data and write summary (Summary write now happens in finally too)
+        self.save_data()  # type: ignore
         logger.info("Final average strategy and data saved.")
+
+        final_status_msg = f"\nFinished. Iter: {self.current_iteration} | kNodes: {self._total_infosets_str} | Expl: {self._last_exploit_str}"
+        print(final_status_msg, file=sys.stderr)
 
     def _update_status_display(
         self, progress_bar: Optional[tqdm], current_iter: int, total_iter: int
@@ -602,21 +582,22 @@ class CFRTrainingLoopMixin:
         if not progress_bar:
             return
 
-        # --- Update postfix for the main bar ---
+        # --- Update postfix for the main bar (using kNodes) ---
         last_t_value = "N/A"
         if isinstance(progress_bar.postfix, dict):
             last_t_value = progress_bar.postfix.get("LastT", "N/A")
         elif isinstance(progress_bar.postfix, str):
-            last_t_value = "N/A"
-
+            last_t_value = "N/A"  # Should not happen with dict usage
+        # Recalculate kNodes string based on current regret_sum size
+        self._total_infosets_str = f"{len(self.regret_sum) // 1000}k"
         current_postfix_dict = {
             "LastT": last_t_value,
             "Expl": self._last_exploit_str,
-            "Nodes": self._total_infosets_str,
+            "kNodes": self._total_infosets_str,
         }
         progress_bar.set_postfix(current_postfix_dict, refresh=False)
 
-        # --- Prepare status lines for workers ---
+        # --- Prepare status lines for workers (using k for nodes) ---
         status_lines = []
         num_workers = self.config.cfr_training.num_workers
         if num_workers > 0:
@@ -626,20 +607,19 @@ class CFRTrainingLoopMixin:
             for i in range(num_workers):
                 status_info = self._worker_statuses.get(i, "Unknown")
                 status_str = ""
-                # --- NEW: Format based on status_info type ---
                 if isinstance(status_info, WorkerStats):
-                    # Final stats after completion
-                    status_str = f"Done (D:{status_info.max_depth}, N:{status_info.nodes_visited:,})"
+                    # Format final stats with 'k' for nodes
+                    nodes_k = status_info.nodes_visited // 1000
+                    status_str = f"Done (D:{status_info.max_depth}, N:{nodes_k}k)"
                 elif isinstance(status_info, tuple) and len(status_info) == 3:
-                    # Live update: ("Running", depth, nodes)
+                    # Format live stats with 'k' for nodes
                     state, depth, nodes = status_info
-                    status_str = f"{state} (D:{depth}, N:{nodes:,})"
+                    nodes_k = nodes // 1000
+                    status_str = f"{state} (D:{depth}, N:{nodes_k}k)"
                 elif isinstance(status_info, str):
-                    # Simple string status (Idle, Failed, Error, Queued, Starting)
                     status_str = status_info
                 else:
                     status_str = f"Unknown State ({type(status_info).__name__})"
-                # --- END NEW ---
 
                 line = f" W{i:<2}: {status_str}"
                 status_lines.append(line)
@@ -648,6 +628,7 @@ class CFRTrainingLoopMixin:
 
             clear_lines = num_workers + 2
             if sys.stderr.isatty():
+                # Move cursor up, clear lines, move cursor up again
                 tqdm.write(
                     f"\033[{clear_lines}F\033[J\033[{clear_lines}F",
                     file=sys.stderr,
@@ -655,6 +636,101 @@ class CFRTrainingLoopMixin:
                 )
 
             status_block = "\n".join(status_lines)
-            tqdm.write(status_block, file=sys.stderr, end="\n")
+            tqdm.write(status_block, file=sys.stderr, end="\n")  # Write block and newline
 
         progress_bar.refresh()
+
+    def _write_run_summary(self):
+        """Writes a summary of the training run to the summary log file."""
+        if not self.run_log_dir or not self.run_timestamp:
+            logger.warning(
+                "Cannot write run summary: Missing run_log_dir or run_timestamp."
+            )
+            return
+
+        # Construct summary file path using the stored run details
+        summary_file_path = os.path.join(
+            self.run_log_dir,
+            f"{self.config.logging.log_file_prefix}_run_{self.run_timestamp}-summary.log",
+        )
+        logger.info("Writing run summary to: %s", summary_file_path)
+
+        try:
+            with open(summary_file_path, "w", encoding="utf-8") as f:
+                f.write("--- Cambia CFR+ Training Run Summary ---\n")
+                f.write(f"Run Timestamp: {self.run_timestamp}\n")
+                f.write(f"Run Directory: {self.run_log_dir}\n")
+                # Attempt to get config path if stored (might need modification)
+                config_path = getattr(
+                    self.config, "_source_path", "N/A"
+                )  # Example attribute name
+                f.write(f"Config File: {config_path}\n")
+                f.write(f"Total Iterations Completed: {self.current_iteration}\n")
+                total_time = (
+                    time.time() - self._total_run_time_start
+                    if self._total_run_time_start > 0
+                    else 0
+                )
+                f.write(f"Total Run Time: {total_time:.2f} seconds\n")
+                f.write(f"Final Exploitability: {self._last_exploit_str}\n")
+                # Write total infosets with full number in summary file
+                f.write(f"Total Unique Infosets: {len(self.regret_sum):,}\n")
+                f.write("\n--- Worker Summary ---\n")
+
+                num_workers = self.config.cfr_training.num_workers
+                if num_workers > 0:
+                    total_nodes = 0
+                    max_depth_overall = 0
+                    completed_workers = 0
+                    failed_workers = 0
+                    error_workers = 0
+
+                    for i in range(num_workers):
+                        status_info = self._worker_statuses.get(i)
+                        status_line = f"Worker {i}: "
+                        if isinstance(status_info, WorkerStats):
+                            # Write full node count in summary file
+                            status_line += f"Completed (Max Depth: {status_info.max_depth}, Nodes Visited: {status_info.nodes_visited:,})"
+                            total_nodes += status_info.nodes_visited
+                            max_depth_overall = max(
+                                max_depth_overall, status_info.max_depth
+                            )
+                            completed_workers += 1
+                        elif isinstance(status_info, str):
+                            status_line += status_info  # e.g., "Failed", "Error", "Idle"
+                            if "Fail" in status_info:
+                                failed_workers += 1
+                            if "Error" in status_info:
+                                error_workers += 1
+                        else:
+                            status_line += (
+                                f"Unknown Final State ({type(status_info).__name__})"
+                            )
+                            error_workers += 1  # Count unknowns as errors
+                        f.write(status_line + "\n")
+
+                    f.write("\n--- Aggregated Worker Stats ---\n")
+                    f.write(f"Completed Workers: {completed_workers}\n")
+                    f.write(f"Failed Workers: {failed_workers}\n")
+                    f.write(f"Error Workers: {error_workers}\n")
+                    f.write(
+                        f"Total Nodes Visited (Sum Across Completed Workers): {total_nodes:,}\n"
+                    )
+                    f.write(
+                        f"Max Depth Reached (Overall Across Completed Workers): {max_depth_overall}\n"
+                    )
+                else:  # Sequential
+                    f.write("Sequential execution (1 worker).\n")
+                    status_info = self._worker_statuses.get(0)
+                    if isinstance(status_info, WorkerStats):
+                        f.write(f"  Final Status: Completed\n")
+                        f.write(f"  Max Depth: {status_info.max_depth}\n")
+                        f.write(f"  Nodes Visited: {status_info.nodes_visited:,}\n")
+                    elif isinstance(status_info, str):
+                        f.write(f"  Final Status: {status_info}\n")
+
+                f.write("\n--- End Summary ---\n")
+        except IOError as e:
+            logger.error("Failed to write run summary file: %s", e)
+        except Exception as e:
+            logger.exception("Unexpected error writing run summary:")

@@ -8,28 +8,22 @@ import sys
 import signal
 import threading
 import multiprocessing
-import multiprocessing.managers  # Import managers submodule
-import time  # Import time for potential sleep
-from typing import List, Optional
+
+from typing import List, Optional, Tuple
 from tqdm import tqdm
 
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import load_config
 from .cfr.trainer import CFRTrainer
 
-# Modify LogQueue Type Alias if necessary, or keep using it for both queues
-from .utils import LogQueue as GenericQueue
-from .cfr.exceptions import GracefulShutdownException  # Import exception
+from .utils import LogQueue as ProgressQueue
+from .cfr.exceptions import GracefulShutdownException
 
-# Global logger instance (initialized after setup)
+# Global logger instance
 logger = logging.getLogger(__name__)
 
 # Shared event for graceful shutdown
 shutdown_event = threading.Event()
-# Global reference to the queue listener thread
-queue_listener: Optional[logging.handlers.QueueListener] = None
-# Global reference to the main process queue handler
-main_process_queue_handler: Optional[logging.handlers.QueueHandler] = None
 
 
 def handle_sigint(sig, frame):
@@ -49,18 +43,16 @@ class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Use file=sys.stderr for tqdm to avoid interfering with stdout pipes
-            # nolock=True might help slightly with threading, but main issue is elsewhere
-            tqdm.write(msg, file=sys.stderr)  # , nolock=True)
+            tqdm.write(msg, file=sys.stderr)  # nolock=True removed
             self.flush()
         except Exception:
             self.handleError(record)
 
 
-def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use GenericQueue
-    """Configures logging using a QueueListener for multiprocessing."""
-    global queue_listener, main_process_queue_handler  # Add main handler to globals
-
+def setup_logging(
+    config, verbose: bool
+) -> Optional[Tuple[str, str]]:  # Return tuple or None
+    """Configures logging directly for the main process."""
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
@@ -73,22 +65,21 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
 
     if not main_log_dir or not isinstance(main_log_dir, str):
         print(f"ERROR: Invalid log directory '{main_log_dir}'. Logging disabled.")
-        return None, None  # Return two Nones
+        return None
 
-    # --- Create Directories ---
+    # --- Create Run Directory ---
     try:
-        os.makedirs(main_log_dir, exist_ok=True)
-        run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H%M%S")
-        run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run-{run_timestamp}")
+        # Use underscores for timestamp format now
+        run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
+        run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run_{run_timestamp}")
         os.makedirs(run_log_dir, exist_ok=True)
     except OSError as e:
         print(
             f"ERROR: Could not create log directory '{run_log_dir or main_log_dir}': {e}. Logging disabled."
         )
-        return None, None  # Return two Nones
+        return None
 
-    # --- Create Handlers (for the main process/listener) ---
-    # Include process name in the format string
+    # --- Create Handlers (for the main process) ---
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)-8s - [%(processName)-20s] - %(name)-25s - %(message)s"
     )
@@ -96,7 +87,6 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
 
     # Console Handler
     if sys.stderr.isatty():
-        # Use Tqdm handler only if stderr is a TTY
         ch = TqdmLoggingHandler()
     else:
         ch = logging.StreamHandler(sys.stderr)
@@ -104,13 +94,16 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
     ch.setFormatter(formatter)
     handlers.append(ch)
 
-    # File Handler (Serial Rotating)
+    # Main Process File Handler (Serial Rotating)
     try:
-        base_log_pattern = os.path.join(run_log_dir, f"{log_prefix}_run-{run_timestamp}")
+        # Use "...-main.log" for the main process log file base pattern
+        main_log_pattern = os.path.join(
+            run_log_dir, f"{log_prefix}_run_{run_timestamp}-main"
+        )
         max_bytes = config.logging.log_max_bytes
         backup_count = config.logging.log_backup_count
         fh = SerialRotatingFileHandler(
-            base_log_pattern,
+            main_log_pattern,  # Pass base pattern without _NNN.log
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",
@@ -118,47 +111,33 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
         handlers.append(fh)
-        current_log_file = fh.baseFilename  # Get initial file name
+        main_log_file = fh.baseFilename  # Get initial file name
     except Exception as e:
-        print(f"ERROR: Could not set up serial rotating file logging: {e}")
-        current_log_file = "File logging disabled"
-
-    # --- Setup Queue Listener (uses the passed manager queue) ---
-    # Ensure queue_listener is stopped if it exists from a previous failed run
-    if queue_listener:
-        queue_listener.stop()
-
-    queue_listener = logging.handlers.QueueListener(
-        log_queue, *handlers, respect_handler_level=True
-    )
-    queue_listener.start()
+        print(f"ERROR: Could not set up main process file logging: {e}")
+        main_log_file = "File logging disabled"
 
     # --- Configure Root Logger (for the main process) ---
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    # Remove any previous handlers (especially important if run multiple times)
+    root_logger.setLevel(logging.DEBUG)  # Set root to lowest level
+    # Remove any previous handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
-    # Add a handler that directs logs *from the main process* to the queue
-    # Store reference to this specific handler
-    main_process_queue_handler = logging.handlers.QueueHandler(log_queue)
-    root_logger.addHandler(main_process_queue_handler)
+    # Add the configured handlers directly
+    for handler in handlers:
+        root_logger.addHandler(handler)
 
-    # --- Initial Log Messages (go through the queue) ---
-    # Get logger instance *after* handler is added
-    initial_logger = logging.getLogger(__name__)  # Use a local logger instance here
+    # --- Initial Log Messages ---
+    initial_logger = logging.getLogger(__name__)
     initial_logger.info("-" * 50)
-    initial_logger.info(
-        "Logging initialized via QueueListener for run: %s", run_timestamp
-    )
+    initial_logger.info("Logging initialized for run: %s", run_timestamp)
     initial_logger.info("Run Log Directory: %s", run_log_dir)
     initial_logger.info(
-        "Logging to File: %s (Level: %s)",
-        current_log_file,
+        "Main Log File: %s (Level: %s)",
+        main_log_file,
         logging.getLevelName(file_log_level),
     )
     initial_logger.info(
-        "Logging to Console: (Level: %s)", logging.getLevelName(console_log_level)
+        "Console Logging: (Level: %s)", logging.getLevelName(console_log_level)
     )
     initial_logger.info("Command: %s", " ".join(sys.argv))
     initial_logger.info("-" * 50)
@@ -168,7 +147,6 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
     try:
         absolute_run_log_dir = os.path.abspath(run_log_dir)
         if sys.platform == "win32":
-            # Use a simple marker file on Windows
             marker_path = latest_log_link_path + ".txt"
             if os.path.exists(marker_path):
                 os.remove(marker_path)
@@ -176,7 +154,6 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
                 f.write(f"Latest run directory: {absolute_run_log_dir}\n")
             initial_logger.info("Updated latest run marker file: %s", marker_path)
         else:
-            # Use symlink on POSIX systems
             if os.path.lexists(latest_log_link_path):
                 os.remove(latest_log_link_path)
             os.symlink(
@@ -189,15 +166,12 @@ def setup_logging(config, verbose: bool, log_queue: GenericQueue):  # Use Generi
     # Reduce Verbosity from Libraries
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("joblib").setLevel(logging.WARNING)
-    # Silence noisy matplotlib font messages if used later
     logging.getLogger("matplotlib.font_manager").setLevel(logging.INFO)
 
-    return run_log_dir, run_timestamp  # Return run dir and timestamp
+    return run_log_dir, run_timestamp  # Return dir and timestamp
 
 
 def main():
-    global queue_listener, main_process_queue_handler  # Access global handler ref
-
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(
         "--config",
@@ -229,24 +203,32 @@ def main():
         print("ERROR: Failed to load configuration. Exiting.")
         sys.exit(1)
 
-    # --- Explicitly Manage the Multiprocessing Manager ---
+    # --- Explicitly Manage the Multiprocessing Manager for ProgressQueue ---
     exit_code = 0
     manager: Optional[multiprocessing.managers.SyncManager] = None
+    progress_queue: Optional[ProgressQueue] = None
     try:
-        # Create and start the manager
-        manager = multiprocessing.Manager()
-        log_queue: GenericQueue = manager.Queue(-1)
-        # Create the new progress queue
-        progress_queue: GenericQueue = manager.Queue(-1)
+        if (
+            config.cfr_training.num_workers > 1
+        ):  # Only need manager if running in parallel
+            # Create and start the manager
+            manager = multiprocessing.Manager()
+            # Create the progress queue
+            progress_queue = manager.Queue(-1)
+        else:
+            # Don't need manager or progress queue for sequential run
+            manager = None
+            progress_queue = None
 
-        # Setup logging using the manager's queue
-        run_log_dir, run_timestamp = setup_logging(config, args.verbose, log_queue)
-        if not run_log_dir:
+        # Setup logging
+        setup_result = setup_logging(config, args.verbose)
+        if not setup_result:
             print("ERROR: Failed to set up logging. Exiting.")
             exit_code = 1
-            raise SystemExit(exit_code)  # Use SystemExit to ensure finally block runs
+            raise SystemExit(exit_code)
+        run_log_dir, run_timestamp = setup_result
 
-        # Logger is now configured globally
+        # Logger is now configured globally for the main process
         logger.info("--- Starting Cambia CFR+ Training ---")
         logger.info("Configuration loaded from: %s", args.config)
 
@@ -265,19 +247,19 @@ def main():
             except Exception as e:
                 logger.error("Failed to set recursion limit: %s", e)
 
-        # Initialize trainer, passing both queues
+        # Initialize trainer, passing run details and progress queue
         try:
             trainer = CFRTrainer(
-                config,
+                config=config,
                 run_log_dir=run_log_dir,
+                run_timestamp=run_timestamp,
                 shutdown_event=shutdown_event,
-                log_queue=log_queue,
-                progress_queue=progress_queue,  # Pass progress queue
+                progress_queue=progress_queue,  # Pass progress queue (or None)
             )
         except Exception:
             logger.exception("Failed to initialize CFRTrainer:")
             exit_code = 1
-            raise  # Re-raise to be caught by the outer try...except
+            raise
 
         # Load data if requested
         if args.load:
@@ -296,24 +278,23 @@ def main():
         except (
             KeyboardInterrupt,
             GracefulShutdownException,
-        ):  # Catch both forms of shutdown
-            logger.warning("Training interrupted by user (Ctrl+C) or shutdown event.")
+        ) as e:
+            logger.warning(
+                "Training interrupted by user (Ctrl+C) or shutdown event (%s).",
+                type(e).__name__,
+            )
             logger.info("Exiting program.")
             # Saving is handled within the trainer's exception handling
         except Exception:
             logger.exception("An unexpected error occurred during training:")
-            # Attempt save (handled by trainer's loop already)
             exit_code = 1  # Indicate error exit
 
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
-        # Avoid logging here if logger setup failed
         if logging.getLogger().hasHandlers():
             logger.error("System exit called with code %s.", exit_code)
     except Exception as e:
-        # Catch errors during manager setup or trainer init
         print(f"FATAL ERROR during setup: {e}", file=sys.stderr)
-        # Attempt to log if logger was partially initialized
         if logging.getLogger().hasHandlers():
             logger.exception("FATAL ERROR during setup:")
         exit_code = 1
@@ -321,32 +302,16 @@ def main():
         # --- Clean Shutdown ---
         print("--- Initiating Final Shutdown Sequence ---", file=sys.stderr)
 
-        root_logger = logging.getLogger()
-        log_available = root_logger.hasHandlers() and queue_listener is not None
+        # 1. Remove log handlers from main process? Optional, logging.shutdown should handle it.
 
-        # 1. Remove the main process QueueHandler to prevent final logs causing errors
-        if main_process_queue_handler:
-            print("Removing main process log handler...", file=sys.stderr)
-            root_logger.removeHandler(main_process_queue_handler)
-            main_process_queue_handler = None  # Clear reference
+        # 2. Stop the QueueListener - REMOVED
 
-        # 2. Stop the QueueListener
-        if queue_listener:
-            print("Stopping log queue listener...", file=sys.stderr)
-            try:
-                # Before stopping, add a sentinel or wait briefly?
-                # No, stopping should handle remaining items gracefully.
-                queue_listener.stop()
-                print("Log queue listener stopped.", file=sys.stderr)
-            except Exception as ql_e:
-                print(f"Error stopping queue listener: {ql_e}", file=sys.stderr)
-            # Short delay MAYBE helps listener process final items from queue
-            # but manager shutdown is the main race condition target
-            time.sleep(0.1)
-
-        # 3. Shut down the Manager (this closes both log_queue and progress_queue)
+        # 3. Shut down the Manager (only if it was created)
         if manager:
-            print("Shutting down multiprocessing manager...", file=sys.stderr)
+            print(
+                "Shutting down multiprocessing manager (for progress queue)...",
+                file=sys.stderr,
+            )
             try:
                 manager.shutdown()
                 print("Manager shut down.", file=sys.stderr)
@@ -361,16 +326,12 @@ def main():
 
 
 if __name__ == "__main__":
-    # Set start method for multiprocessing *before* creating Manager or Pool
     start_method_set = False
     try:
         preferred_method = "forkserver" if sys.platform != "win32" else "spawn"
         available_methods = multiprocessing.get_all_start_methods()
-
-        # Check the currently configured method
         current_method = multiprocessing.get_start_method(allow_none=True)
-
-        force_set = current_method is None  # Only force if no method is explicitly set
+        force_set = current_method is None
 
         if preferred_method in available_methods:
             if force_set or current_method != preferred_method:
@@ -379,7 +340,6 @@ if __name__ == "__main__":
                 print(f"INFO: Set multiprocessing start method to '{preferred_method}'")
             else:
                 print(f"INFO: Multiprocessing start method already '{preferred_method}'")
-
         elif "spawn" in available_methods:
             if force_set or current_method != "spawn":
                 multiprocessing.set_start_method("spawn", force=force_set)
@@ -389,15 +349,12 @@ if __name__ == "__main__":
                 )
             else:
                 print("INFO: Multiprocessing start method already 'spawn'")
-
-        elif current_method is None:  # Only error if no method set and no methods work
-            # Should not happen on supported platforms
+        elif current_method is None:
             print("ERROR: Neither 'forkserver' nor 'spawn' start methods available!")
 
     except RuntimeError as e:
-        # Context might have already been set via other means or previous runs
         print(f"DEBUG: Multiprocessing start method likely already set? ({e})")
-        pass  # Assume it was set correctly elsewhere
+        pass
     except Exception as e:
         print(f"ERROR: Error setting multiprocessing start method: {e}")
 

@@ -2,15 +2,16 @@
 """
 Functions executed by worker processes for parallel CFR training.
 Based on External Sampling Monte Carlo CFR.
+Logs directly to worker-specific files.
 """
 
 import copy
 import logging
-import logging.handlers
-from collections import defaultdict
+import os
 import sys
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, TypeAlias
-import queue  # For queue.Empty, queue.Full exceptions
+import queue
 
 import numpy as np
 
@@ -40,20 +41,20 @@ from ..utils import (
     LocalStrategyUpdateDict,
     LocalReachProbUpdateDict,
     WorkerResult,
-    LogQueue as GenericQueue,  # Rename for clarity
     WorkerStats,
 )
 
-# Logger setup is now simpler - just get logger. Configuration happens in main.
-# Ensure logger is configured *after* queue handler is added in run_cfr_simulation_worker
-# logger = logging.getLogger(__name__) # Get logger inside the function after setup
+from ..serial_rotating_handler import SerialRotatingFileHandler
+
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
-ProgressQueue: TypeAlias = GenericQueue  # Use same type alias for progress queue
+ProgressQueue: TypeAlias = queue.Queue
+
+
 PROGRESS_UPDATE_NODE_INTERVAL = 1000  # Send update every N nodes
 
 
-# --- Traversal Logic (largely unchanged, ensure logging uses logger.) ---
+# --- Traversal Logic ---
 def _traverse_game_for_worker(
     game_state: CambiaGameState,
     agent_states: List[AgentState],
@@ -72,7 +73,8 @@ def _traverse_game_for_worker(
     worker_id: int,
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
-    logger = logging.getLogger(__name__)  # Get logger instance for this function scope
+    # Get logger instance AFTER setup in run_cfr_simulation_worker
+    logger = logging.getLogger(__name__)
 
     # Update stats
     worker_stats.nodes_visited += 1
@@ -88,13 +90,11 @@ def _traverse_game_for_worker(
                 worker_stats.max_depth,
                 worker_stats.nodes_visited,
             )
+            # Use put_nowait for manager queue if progress_queue comes from manager
             progress_queue.put_nowait(progress_update)
         except queue.Full:
-            # If the queue is full, just skip the update for now
-            # logger.debug("Progress queue full for worker %d, skipping update.", worker_id)
             pass
         except Exception as pq_e:
-            # Log error but don't crash the worker
             logger.error(
                 "Error putting progress update on queue for worker %d: %s",
                 worker_id,
@@ -107,21 +107,20 @@ def _traverse_game_for_worker(
             [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
         )
 
-    # Check depth limit (prevent infinite recursion)
+    # Check depth limit
     if depth >= config.system.recursion_limit:
         logger.error(
             "Worker %d: Max recursion depth (%d) reached. Returning 0.", worker_id, depth
         )
-        # Treat as terminal with neutral utility
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
+    # --- Determine Context, Acting Player, Infoset Key ---
     # Determine Context (ensure logger calls work)
     if game_state.snap_phase_active:
         current_context = DecisionContext.SNAP_DECISION
-    # ... (rest of context logic unchanged, but ensure logger calls use logger.)
     elif game_state.pending_action:
         pending = game_state.pending_action
-        if isinstance(pending, ActionDiscard):  # After draw, choosing discard/replace
+        if isinstance(pending, ActionDiscard):
             current_context = DecisionContext.POST_DRAW
         elif isinstance(
             pending,
@@ -132,11 +131,9 @@ def _traverse_game_for_worker(
                 ActionAbilityKingLookSelect,
                 ActionAbilityKingSwapDecision,
             ),
-        ):  # Choosing target/decision for ability
+        ):
             current_context = DecisionContext.ABILITY_SELECT
-        elif isinstance(
-            pending, ActionSnapOpponentMove
-        ):  # Choosing card to move after SnapOpponent
+        elif isinstance(pending, ActionSnapOpponentMove):
             current_context = DecisionContext.SNAP_MOVE
         else:
             logger.warning(
@@ -148,7 +145,6 @@ def _traverse_game_for_worker(
     else:  # Normal start of turn
         current_context = DecisionContext.START_TURN
 
-    # Get Acting Player and Infoset Key (ensure logger calls work)
     player = game_state.get_acting_player()
     if player == -1:
         logger.error(
@@ -161,7 +157,6 @@ def _traverse_game_for_worker(
     current_agent_state = agent_states[player]
     opponent = 1 - player
     try:
-        # Basic validation moved here for clarity
         if not hasattr(current_agent_state, "own_hand") or not hasattr(
             current_agent_state, "opponent_belief"
         ):
@@ -174,7 +169,6 @@ def _traverse_game_for_worker(
             )
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         base_infoset_tuple = current_agent_state.get_infoset_key()
-        # Ensure context is valid Enum member before accessing value
         if not isinstance(current_context, DecisionContext):
             logger.error(
                 "Worker %d: Invalid context type '%s' for infoset key.",
@@ -200,10 +194,9 @@ def _traverse_game_for_worker(
         )
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-    # Get Legal Actions (ensure logger calls work)
+    # --- Get Legal Actions ---
     try:
         legal_actions_set = game_state.get_legal_actions()
-        # Sort for deterministic iteration order (important for strategy array alignment)
         legal_actions = sorted(list(legal_actions_set), key=repr)
     except Exception as e_legal:
         logger.error(
@@ -218,13 +211,9 @@ def _traverse_game_for_worker(
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
     num_actions = len(legal_actions)
 
-    # Handle No Legal Actions (ensure logger calls work)
     if num_actions == 0:
-        # This check should ideally happen within get_legal_actions or is_terminal
-        # If we reach here and it's not terminal, it's the bug we need to fix.
         if not game_state.is_terminal():
-            # This log might still appear if the underlying cause in the engine isn't fixed yet.
-            logger.error(  # Keep as ERROR
+            logger.error(
                 "Worker %d: No legal actions P%d depth %d, but state non-terminal! State: %s Context: %s",
                 worker_id,
                 player,
@@ -236,22 +225,18 @@ def _traverse_game_for_worker(
                     else current_context
                 ),
             )
-            # To avoid crashing, return neutral utility, but this highlights the bug.
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         else:  # Correctly terminal
             return np.array(
                 [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
             )
 
-    # Get Strategy from Snapshot (ensure logger calls work)
+    # --- Get Strategy from Snapshot ---
     current_regrets: Optional[np.ndarray] = regret_sum_snapshot.get(infoset_key)
     strategy = np.array([])  # Initialize strategy
-
-    # Check if snapshot contains the key and dimensions match
     if current_regrets is not None and len(current_regrets) == num_actions:
         strategy = get_rm_plus_strategy(current_regrets)
     else:
-        # Handle missing key or dimension mismatch
         if current_regrets is not None:  # Dimension mismatch
             logger.warning(
                 "Worker %d: Regret dim mismatch key %s. Snap:%d Need:%d. Using uniform.",
@@ -260,12 +245,7 @@ def _traverse_game_for_worker(
                 len(current_regrets),
                 num_actions,
             )
-        # else: Key not found, expected if infoset is new
-
-        # Use uniform strategy
         strategy = np.ones(num_actions) / num_actions if num_actions > 0 else np.array([])
-
-        # Initialize local updates for this new/mismatched infoset if needed
         if (
             infoset_key not in local_regret_updates
             or len(local_regret_updates.get(infoset_key, [])) != num_actions
@@ -279,14 +259,11 @@ def _traverse_game_for_worker(
                 num_actions, dtype=np.float64
             )
 
+    # --- Accumulate Updates & Iterate Through Actions ---
     player_reach = reach_probs[player]
     opponent_reach = reach_probs[opponent]
-
-    # Accumulate Strategy Sum Update (ensure logger calls work)
-    # Ensure strategy has the correct dimension before updating sums
     if player == updating_player and weight > 0 and player_reach > 1e-9:
         if len(strategy) == num_actions:
-            # Ensure the local update dict entry exists and has correct dimension
             if (
                 infoset_key not in local_strategy_sum_updates
                 or len(local_strategy_sum_updates[infoset_key]) != num_actions
@@ -305,7 +282,6 @@ def _traverse_game_for_worker(
                 infoset_key,
             )
 
-    # Iterate Through Actions (ensure logger calls work)
     action_utilities = np.zeros((num_actions, NUM_PLAYERS), dtype=np.float64)
     node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
@@ -318,19 +294,15 @@ def _traverse_game_for_worker(
                 len(strategy),
                 infoset_key,
             )
-            continue  # Skip this action to prevent crash
+            continue
         action_prob = strategy[i]
-        # Skip actions with near-zero probability to save computation
-        # Note: RBP pruning could be added here based on regret_sum_snapshot
         if action_prob < 1e-9:
             continue
 
-        # Apply Action (ensure logger calls work)
         state_delta: Optional[StateDelta] = None
         undo_info: Optional[UndoInfo] = None
         drawn_card_this_step: Optional[CardObject] = None
         try:
-            # Check if the action involves consuming the drawn card from pending data
             if isinstance(
                 action, (ActionReplace, ActionDiscard)
             ) and game_state.pending_action_data.get("drawn_card"):
@@ -344,9 +316,8 @@ def _traverse_game_for_worker(
                     action,
                     game_state,
                 )
-                # Treat as failure for this branch
                 action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
-                continue  # Skip recursion for this action
+                continue
 
         except Exception as apply_err:
             logger.error(
@@ -359,16 +330,16 @@ def _traverse_game_for_worker(
                 game_state,
                 exc_info=True,
             )
-            continue  # Skip this action branch
+            continue
 
-        # Create observation and update agent states (ensure logger calls work)
+        # Create observation and update agent states
         observation = _create_observation(
             None,
             action,
-            game_state,  # State *after* action
-            player,  # Player who took the action
-            game_state.snap_results_log,  # Log *after* action (might include snap results)
-            drawn_card_this_step,  # Pass card involved if Discard/Replace
+            game_state,
+            player,
+            game_state.snap_results_log,
+            drawn_card_this_step,
         )
         next_agent_states = []
         agent_update_failed = False
@@ -390,10 +361,9 @@ def _traverse_game_for_worker(
                     exc_info=True,
                 )
                 agent_update_failed = True
-                break  # Stop processing agents for this action branch
+                break
             next_agent_states.append(cloned_agent)
 
-        # If agent update failed for any player, undo and skip recursion
         if agent_update_failed:
             if undo_info:
                 try:
@@ -405,18 +375,17 @@ def _traverse_game_for_worker(
                         undo_e,
                         exc_info=True,
                     )
-            continue  # Skip recursion for this action
+            continue
 
-        # Calculate next reach probabilities
         temp_reach_probs = reach_probs.copy()
         temp_reach_probs[player] *= action_prob
 
-        # Recursive call (ensure logger calls work)
+        # Recursive call
         try:
             recursive_utilities = _traverse_game_for_worker(
-                game_state,  # Pass the state *after* the action
-                next_agent_states,  # Pass the updated agent states
-                temp_reach_probs,  # Pass updated reach probs
+                game_state,
+                next_agent_states,
+                temp_reach_probs,
                 iteration,
                 updating_player,
                 weight,
@@ -425,10 +394,10 @@ def _traverse_game_for_worker(
                 local_regret_updates,
                 local_strategy_sum_updates,
                 local_reach_prob_updates,
-                depth + 1,  # Increment depth
-                worker_stats,  # Pass stats object along
-                progress_queue,  # Pass progress queue along
-                worker_id,  # Pass worker id along
+                depth + 1,
+                worker_stats,
+                progress_queue,
+                worker_id,
             )
             action_utilities[i] = recursive_utilities
         except Exception as recursive_err:
@@ -443,12 +412,10 @@ def _traverse_game_for_worker(
             )
             action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-        # Undo action (ensure logger calls work)
+        # Undo action
         if undo_info:
             try:
                 undo_info()
-                # Sanity check: Ensure state after undo matches state before apply_action (requires cloning state before loop)
-                # This is computationally expensive, rely on logging/testing for now.
             except Exception as undo_e:
                 logger.error(
                     "Worker %d: Error undoing action %s depth %d: %s. State likely corrupt. Returning zero.",
@@ -458,12 +425,9 @@ def _traverse_game_for_worker(
                     undo_e,
                     exc_info=True,
                 )
-                # If undo fails, state is corrupt, safest to return 0 and stop traversal down this path
                 return np.zeros(NUM_PLAYERS, dtype=np.float64)
-        # else: Already logged error when undo_info was missing/invalid after apply_action call
 
-    # Calculate Node Value & Accumulate Regret Update (ensure logger calls work)
-    # Ensure strategy used has the same length as action_utilities collected
+    # --- Calculate Node Value & Accumulate Regret Update ---
     valid_strategy_for_value_calc = (
         strategy
         if len(strategy) == num_actions
@@ -473,23 +437,21 @@ def _traverse_game_for_worker(
         node_value = np.sum(
             valid_strategy_for_value_calc[:, np.newaxis] * action_utilities, axis=0
         )
-    else:  # No actions, node value is 0
+    else:
         node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     if player == updating_player:
-        # Ensure local update entry exists and matches dimension
         if (
             infoset_key not in local_regret_updates
             or len(local_regret_updates[infoset_key]) != num_actions
         ):
             local_regret_updates[infoset_key] = np.zeros(num_actions, dtype=np.float64)
 
-        if num_actions > 0:  # Only calculate regret if actions exist
+        if num_actions > 0:
             player_action_values = action_utilities[:, player]
             player_node_value = node_value[player]
             instantaneous_regret = player_action_values - player_node_value
             update_weight = opponent_reach
-            # Ensure instantaneous regret has same shape as local update array
             if len(instantaneous_regret) == len(local_regret_updates[infoset_key]):
                 local_regret_updates[infoset_key] += update_weight * instantaneous_regret
             else:
@@ -506,65 +468,95 @@ def _traverse_game_for_worker(
 
 def run_cfr_simulation_worker(
     worker_args: Tuple[
-        int,
+        int,  # iteration
         Config,
         RegretSnapshotDict,
-        Optional[GenericQueue],
-        Optional[ProgressQueue],
-        int,
+        Optional[ProgressQueue],  # progress_queue
+        int,  # worker_id
+        str,  # run_log_dir
+        str,  # run_timestamp
     ],
-) -> Optional[WorkerResult]:  # Return the WorkerResult dataclass
-    """Top-level function executed by each worker process."""
-    # !!! IMPORTANT: Setup logging FIRST using the queue !!!
-    iteration, config, regret_sum_snapshot, log_queue, progress_queue, worker_id = (
-        worker_args  # Unpack args
-    )
+) -> Optional[WorkerResult]:
+    """Top-level function executed by each worker process. Sets up per-worker logging."""
     logger = None  # Initialize logger variable
-    try:
-        worker_root_logger = logging.getLogger()  # Get root logger for this process
-        if log_queue:
-            # Avoid adding handler if it already exists
-            if not any(
-                isinstance(h, logging.handlers.QueueHandler) and h.queue is log_queue
-                for h in worker_root_logger.handlers
-            ):
-                # Remove any handlers inherited via fork (if any)
-                for handler in worker_root_logger.handlers[:]:
-                    worker_root_logger.removeHandler(handler)
-                # Add the queue handler
-                queue_handler = logging.handlers.QueueHandler(log_queue)
-                worker_root_logger.addHandler(queue_handler)
-                # Set worker logger level to DEBUG to send everything to the queue
-                worker_root_logger.setLevel(logging.DEBUG)
-                # Now safe to get and use child loggers
-                logger = logging.getLogger(__name__)  # Assign logger here
-                # logger.info("Worker %d logging initialized via QueueHandler.", worker_id) # Reduced noise
-        else:
-            # Fallback or error handling if queue is not provided
-            if (
-                not worker_root_logger.hasHandlers()
-            ):  # Add NullHandler only if no other handlers exist
-                worker_root_logger.addHandler(logging.NullHandler())
-            logger = logging.getLogger(__name__)  # Get logger even if queue fails
-            logger.warning(
-                "Worker %d running without queue logging.", worker_id
-            )  # Log a warning if possible
+    (
+        iteration,
+        config,
+        regret_sum_snapshot,
+        progress_queue,
+        worker_id,
+        run_log_dir,
+        run_timestamp,
+    ) = worker_args
 
-        # --- Now wrap the main worker logic in a try...except block ---
-        # This inner try...except catches errors within the simulation logic
+    try:
+        # --- Per-Worker Logging Setup ---
+        worker_root_logger = logging.getLogger()  # Get root logger for this process
+        # Remove any inherited handlers
+        for handler in worker_root_logger.handlers[:]:
+            worker_root_logger.removeHandler(handler)
+
         try:
-            worker_stats = WorkerStats()  # Initialize stats for this run
+            # Create worker-specific directory
+            worker_log_dir = os.path.join(run_log_dir, f"w{worker_id}")
+            os.makedirs(worker_log_dir, exist_ok=True)
+
+            # Construct base log pattern (handler adds _NNN.log)
+            log_pattern = os.path.join(
+                worker_log_dir,
+                f"{config.logging.log_file_prefix}_run_{run_timestamp}-w{worker_id}",
+            )
+
+            # Create and add the SerialRotatingFileHandler for this worker
+            formatter = logging.Formatter(
+                "%(asctime)s - %(levelname)-8s - [%(processName)-20s] - %(name)-25s - %(message)s"
+            )
+            file_handler = SerialRotatingFileHandler(
+                filename_pattern=log_pattern,
+                maxBytes=config.logging.log_max_bytes,
+                backupCount=config.logging.log_backup_count,
+                encoding="utf-8",
+            )
+            # Use the file log level from config for workers too
+            file_log_level = getattr(
+                logging, config.logging.log_level_file.upper(), logging.DEBUG
+            )
+            file_handler.setLevel(file_log_level)
+            file_handler.setFormatter(formatter)
+            worker_root_logger.addHandler(file_handler)
+
+            # Set worker's root logger level (e.g., DEBUG to capture everything for the file)
+            worker_root_logger.setLevel(logging.DEBUG)
+            logger = logging.getLogger(__name__)  # Now safe to get child logger
+            logger.info(
+                "Worker %d logging initialized to directory %s", worker_id, worker_log_dir
+            )
+
+        except Exception as log_setup_e:
+            # If logging setup fails, print error and continue without logging
+            print(
+                f"!!! CRITICAL Error setting up logging for worker {worker_id}: {log_setup_e} !!!",
+                file=sys.stderr,
+            )
+            # Add a NullHandler to prevent "No handler found" warnings
+            if not worker_root_logger.hasHandlers():
+                worker_root_logger.addHandler(logging.NullHandler())
+            logger = logging.getLogger(__name__)  # Get logger anyway
+
+        # --- Now wrap the main worker logic ---
+        try:
+            worker_stats = WorkerStats()
             # logger.debug("Worker %d starting iteration %d.", worker_id, iteration) # Reduced noise
 
-            # --- Initialize Game and Agent States ---
+            # Initialize Game and Agent States
             game_state = CambiaGameState(house_rules=config.cambia_rules)
             initial_agent_states = []
-            initial_hands_for_log = [list(p.hand) for p in game_state.players]
-            initial_peeks_for_log = [p.initial_peek_indices for p in game_state.players]
-
             if not game_state.is_terminal():
-                # Create initial observation *before* initializing agents
                 initial_obs = _create_observation(None, None, game_state, -1, [], None)
+                initial_hands_for_log = [list(p.hand) for p in game_state.players]
+                initial_peeks_for_log = [
+                    p.initial_peek_indices for p in game_state.players
+                ]
                 for i in range(NUM_PLAYERS):
                     agent = AgentState(
                         player_id=i,
@@ -574,7 +566,6 @@ def run_cfr_simulation_worker(
                         initial_hand_size=len(initial_hands_for_log[i]),
                         config=config,
                     )
-                    # Pass the single initial observation to all agents
                     agent.initialize(
                         initial_obs, initial_hands_for_log[i], initial_peeks_for_log[i]
                     )
@@ -583,7 +574,7 @@ def run_cfr_simulation_worker(
                 logger.error(
                     "Worker %d: Game terminal at init. State: %s", worker_id, game_state
                 )
-                return None  # Cannot start traversal
+                return None
 
             if len(initial_agent_states) != NUM_PLAYERS:
                 logger.error(
@@ -591,16 +582,15 @@ def run_cfr_simulation_worker(
                 )
                 return None
 
-            # --- Determine Updating Player & Iteration Weight ---
+            # Determine Updating Player & Iteration Weight
             updating_player = iteration % NUM_PLAYERS
             if config.cfr_plus_params.weighted_averaging_enabled:
                 delay = config.cfr_plus_params.averaging_delay
-                # Iteration weight starts from 1 at iter d+1
                 weight = float(max(0, (iteration + 1) - (delay + 1)))
             else:
                 weight = 1.0
 
-            # --- Initialize Local Update Dictionaries ---
+            # Initialize Local Update Dictionaries
             local_regret_updates: LocalRegretUpdateDict = defaultdict(
                 lambda: np.array([], dtype=np.float64)
             )
@@ -609,13 +599,11 @@ def run_cfr_simulation_worker(
             )
             local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
 
-            # --- Run Traversal ---
+            # Run Traversal
             _traverse_game_for_worker(
                 game_state=game_state,
                 agent_states=initial_agent_states,
-                reach_probs=np.ones(
-                    NUM_PLAYERS, dtype=np.float64
-                ),  # Initial reach is 1 for both
+                reach_probs=np.ones(NUM_PLAYERS, dtype=np.float64),
                 iteration=iteration,
                 updating_player=updating_player,
                 weight=weight,
@@ -625,13 +613,12 @@ def run_cfr_simulation_worker(
                 local_strategy_sum_updates=local_strategy_sum_updates,
                 local_reach_prob_updates=local_reach_prob_updates,
                 depth=0,
-                worker_stats=worker_stats,  # Pass stats object
-                progress_queue=progress_queue,  # Pass progress queue
-                worker_id=worker_id,  # Pass worker id
+                worker_stats=worker_stats,
+                progress_queue=progress_queue,
+                worker_id=worker_id,
             )
 
-            # logger.debug("Worker %d finished iteration %d. MaxDepth: %d, Nodes: %d", worker_id, iteration, worker_stats.max_depth, worker_stats.nodes_visited) # Reduced noise
-            # Return WorkerResult dataclass instance
+            # logger.debug("Worker %d finished iteration %d.", worker_id, iteration) # Reduced noise
             return WorkerResult(
                 regret_updates=dict(local_regret_updates),
                 strategy_updates=dict(local_strategy_sum_updates),
@@ -640,54 +627,48 @@ def run_cfr_simulation_worker(
             )
 
         except Exception as e_inner:
-            # Log exception using the configured queue handler *inside the worker*
-            # Use the logger instance obtained after setup
-            if logger:  # Check if logger was initialized
+            if logger:  # Log if logger was successfully set up
                 logger.error(
                     "!!! Unhandled Error in worker %d iter %d simulation: %s !!!",
                     worker_id,
                     iteration,
                     e_inner,
-                    exc_info=True,  # Include traceback in the log sent via queue
+                    exc_info=True,
                 )
-            else:  # Fallback print if logger failed
+            else:  # Fallback print
                 print(
                     f"!!! FATAL WORKER ERROR (Worker {worker_id}, Iter {iteration}): {e_inner} !!!",
                     file=sys.stderr,
                 )
-            # Return None to indicate failure *without* pickling the exception
             return None
 
-    # This outer try...except catches errors during logger setup itself
+    # This outer try...except catches errors during initial setup before logger might exist
     except Exception as e_outer:
-        # Cannot use logger here as setup might have failed
         print(
             f"!!! CRITICAL Error during worker {worker_id} init (Iter {iteration}): {e_outer} !!!",
             file=sys.stderr,
         )
-        # Print traceback manually if possible
         import traceback
 
         traceback.print_exc(file=sys.stderr)
-        return None  # Indicate failure
+        return None
+    finally:
+        # Explicitly shutdown logging for the worker process?
+        # logging.shutdown() # Maybe needed depending on start method / OS
+        pass
 
 
-# --- Helper functions needed by _traverse_game_for_worker ---
-# (Implementation unchanged from v0.7.4, but ensure consistency)
+# --- Helper functions _create_observation, _filter_observation ---
 def _create_observation(
-    prev_state: Optional[
-        CambiaGameState
-    ],  # Not currently used but kept for potential future use
-    action: Optional[GameAction],  # Action that LED to next_state
-    next_state: CambiaGameState,  # State AFTER action was applied
-    acting_player: int,  # Player who took the action
-    snap_results: List[Dict],  # Snap results that occurred *during* this action step
-    explicit_drawn_card: Optional[
-        CardObject
-    ] = None,  # Card drawn if action was Draw... or Discard/Replace
+    prev_state: Optional[CambiaGameState],
+    action: Optional[GameAction],
+    next_state: CambiaGameState,
+    acting_player: int,
+    snap_results: List[Dict],
+    explicit_drawn_card: Optional[CardObject] = None,
 ) -> AgentObservation:
     """Creates the AgentObservation object based on the state *after* the action."""
-    logger = logging.getLogger(__name__)  # Get logger instance
+    logger_obs = logging.getLogger(__name__)  # Get logger instance for this helper
     discard_top = next_state.get_discard_top()
     hand_sizes = [next_state.get_player_card_count(i) for i in range(NUM_PLAYERS)]
     stock_size = next_state.get_stockpile_size()
@@ -696,27 +677,16 @@ def _create_observation(
     game_over = next_state.is_terminal()
     turn_num = next_state.get_turn_number()
 
-    # Determine the drawn card relevant to this observation context
     drawn_card_for_obs = None
     if isinstance(action, (ActionDiscard, ActionReplace)):
-        # If action was Discard or Replace, the 'explicit_drawn_card' is the one
-        # that was originally drawn and now involved in this action.
-        # This is the card that becomes 'public knowledge' potentially.
         drawn_card_for_obs = explicit_drawn_card
-        # logger.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card}, set drawn_card_for_obs: {drawn_card_for_obs}")
-
+        # logger_obs.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card}, set drawn_card_for_obs: {drawn_card_for_obs}")
     elif explicit_drawn_card is not None and acting_player != -1:
-        # If an explicit card is passed (e.g., from ActionDrawStockpile)
-        # it's relevant for the actor's observation immediately.
         drawn_card_for_obs = explicit_drawn_card
-        # logger.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card} (actor {acting_player}), set drawn_card_for_obs: {drawn_card_for_obs}")
+        # logger_obs.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card} (actor {acting_player}), set drawn_card_for_obs: {drawn_card_for_obs}")
 
-    # Determine peeked cards relevant to this observation
     peeked_cards_dict = None
-    # Peek results are associated with the *Select* or *Look* action that generated them.
-    # KingSwapDecision action itself doesn't generate new peek info in the observation.
     if isinstance(action, ActionAbilityPeekOwnSelect) and acting_player != -1:
-        # We need the state *after* the action to confirm the peeked card
         hand = next_state.get_player_hand(acting_player)
         target_idx = action.target_hand_index
         if hand and 0 <= target_idx < len(hand):
@@ -728,7 +698,6 @@ def _create_observation(
         if opp_hand and 0 <= target_opp_idx < len(opp_hand):
             peeked_cards_dict = {(opp_idx, target_opp_idx): opp_hand[target_opp_idx]}
     elif isinstance(action, ActionAbilityKingLookSelect) and acting_player != -1:
-        # Re-fetch cards looked at from the state *after* the look action
         own_idx, opp_look_idx = action.own_hand_index, action.opponent_hand_index
         opp_real_idx = next_state.get_opponent_index(acting_player)
         own_hand, opp_hand = next_state.get_player_hand(
@@ -746,7 +715,6 @@ def _create_observation(
                 (opp_real_idx, opp_look_idx): card2,
             }
 
-    # Use the snap results passed in (should reflect results from this specific step)
     final_snap_results = snap_results if snap_results else []
 
     obs = AgentObservation(
@@ -755,40 +723,30 @@ def _create_observation(
         discard_top_card=discard_top,
         player_hand_sizes=hand_sizes,
         stockpile_size=stock_size,
-        drawn_card=drawn_card_for_obs,  # Pass potentially visible drawn card
-        peeked_cards=peeked_cards_dict,  # Pass peek info caused by this action
-        snap_results=final_snap_results,  # Pass snap results from this step
+        drawn_card=drawn_card_for_obs,
+        peeked_cards=peeked_cards_dict,
+        snap_results=final_snap_results,
         did_cambia_get_called=cambia_called,
         who_called_cambia=who_called,
         is_game_over=game_over,
         current_turn=turn_num,
     )
-    # logger.debug(f"## OBS CREATE ## Created observation: {obs}")
+    # logger_obs.debug(f"## OBS CREATE ## Created observation: {obs}")
     return obs
 
 
 def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObservation:
     """Creates a player-specific view of the observation, masking private info."""
-    logger = logging.getLogger(__name__)  # Get logger instance
-    # Start with a shallow copy, then modify fields that need filtering
+    logger_filt = logging.getLogger(__name__)  # Get logger instance for this helper
     filtered_obs = copy.copy(obs)
 
-    # --- Filter Drawn Card ---
-    # Observer only sees the drawn card if:
-    # 1. They were the acting player who drew it (ActionDraw...).
-    # 2. The action was Discard or Replace (making the drawn card public knowledge via discard pile).
     is_public_reveal = isinstance(obs.action, (ActionDiscard, ActionReplace))
-
     if obs.drawn_card and obs.acting_player != observer_id and not is_public_reveal:
-        # If observer didn't act and it wasn't a public reveal action, hide the card.
-        # logger.debug(f"## OBS FILTER ## P{observer_id} filtering drawn_card from P{obs.acting_player}'s action {type(obs.action).__name__}")
+        # logger_filt.debug(f"## OBS FILTER ## P{observer_id} filtering drawn_card from P{obs.acting_player}'s action {type(obs.action).__name__}")
         filtered_obs.drawn_card = None
-    # else: logger.debug(f"## OBS FILTER ## P{observer_id} keeps drawn_card (Actor:{obs.acting_player==observer_id}, PublicReveal:{is_public_reveal})")
+    # else: logger_filt.debug(f"## OBS FILTER ## P{observer_id} keeps drawn_card (Actor:{obs.acting_player==observer_id}, PublicReveal:{is_public_reveal})")
 
-    # --- Filter Peeked Cards ---
-    # Observer only sees peek results if they were the actor performing the peek/look.
     if obs.peeked_cards:
-        # Check if the action type corresponds to a peek/look by the observer
         is_observer_peek_action = (
             (
                 isinstance(obs.action, ActionAbilityPeekOwnSelect)
@@ -803,17 +761,13 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
                 and obs.acting_player == observer_id
             )
         )
-
         if not is_observer_peek_action:
-            # If the observer didn't perform the peek/look action, hide the results.
-            # logger.debug(f"## OBS FILTER ## P{observer_id} filtering peeked_cards from P{obs.acting_player}'s action {type(obs.action).__name__}")
+            # logger_filt.debug(f"## OBS FILTER ## P{observer_id} filtering peeked_cards from P{obs.acting_player}'s action {type(obs.action).__name__}")
             filtered_obs.peeked_cards = None
-        # else: logger.debug(f"## OBS FILTER ## P{observer_id} keeps peeked_cards.")
+        # else: logger_filt.debug(f"## OBS FILTER ## P{observer_id} keeps peeked_cards.")
     else:
-        filtered_obs.peeked_cards = None  # Ensure it's None if originally None
+        filtered_obs.peeked_cards = None
 
-    # Snap results are considered public information
-    filtered_obs.snap_results = obs.snap_results  # Already copied by shallow copy
-
-    # logger.debug(f"## OBS FILTER ## Filtered for P{observer_id}: {filtered_obs}")
+    filtered_obs.snap_results = obs.snap_results
+    # logger_filt.debug(f"## OBS FILTER ## Filtered for P{observer_id}: {filtered_obs}")
     return filtered_obs
