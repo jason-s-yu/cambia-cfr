@@ -43,7 +43,8 @@ from ..utils import (
 )
 
 # Logger setup is now simpler - just get logger. Configuration happens in main.
-logger = logging.getLogger(__name__)
+# Ensure logger is configured *after* queue handler is added in run_cfr_simulation_worker
+# logger = logging.getLogger(__name__) # Get logger inside the function after setup
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 
@@ -65,6 +66,7 @@ def _traverse_game_for_worker(
     worker_stats: WorkerStats,
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
+    logger = logging.getLogger(__name__)  # Get logger instance for this function scope
 
     # Update stats
     worker_stats.nodes_visited += 1
@@ -462,18 +464,16 @@ def run_cfr_simulation_worker(
     ],
 ) -> Optional[WorkerResult]:  # Return the WorkerResult dataclass
     """Top-level function executed by each worker process."""
+    # !!! IMPORTANT: Setup logging FIRST using the queue !!!
     iteration, config, regret_sum_snapshot, log_queue, worker_id = worker_args
-    worker_stats = WorkerStats()  # Initialize stats for this run
-
-    # --- Setup Logging for this worker using QueueHandler ---
+    worker_root_logger = logging.getLogger()  # Get root logger for this process
     if log_queue:
-        worker_root_logger = logging.getLogger()
-        # Avoid adding handler if it already exists (e.g., if worker is reused somehow)
+        # Avoid adding handler if it already exists
         if not any(
             isinstance(h, logging.handlers.QueueHandler) and h.queue is log_queue
             for h in worker_root_logger.handlers
         ):
-            # Remove any handlers that might be inherited (shouldn't be needed with spawn/forkserver)
+            # Remove any handlers inherited via fork (if any)
             for handler in worker_root_logger.handlers[:]:
                 worker_root_logger.removeHandler(handler)
             # Add the queue handler
@@ -481,12 +481,17 @@ def run_cfr_simulation_worker(
             worker_root_logger.addHandler(queue_handler)
             # Set worker logger level to DEBUG to send everything to the queue
             worker_root_logger.setLevel(logging.DEBUG)
+            # Now safe to get and use child loggers
+            logger = logging.getLogger(__name__)
             logger.info("Worker %d logging initialized via QueueHandler.", worker_id)
     else:
         # Fallback or error handling if queue is not provided
-        logging.getLogger().addHandler(logging.NullHandler())
+        worker_root_logger.addHandler(logging.NullHandler())
+        logger = logging.getLogger(__name__)  # Get logger even if queue fails
 
+    # --- Now wrap the main worker logic in a try...except block ---
     try:
+        worker_stats = WorkerStats()  # Initialize stats for this run
         logger.debug("Worker %d starting iteration %d.", worker_id, iteration)
 
         # --- Initialize Game and Agent States ---
@@ -528,7 +533,6 @@ def run_cfr_simulation_worker(
             delay = config.cfr_plus_params.averaging_delay
             # Iteration weight starts from 1 at iter d+1
             weight = float(max(0, (iteration + 1) - (delay + 1)))
-            # Alternative: weight = float(max(0, iteration - delay)) # weight is 1 at iter d+1
         else:
             weight = 1.0
 
@@ -576,15 +580,21 @@ def run_cfr_simulation_worker(
         )
 
     except Exception as e:
-        # Log exception using the configured queue handler
+        # Log exception using the configured queue handler *inside the worker*
+        # Use the logger instance obtained after setup
         logger.error(
-            "Error in worker %d iter %d: %s", worker_id, iteration, e, exc_info=True
+            "!!! Unhandled Error in worker %d iter %d: %s !!!",
+            worker_id,
+            iteration,
+            e,
+            exc_info=True,  # Include traceback in the log sent via queue
         )
-        return None  # Indicate failure
+        # Return None to indicate failure *without* pickling the exception
+        return None
 
 
 # --- Helper functions needed by _traverse_game_for_worker ---
-# (Implementation unchanged from v0.7.2, but ensure consistency)
+# (Implementation unchanged from v0.7.3, but ensure consistency)
 def _create_observation(
     prev_state: Optional[
         CambiaGameState
@@ -598,6 +608,7 @@ def _create_observation(
     ] = None,  # Card drawn if action was Draw... or Discard/Replace
 ) -> AgentObservation:
     """Creates the AgentObservation object based on the state *after* the action."""
+    logger = logging.getLogger(__name__)  # Get logger instance
     discard_top = next_state.get_discard_top()
     hand_sizes = [next_state.get_player_card_count(i) for i in range(NUM_PLAYERS)]
     stock_size = next_state.get_stockpile_size()
@@ -679,6 +690,7 @@ def _create_observation(
 
 def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObservation:
     """Creates a player-specific view of the observation, masking private info."""
+    logger = logging.getLogger(__name__)  # Get logger instance
     # Start with a shallow copy, then modify fields that need filtering
     filtered_obs = copy.copy(obs)
 

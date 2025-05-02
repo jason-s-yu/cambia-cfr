@@ -289,22 +289,34 @@ if __name__ == "__main__":
     # Set start method for multiprocessing (fork is problematic with threads like QueueListener)
     # 'spawn' is generally safer but might be slower. 'forkserver' is another option.
     # Set this *before* any multiprocessing objects are created.
+    start_method_set = False
     try:
         # Use 'forkserver' if available (often better performance than 'spawn')
         # Use 'spawn' on Windows or if 'forkserver' is unavailable/causes issues
         if sys.platform == "win32":
             multiprocessing.set_start_method("spawn", force=True)
+            start_method_set = True
         else:
             try:
                 multiprocessing.set_start_method("forkserver", force=True)
+                start_method_set = True
             except ValueError:
-                logger.warning("forkserver start method not available, using spawn.")
+                logging.warning("forkserver start method not available, using spawn.")
                 multiprocessing.set_start_method("spawn", force=True)
+                start_method_set = True
     except RuntimeError:
         # Context might have already been set if this isn't the main entry point
-        logger.debug("Multiprocessing context already set.")
-        pass
+        logging.debug("Multiprocessing context already set.")
+        pass  # Assume it was set correctly elsewhere
     except Exception as e:
-        logger.error("Error setting multiprocessing start method: %s", e)
+        logging.error("Error setting multiprocessing start method: %s", e)
+
+    # Add logging here AFTER attempting to set the start method
+    # Note: Logger might not be fully configured yet if setup_logging hasn't run
+    # Use basic print or preliminary logging setup if needed
+    effective_method = multiprocessing.get_start_method(allow_none=True)
+    print(f"INFO: Effective multiprocessing start method: {effective_method}")
+    # If using logger, ensure basicConfig is set or queue exists
+    # logger.info("Effective multiprocessing start method: %s", effective_method) # Use this if logger is ready
 
     main()

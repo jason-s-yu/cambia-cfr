@@ -8,12 +8,12 @@ import time
 import copy
 import multiprocessing
 import multiprocessing.pool
-from typing import Any, Callable, Optional, List, Tuple, Dict
+from typing import Any, Callable, Optional, List, Tuple, Dict, Union
 
 from tqdm import tqdm
 
 from ..analysis_tools import AnalysisTools
-from ..utils import WorkerResult, PolicyDict, LogQueue
+from ..utils import WorkerResult, PolicyDict, LogQueue, WorkerStats
 from ..config import Config
 from .exceptions import GracefulShutdownException
 from .worker import run_cfr_simulation_worker
@@ -45,7 +45,8 @@ class CFRTrainingLoopMixin:
     # Internal state for display
     _last_exploit_str: str = "N/A"
     _total_infosets_str: str = "0"
-    _worker_statuses: Dict[int, str] = {}  # For displaying worker info
+    # Store worker status strings or WorkerStats objects
+    _worker_statuses: Dict[int, Union[str, WorkerStats]] = {}
 
     def train(self, num_iterations: Optional[int] = None):
         """Runs the main CFR+ training loop, potentially in parallel."""
@@ -85,6 +86,15 @@ class CFRTrainingLoopMixin:
             position=0,  # Main bar at position 0
             leave=True,
         )
+        # Initialize postfix early to prevent AttributeError
+        progress_bar.set_postfix(
+            {
+                "LastT": "N/A",
+                "Expl": self._last_exploit_str,
+                "Nodes": self._total_infosets_str,
+            },
+            refresh=False,
+        )
 
         try:
             # 't' is the iteration number currently being executed
@@ -96,6 +106,7 @@ class CFRTrainingLoopMixin:
 
                 iter_start_time = time.time()
                 self.current_iteration = t
+                # Reset worker statuses at the start of the iteration
                 self._worker_statuses = {i: "Starting" for i in range(num_workers)}
                 self._update_status_display(progress_bar, t, end_iter_num)
 
@@ -140,11 +151,9 @@ class CFRTrainingLoopMixin:
                         if result is None:
                             sim_failed_count += 1
                             self._worker_statuses[0] = "Failed"
-                        else:
-                            # Access stats via result.stats
-                            self._worker_statuses[0] = (
-                                f"Done (Depth:{result.stats.max_depth}, Nodes:{result.stats.nodes_visited:,})"
-                            )
+                        elif isinstance(result, WorkerResult):
+                            # Store WorkerStats object for display
+                            self._worker_statuses[0] = result.stats
                     except Exception:
                         logger.exception("Error during sequential simulation iter %d.", t)
                         sim_failed_count += 1
@@ -179,7 +188,7 @@ class CFRTrainingLoopMixin:
                         )  # Show all as running
 
                         # Collect results with timeout and update status
-                        start_collection_time = time.time()
+                        # start_collection_time = time.time()
                         while completed_worker_count < num_workers:
                             if self.shutdown_event.is_set():
                                 logger.warning(
@@ -198,9 +207,14 @@ class CFRTrainingLoopMixin:
                             ]
 
                             for worker_id in ready_workers:
+                                if worker_id not in async_results:
+                                    continue  # Already processed
                                 async_res = async_results.pop(
-                                    worker_id
+                                    worker_id, None
                                 )  # Remove from dict to avoid re-processing
+                                if async_res is None:
+                                    continue  # Already processed
+
                                 try:
                                     # Get the actual result (WorkerResult object or None)
                                     result: Optional[WorkerResult] = async_res.get()
@@ -213,11 +227,9 @@ class CFRTrainingLoopMixin:
                                         self._worker_statuses[worker_id] = (
                                             f"Failed (Iter {t})"
                                         )
-                                    else:
-                                        # Access stats via result.stats
-                                        self._worker_statuses[worker_id] = (
-                                            f"Done (Depth:{result.stats.max_depth}, Nodes:{result.stats.nodes_visited:,})"
-                                        )
+                                    elif isinstance(result, WorkerResult):
+                                        # Store WorkerStats object for display
+                                        self._worker_statuses[worker_id] = result.stats
                                 except Exception as pool_e:
                                     logger.error(
                                         "Error fetching result for worker %d iter %d: %s",
@@ -232,6 +244,7 @@ class CFRTrainingLoopMixin:
                                         f"Error ({type(pool_e).__name__})"
                                     )
 
+                            # Update display immediately after checking ready workers
                             self._update_status_display(progress_bar, t, end_iter_num)
 
                             if completed_worker_count < num_workers:
@@ -263,6 +276,15 @@ class CFRTrainingLoopMixin:
 
                 # --- Process Results (Merge) ---
                 if sim_failed_count == num_workers and num_workers > 0:
+                    # Ensure postfix is a dict before setting str
+                    progress_bar.set_postfix(
+                        {
+                            "LastT": "N/A",
+                            "Expl": self._last_exploit_str,
+                            "Nodes": self._total_infosets_str,
+                        },
+                        refresh=False,
+                    )
                     progress_bar.set_postfix_str("All Sims FAILED", refresh=True)
                     logger.error(
                         "All simulations failed for iteration %d. Skipping merge.", t
@@ -279,14 +301,33 @@ class CFRTrainingLoopMixin:
                     # Filter out Nones before merging
                     valid_results = [res for res in results if res is not None]
                     if not valid_results:
+                        # Ensure postfix is a dict before setting str
+                        progress_bar.set_postfix(
+                            {
+                                "LastT": "N/A",
+                                "Expl": self._last_exploit_str,
+                                "Nodes": self._total_infosets_str,
+                            },
+                            refresh=False,
+                        )
                         progress_bar.set_postfix_str("All Sims FAILED", refresh=True)
                         logger.error(
-                            "All simulations failed for iteration %d. Skipping merge.", t
+                            "All simulations failed for iteration %d. Skipping merge.",
+                            t,
                         )
                         continue
                 else:
-                    valid_results = results
+                    valid_results = results  # type: ignore # Checked above
 
+                # Ensure postfix is a dict before setting str
+                progress_bar.set_postfix(
+                    {
+                        "LastT": "N/A",
+                        "Expl": self._last_exploit_str,
+                        "Nodes": self._total_infosets_str,
+                    },
+                    refresh=False,
+                )
                 progress_bar.set_postfix_str("Merging...", refresh=False)
                 merge_start_time = time.time()
                 try:
@@ -296,6 +337,15 @@ class CFRTrainingLoopMixin:
                     logger.debug("Iter %d merge took %.3fs", t, merge_time)
                 except Exception:
                     logger.exception("Error merging results iter %d.", t)
+                    # Ensure postfix is a dict before setting str
+                    progress_bar.set_postfix(
+                        {
+                            "LastT": "N/A",
+                            "Expl": self._last_exploit_str,
+                            "Nodes": self._total_infosets_str,
+                        },
+                        refresh=False,
+                    )
                     progress_bar.set_postfix_str("Merge FAILED", refresh=True)
                     continue
 
@@ -306,11 +356,29 @@ class CFRTrainingLoopMixin:
                 # Calculate Exploitability Periodically
                 exploit_calc_time = 0.0
                 if exploitability_interval > 0 and t % exploitability_interval == 0:
+                    # Ensure postfix is a dict before setting str
+                    progress_bar.set_postfix(
+                        {
+                            "LastT": f"{iter_time:.2f}s",
+                            "Expl": self._last_exploit_str,
+                            "Nodes": self._total_infosets_str,
+                        },
+                        refresh=False,
+                    )
                     progress_bar.set_postfix_str("Avg Strat...", refresh=False)
                     exploit_start_time = time.time()
                     logger.info("Calculating exploitability at iteration %d...", t)
                     current_avg_strategy = self.compute_average_strategy()
                     if current_avg_strategy:
+                        # Ensure postfix is a dict before setting str
+                        progress_bar.set_postfix(
+                            {
+                                "LastT": f"{iter_time:.2f}s",
+                                "Expl": self._last_exploit_str,
+                                "Nodes": self._total_infosets_str,
+                            },
+                            refresh=False,
+                        )
                         progress_bar.set_postfix_str("Exploit...", refresh=False)
                         exploit = self.analysis.calculate_exploitability(
                             current_avg_strategy, self.config
@@ -343,6 +411,8 @@ class CFRTrainingLoopMixin:
 
                 # Save progress periodically
                 if t % self.config.cfr_training.save_interval == 0:
+                    # Ensure postfix is a dict before setting str
+                    progress_bar.set_postfix(postfix_dict, refresh=False)
                     progress_bar.set_postfix_str("Saving...", refresh=True)
                     self.save_data()  # Saves state after completing iteration 't'
                     progress_bar.set_postfix(
@@ -391,8 +461,42 @@ class CFRTrainingLoopMixin:
                     "Shutdown before first new iteration completed or loaded. No progress to save."
                 )
             # Re-raise as KeyboardInterrupt for main's finally block
-        except KeyboardInterrupt as exc:
-            raise KeyboardInterrupt("Graceful shutdown processed") from exc
+            raise KeyboardInterrupt(
+                "Graceful shutdown processed"
+            ) from GracefulShutdownException()
+
+        except (
+            KeyboardInterrupt
+        ) as exc:  # Catch direct KeyboardInterrupt if not through GracefulShutdownException
+            logger.warning(
+                "KeyboardInterrupt caught directly in train loop. Saving progress..."
+            )
+            # Logic similar to GracefulShutdownException handling
+            if pool:
+                logger.warning("Terminating worker pool due to KeyboardInterrupt...")
+                pool.terminate()
+                try:
+                    pool.join()
+                except Exception as join_e:
+                    logger.error("Error joining pool: %s", join_e)
+                pool = None
+            completed_iter_to_save = (
+                self.current_iteration - 1
+                if self.current_iteration > last_completed_iteration
+                else last_completed_iteration
+            )
+            if completed_iter_to_save >= 0:
+                temp_iter = self.current_iteration
+                self.current_iteration = completed_iter_to_save
+                try:
+                    self.save_data()
+                    logger.info(
+                        "Progress saved after interrupt (iter %d).",
+                        self.current_iteration,
+                    )
+                except Exception as save_e:
+                    logger.error("Failed save after interrupt: %s", save_e)
+            raise KeyboardInterrupt("KeyboardInterrupt processed") from exc
 
         except Exception as main_loop_e:
             logger.exception("Unhandled exception in main training loop:")
@@ -439,7 +543,9 @@ class CFRTrainingLoopMixin:
                 # Attempt to clear previous status lines, might not work perfectly everywhere
                 # Write enough newlines to cover the potential status block height
                 num_status_lines = self.config.cfr_training.num_workers + 2
-                tqdm.write("\n" * num_status_lines, file=sys.stderr, end="")
+                # Only write clearing characters if likely in a terminal
+                if sys.stderr.isatty():
+                    tqdm.write("\n" * num_status_lines, file=sys.stderr, end="")
 
         # --- Training Loop Finished Normally ---
         end_time = time.time()
@@ -488,19 +594,29 @@ class CFRTrainingLoopMixin:
         self, progress_bar: tqdm, current_iter: int, total_iter: int
     ):
         """Updates the main progress bar postfix and prints worker statuses above it."""
-        # Update postfix for the main bar
-        postfix_dict = {
-            "LastT": progress_bar.postfix.get(
-                "LastT", "N/A"
-            ),  # Preserve last time if available
+        # --- Update postfix for the main bar ---
+        last_t_value = "N/A"
+        # Check the type of postfix before trying to access it
+        if isinstance(progress_bar.postfix, dict):
+            last_t_value = progress_bar.postfix.get("LastT", "N/A")
+        elif isinstance(progress_bar.postfix, str):
+            # If postfix is a string (from set_postfix_str), we can't get LastT.
+            # Keep the default "N/A" or decide if the string itself should be preserved somehow.
+            # For simplicity, let's reset to "N/A" if it was a string.
+            last_t_value = "N/A"
+
+        # Construct the postfix dictionary we *want* to set
+        current_postfix_dict = {
+            "LastT": last_t_value,
             "Expl": self._last_exploit_str,
             "Nodes": self._total_infosets_str,
         }
+        # Set the postfix to the dictionary format, ensuring it's not a string
         progress_bar.set_postfix(
-            postfix_dict, refresh=False
+            current_postfix_dict, refresh=False
         )  # Don't refresh main bar yet
 
-        # Prepare status lines for workers
+        # --- Prepare status lines for workers ---
         status_lines = []
         num_workers = self.config.cfr_training.num_workers
         if num_workers > 0:
@@ -508,16 +624,37 @@ class CFRTrainingLoopMixin:
             status_lines.append(header)
             max_len = len(header)
             for i in range(num_workers):
-                status = self._worker_statuses.get(i, "Unknown")
-                line = f" W{i:<2}: {status}"
+                status_info = self._worker_statuses.get(i, "Unknown")
+                status_str = ""
+                if isinstance(status_info, WorkerStats):
+                    # Format WorkerStats object
+                    status_str = f"Done (Depth:{status_info.max_depth}, Nodes:{status_info.nodes_visited:,})"
+                elif isinstance(status_info, str):
+                    # Use the string status directly (e.g., "Running", "Failed")
+                    status_str = status_info
+                else:
+                    status_str = "Unknown State"
+
+                line = f" W{i:<2}: {status_str}"
                 status_lines.append(line)
                 max_len = max(max_len, len(line))
             status_lines.append("-" * max_len)  # Footer line matching max width
 
-            # Use tqdm.write to print the status block. This handles progress bar interference.
-            # Add newlines before the block to separate it from previous output/bar.
-            status_block = "\n" + "\n".join(status_lines)
+            # Use tqdm.write to print the status block.
+            # Clear previous lines using ANSI codes if in a suitable terminal.
+            clear_lines = num_workers + 2
+            if sys.stderr.isatty():
+                # Move cursor up, clear lines from cursor down, move cursor up again
+                # This seems slightly more robust on some terminals than clearing line by line up.
+                tqdm.write(
+                    f"\033[{clear_lines}F\033[J\033[{clear_lines}F",
+                    file=sys.stderr,
+                    end="",
+                )
+
+            status_block = "\n".join(status_lines)
             tqdm.write(status_block, file=sys.stderr, end="\n")
 
         # Refresh the main progress bar now *after* writing status lines
+        # and ensuring postfix is a dictionary
         progress_bar.refresh()
