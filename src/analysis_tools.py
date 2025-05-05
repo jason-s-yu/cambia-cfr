@@ -17,12 +17,9 @@ from .utils import (
     normalize_probabilities,
 )
 
+from .game.helpers import serialize_card
+
 logger = logging.getLogger(__name__)
-
-
-def _serialize_card(card: CardObject) -> Optional[str]:
-    """Helper to serialize a Card object to a string."""
-    return str(card) if card else None
 
 
 def _serialize_action(action: GameAction) -> Dict[str, Any]:
@@ -199,11 +196,13 @@ class AnalysisTools:
             return max_value
         else:
             try:
+                # IMPORTANT: Use the *BR player's* agent state view to get the infoset key
+                # even when the *opponent* is acting. This aligns with how the BR value is calculated.
                 base_infoset_tuple = br_agent_state.get_infoset_key()
                 infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
             except Exception:
                 logger.error(
-                    "BR Calc: Error getting infoset key for opponent P%d at depth %d. BR State: %s",
+                    "BR Calc: Error getting infoset key for opponent's turn P%d at depth %d using BR player's state. BR State: %s",
                     acting_player,
                     depth,
                     br_agent_state,
@@ -272,6 +271,9 @@ class AnalysisTools:
                     infoset_key,
                     depth,
                 )
+                # If opponent has no actions/strategy, the BR player gets the value of the current state
+                # However, this shouldn't happen in a non-terminal state with actions.
+                # default to 0 for safety
                 return 0.0
 
             return expected_value
@@ -333,10 +335,13 @@ class AnalysisTools:
                     elif isinstance(obj, (np.void)):
                         return None
                     elif isinstance(obj, InfosetKey):
+                        # Convert InfosetKey to its tuple representation for JSON
                         return obj.astuple()
                     try:
+                        # Fallback to string representation
                         return str(obj)
                     except TypeError:
+                        # Last resort: Use repr if str fails
                         return repr(obj)
 
                 json_record = json.dumps(game_details, default=default_serializer)
@@ -361,7 +366,8 @@ class AnalysisTools:
         final_hands_serializable, final_scores = [], []
         for i, player_state in enumerate(game_state.players):
             if hasattr(player_state, "hand") and isinstance(player_state.hand, list):
-                hand_str = [_serialize_card(c) for c in player_state.hand]
+                # Use the imported serialize_card
+                hand_str = [serialize_card(c) for c in player_state.hand]
                 final_hands_serializable.append(hand_str)
                 final_scores.append(sum(c.value for c in player_state.hand if c))
             else:
@@ -369,7 +375,8 @@ class AnalysisTools:
                 final_scores.append(999)
 
         initial_hands_serializable = (
-            [[_serialize_card(c) for c in hand] for hand in initial_hands]
+            # Use the imported serialize_card
+            [[serialize_card(c) for c in hand] for hand in initial_hands]
             if initial_hands
             else None
         )
