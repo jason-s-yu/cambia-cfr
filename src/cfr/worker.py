@@ -1,51 +1,44 @@
-# src/cfr/worker.py
-"""
-Functions executed by worker processes for parallel CFR training.
-Based on External Sampling Monte Carlo CFR.
-Logs directly to worker-specific files.
-"""
+"""src/cfr/worker.py"""
 
 import copy
 import logging
 import os
+import queue
 import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, TypeAlias
-import queue
 
 import numpy as np
 
 # Relative imports from parent directories
-from ..agent_state import AgentState, AgentObservation
+from ..agent_state import AgentObservation, AgentState
 from ..config import Config
 from ..constants import (
     NUM_PLAYERS,
-    DecisionContext,
-    GameAction,
-    ActionDiscard,
-    ActionReplace,
-    ActionAbilityPeekOwnSelect,
-    ActionAbilityPeekOtherSelect,
     ActionAbilityBlindSwapSelect,
     ActionAbilityKingLookSelect,
     ActionAbilityKingSwapDecision,
+    ActionAbilityPeekOtherSelect,
+    ActionAbilityPeekOwnSelect,
+    ActionDiscard,
+    ActionReplace,
     ActionSnapOpponentMove,
     CardObject,
+    DecisionContext,
+    GameAction,
 )
 from ..game.engine import CambiaGameState
 from ..game.types import StateDelta, UndoInfo
+from ..serial_rotating_handler import SerialRotatingFileHandler
 from ..utils import (
     InfosetKey,
-    get_rm_plus_strategy,
+    LocalReachProbUpdateDict,
     LocalRegretUpdateDict,
     LocalStrategyUpdateDict,
-    LocalReachProbUpdateDict,
     WorkerResult,
     WorkerStats,
+    get_rm_plus_strategy,
 )
-
-from ..serial_rotating_handler import SerialRotatingFileHandler
-
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 ProgressQueue: TypeAlias = queue.Queue
@@ -85,10 +78,12 @@ def _traverse_game_for_worker(
         worker_stats.nodes_visited % PROGRESS_UPDATE_NODE_INTERVAL == 0
     ):
         try:
+            # Send current depth, max depth for this worker, and nodes visited
             progress_update = (
                 worker_id,
-                worker_stats.max_depth,
-                worker_stats.nodes_visited,
+                depth,  # Current recursion depth
+                worker_stats.max_depth,  # Max depth seen by this worker so far
+                worker_stats.nodes_visited,  # Total nodes visited by this worker
             )
             # Use put_nowait for manager queue if progress_queue comes from manager
             progress_queue.put_nowait(progress_update)

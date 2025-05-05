@@ -1,38 +1,42 @@
-# src/cfr/training_loop_mixin.py
-"""Mixin class for orchestrating the CFR+ training loop."""
+"""src/cfr/training_loop_mixin.py"""
 
+import copy
 import logging
+import multiprocessing
+import multiprocessing.pool
+import os
+import queue
 import sys
 import threading
 import time
-import copy
-import multiprocessing
-import multiprocessing.pool
-import queue
-import os
-from typing import Any, Callable, Optional, List, Tuple, Dict, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from tqdm import tqdm
 
 from ..analysis_tools import AnalysisTools
-
-from ..utils import WorkerResult, PolicyDict, WorkerStats, LogQueue as ProgressQueue
 from ..config import Config
+
+# Import the new formatting utility
+from ..utils import (
+    LogQueue as ProgressQueue,
+    PolicyDict,
+    WorkerResult,
+    WorkerStats,
+    format_large_number,
+)
 from .exceptions import GracefulShutdownException
 from .worker import run_cfr_simulation_worker
 
-
 logger = logging.getLogger(__name__)
 
-# Timeout for waiting on worker pool join during shutdown (seconds) - Not used directly
-# POOL_JOIN_TIMEOUT = 10.0
-
-# Define a type for worker status storage
-WorkerStatusInfo = Union[str, WorkerStats, Tuple[str, int, int]]
+# Define a type for worker status storage - extended tuple for live updates
+WorkerStatusInfo = Union[
+    str, WorkerStats, Tuple[str, int, int, int]
+]  # state, cur_d, max_d, nodes
 
 
 def format_infoset_count(count: int) -> str:
-    """Formats a large number with k/M suffixes."""
+    """Formats a large number with k/M suffixes for the main progress bar."""
     if count < 1000:
         return str(count)
     elif count < 1_000_000:
@@ -126,7 +130,8 @@ class CFRTrainingLoopMixin:
                 iter_start_time = time.time()
                 self.current_iteration = t
                 self._worker_statuses = {
-                    i: ("Starting", 0, 0) for i in range(num_workers)
+                    i: ("Starting", 0, 0, 0)
+                    for i in range(num_workers)  # state, cur_d, max_d, nodes
                 }
                 # Update total infoset count for display before starting iteration logic
                 self._total_infosets_str = format_infoset_count(len(self.regret_sum))
@@ -155,7 +160,7 @@ class CFRTrainingLoopMixin:
 
                 if num_workers == 1:
                     # Sequential execution
-                    self._worker_statuses[0] = ("Running", 0, 0)
+                    self._worker_statuses[0] = ("Running", 0, 0, 0)
                     self._update_status_display(progress_bar, t, end_iter_num)
                     try:
                         worker_args = worker_base_args + (0, run_log_dir, run_timestamp)
@@ -182,7 +187,7 @@ class CFRTrainingLoopMixin:
                                 self._worker_statuses[0].error_count += 1
                         elif isinstance(result, WorkerResult):
                             self._worker_statuses[0] = result.stats
-                    except Exception:
+                    except Exception as e:
                         logger.exception("Error during sequential simulation iter %d.", t)
                         sim_failed_count += 1
                         # Try to capture stats with error count if status was already WorkerStats
@@ -207,7 +212,7 @@ class CFRTrainingLoopMixin:
                     pool = None
                     try:
                         self._worker_statuses = {
-                            i: ("Queued", 0, 0) for i in range(num_workers)
+                            i: ("Queued", 0, 0, 0) for i in range(num_workers)
                         }
                         self._update_status_display(progress_bar, t, end_iter_num)
 
@@ -216,7 +221,7 @@ class CFRTrainingLoopMixin:
                             async_results[worker_id] = pool.apply_async(
                                 run_cfr_simulation_worker, (args,)
                             )
-                            self._worker_statuses[worker_id] = ("Running", 0, 0)
+                            self._worker_statuses[worker_id] = ("Running", 0, 0, 0)
 
                         pool.close()
                         self._update_status_display(progress_bar, t, end_iter_num)
@@ -232,19 +237,22 @@ class CFRTrainingLoopMixin:
                             if progress_queue:
                                 try:
                                     while True:
-                                        prog_w_id, prog_d, prog_n = (
+                                        # Expect worker_id, current_depth, max_depth, nodes
+                                        prog_w_id, prog_cur_d, prog_max_d, prog_n = (
                                             progress_queue.get_nowait()
                                         )
                                         current_status = self._worker_statuses.get(
                                             prog_w_id
                                         )
+                                        # Only update if worker is still 'Running'
                                         if (
                                             isinstance(current_status, tuple)
                                             and current_status[0] == "Running"
                                         ):
                                             self._worker_statuses[prog_w_id] = (
                                                 "Running",
-                                                prog_d,
+                                                prog_cur_d,
+                                                prog_max_d,
                                                 prog_n,
                                             )
                                 except queue.Empty:
@@ -644,7 +652,7 @@ class CFRTrainingLoopMixin:
         }
         progress_bar.set_postfix(current_postfix_dict, refresh=False)
 
-        # --- Prepare status lines for workers (using k for nodes) ---
+        # --- Prepare status lines for workers (using new formatting) ---
         status_lines = []
         num_workers = self.config.cfr_training.num_workers
         if num_workers > 0:
@@ -655,14 +663,14 @@ class CFRTrainingLoopMixin:
                 status_info = self._worker_statuses.get(i, "Unknown")
                 status_str = ""
                 if isinstance(status_info, WorkerStats):
-                    # Format final stats with 'k' for nodes
-                    nodes_k = status_info.nodes_visited // 1000
-                    status_str = f"Done (D:{status_info.max_depth}, N:{nodes_k}k, W:{status_info.warning_count}, E:{status_info.error_count})"
-                elif isinstance(status_info, tuple) and len(status_info) == 3:
-                    # Format live stats with 'k' for nodes
-                    state, depth, nodes = status_info
-                    nodes_k = nodes // 1000
-                    status_str = f"{state} (D:{depth}, N:{nodes_k}k)"
+                    # Format final stats: Use format_large_number for nodes
+                    nodes_fmt = format_large_number(status_info.nodes_visited)
+                    status_str = f"Done (D:{status_info.max_depth}, N:{nodes_fmt}, W:{status_info.warning_count}, E:{status_info.error_count})"
+                elif isinstance(status_info, tuple) and len(status_info) == 4:
+                    # Format live stats: Use format_large_number for nodes, show current/max depth
+                    state, current_depth, max_depth, nodes = status_info
+                    nodes_fmt = format_large_number(nodes)
+                    status_str = f"{state} (D:{current_depth}/{max_depth}, N:{nodes_fmt})"
                 elif isinstance(status_info, str):
                     status_str = status_info
                 else:
@@ -742,8 +750,9 @@ class CFRTrainingLoopMixin:
                         status_info = self._worker_statuses.get(i)
                         status_line = f"Worker {i}: "
                         if isinstance(status_info, WorkerStats):
-                            # Write full node count, warnings, errors
-                            status_line += f"Completed (Max Depth: {status_info.max_depth}, Nodes Visited: {status_info.nodes_visited:,}, Warnings: {status_info.warning_count}, Errors: {status_info.error_count})"
+                            # Use format_large_number for node display in summary too
+                            nodes_fmt = format_large_number(status_info.nodes_visited)
+                            status_line += f"Completed (Max Depth: {status_info.max_depth}, Nodes Visited: {nodes_fmt}, Warnings: {status_info.warning_count}, Errors: {status_info.error_count})"
                             total_nodes += status_info.nodes_visited
                             max_depth_overall = max(
                                 max_depth_overall, status_info.max_depth
@@ -760,6 +769,17 @@ class CFRTrainingLoopMixin:
                                 total_errors += (
                                     1  # Count failure/error string as an error
                                 )
+                        # Handle live status tuple in summary (should ideally be WorkerStats or str)
+                        elif isinstance(status_info, tuple) and len(status_info) == 4:
+                            state, cur_d, max_d, nodes = status_info
+                            nodes_fmt = format_large_number(nodes)
+                            status_line += (
+                                f"Stopped ({state}, D:{cur_d}/{max_d}, N:{nodes_fmt})"
+                            )
+                            failed_workers += (
+                                1  # Treat stopped mid-run as a failure/incomplete state
+                            )
+                            total_errors += 1
                         else:
                             status_line += (
                                 f"Unknown Final State ({type(status_info).__name__})"
@@ -772,8 +792,9 @@ class CFRTrainingLoopMixin:
                     f.write(f"Completed Workers (Returned Stats): {completed_workers}\n")
                     f.write(f"Failed/Error Workers (String Status): {failed_workers}\n")
                     f.write(f"Workers with Errors in Stats: {error_in_stats_workers}\n")
+                    # Format aggregated numbers nicely in summary
                     f.write(
-                        f"Total Nodes Visited (Sum Across Completed Workers): {total_nodes:,}\n"
+                        f"Total Nodes Visited (Sum Across Completed Workers): {format_large_number(total_nodes)} ({total_nodes:,})\n"
                     )
                     f.write(
                         f"Max Depth Reached (Overall Across Completed Workers): {max_depth_overall}\n"
@@ -789,13 +810,23 @@ class CFRTrainingLoopMixin:
                     f.write("Sequential execution (1 worker).\n")
                     status_info = self._worker_statuses.get(0)
                     if isinstance(status_info, WorkerStats):
+                        nodes_fmt = format_large_number(status_info.nodes_visited)
                         f.write(f"  Final Status: Completed\n")
                         f.write(f"  Max Depth: {status_info.max_depth}\n")
-                        f.write(f"  Nodes Visited: {status_info.nodes_visited:,}\n")
+                        f.write(
+                            f"  Nodes Visited: {nodes_fmt} ({status_info.nodes_visited:,})\n"
+                        )
                         f.write(f"  Warnings: {status_info.warning_count}\n")
                         f.write(f"  Errors: {status_info.error_count}\n")
                     elif isinstance(status_info, str):
                         f.write(f"  Final Status: {status_info}\n")
+                    # Handle tuple case in summary if sequential run interrupted
+                    elif isinstance(status_info, tuple) and len(status_info) == 4:
+                        state, cur_d, max_d, nodes = status_info
+                        nodes_fmt = format_large_number(nodes)
+                        f.write(
+                            f"  Final Status: Stopped ({state}, D:{cur_d}/{max_d}, N:{nodes_fmt})\n"
+                        )
 
                 f.write("\n--- End Summary ---\n")
         except IOError as e:

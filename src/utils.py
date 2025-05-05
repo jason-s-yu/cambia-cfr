@@ -1,14 +1,13 @@
-# src/utils.py
-"""Utility functions and type aliases for CFR."""
+"""src/utils.py"""
 
-from typing import TypeAlias, Dict, Tuple
-from dataclasses import dataclass, field
 import multiprocessing
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, TypeAlias
+
 import numpy as np
 
 
 # Type alias for Regret/Strategy Dictionaries
-# Using the new dataclass for the key type hint
 @dataclass(frozen=True)
 class InfosetKey:
     """Represents the key for accessing policy/regret data. Must be hashable."""
@@ -100,3 +99,23 @@ def get_rm_plus_strategy(regret_sum: np.ndarray) -> np.ndarray:
     # RM+ uses only positive regrets
     positive_regrets = np.maximum(0.0, regret_sum)
     return normalize_probabilities(positive_regrets)
+
+
+def format_large_number(num: int) -> str:
+    """Formats a large integer with metric prefixes (k, M, B, T).
+
+    Args:
+        num: The integer to format.
+
+    Returns:
+        A formatted string representation of the number.
+    """
+    if num < 1000:
+        return str(num)
+    if num < 1_000_000:
+        return f"{num / 1_000:.0f}k"  # No decimals for thousands
+    if num < 1_000_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    if num < 1_000_000_000_000:
+        return f"{num / 1_000_000_000:.2f}B"
+    return f"{num / 1_000_000_000_000:.2f}T"
