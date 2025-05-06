@@ -229,45 +229,54 @@ class LiveDisplayManager:
             return self.layout
         except Exception as e:
             # Fallback if rendering fails during update
-            logging.error(f"Error generating display layout: {e}", exc_info=True)
+            logging.error("Error generating display layout: %s", e, exc_info=True)
             # Return a simple Text object indicating the error
             return Layout(Text(f"Error generating display layout: {e}", style="bold red"))
 
     def refresh(self):
         """Explicitly triggers a refresh of the Live display if active."""
-        # Re-introduce explicit refresh call
         if self.live and hasattr(self.live, "refresh"):
             try:
-                self.live.refresh()
+                # Rich's Live object manages its own refresh scheduling based on refresh_per_second.
+                # Calling live.update(renderable) is generally preferred to force a redraw with new content.
+                # However, if just internal data has changed that _generate_renderable uses,
+                # ensuring the Live object processes its next refresh cycle is key.
+                # A direct live.refresh() might be redundant if live.update() is used or if the internal
+                # refresh cycle is frequent enough.
+                # Forcing an update with the new renderable is safer.
+                self.live.update(self._generate_renderable(), refresh=True)
+
             except Exception as e:
-                # Log error if refresh fails, but don't crash
-                logging.error(f"Error explicitly refreshing Live display: {e}")
+                logging.error("Error explicitly refreshing Live display: %s", e, exc_info=True)
+
 
     # --- Public Update Methods ---
     def add_log_record(self, record: logging.LogRecord):
         """Adds a log record to the display queue."""
         self._log_records.append(record)
-        self.refresh()  # Refresh after adding log to show it sooner
+        self.refresh()
 
     def update_worker_status(self, worker_id: int, status: WorkerDisplayStatus):
         """Updates the status of a specific worker."""
         if 0 <= worker_id < self.num_workers:
             self._worker_statuses[worker_id] = status
-            # No explicit refresh here; rely on the main loop's refresh call after processing queue
+            self.refresh() # Refresh to show updated worker status
         else:
             logging.error(
-                f"LiveDisplay: Invalid worker ID {worker_id} for status update."
+                "LiveDisplay: Invalid worker ID %d for status update.", worker_id
             )
 
     def update_overall_progress(self, completed: int):
         """Updates the main iteration progress bar."""
         self._current_iteration = completed
         try:
-            # Update the progress bar task directly
             self.progress.update(self.iteration_task_id, completed=completed)
-            # Progress bar updates are handled efficiently by Live, no full refresh needed
+            # No full refresh needed, progress bar updates efficiently.
+            # However, if other parts of the display depend on _current_iteration (e.g. table title),
+            # a selective refresh or relying on the general refresh cycle is needed.
+            # self.refresh() # Can add if other components need immediate update based on iteration
         except Exception as e:
-            logging.error(f"Error updating progress bar completion: {e}")
+            logging.error("Error updating progress bar completion: %s", e, exc_info=True)
 
     def update_stats(
         self,
@@ -277,7 +286,6 @@ class LiveDisplayManager:
         last_iter_time: Optional[float] = None,
     ):
         """Updates the displayed overall statistics."""
-        # Update internal state variables that affect header/table title/progress status
         self._current_iteration = iteration
         self._total_infosets = infosets
         self._last_exploitability = exploitability
@@ -286,14 +294,12 @@ class LiveDisplayManager:
         )
         status_text = f"Infosets: {infosets} | Expl: {exploitability} | Last T: {self._last_iter_time}"
         try:
-            # Update the status_text field in the progress bar task
             self.progress.update(
                 self.iteration_task_id, status_text=status_text, advance=0
             )
-            # Since header and table title depend on these stats, trigger a refresh
-            self.refresh()
+            self.refresh() # Refresh to show updated header/table titles
         except Exception as e:
-            logging.error(f"Error updating progress bar stats field or refreshing: {e}")
+            logging.error("Error updating progress bar stats field or refreshing: %s", e, exc_info=True)
 
     def start(self):
         """Starts the Rich Live display."""
@@ -302,54 +308,54 @@ class LiveDisplayManager:
                 self.live = Live(
                     self._generate_renderable(),
                     console=self.console,
-                    refresh_per_second=4,  # Refresh rate
-                    transient=False,  # Keep display after exit
+                    refresh_per_second=2,
+                    transient=False,
                     vertical_overflow="visible",
                 )
-                self.live.start(refresh=True)  # Start background refresh thread
+                self.live.start(refresh=True)
                 logging.debug("Rich Live display started.")
             except Exception as e:
-                logging.error(f"Failed to start Rich Live display: {e}", exc_info=True)
-                self.live = None  # Ensure live is None if start fails
+                logging.error("Failed to start Rich Live display: %s", e, exc_info=True)
+                self.live = None
 
     def stop(self):
         """Stops the Rich Live display."""
         if self.live:
             try:
                 self.live.stop()
-                self.console.print()
+                self.console.print() # Print a final newline
                 logging.debug("Rich Live display stopped.")
             except Exception as e:
-                logging.error(f"Error stopping Rich Live display: {e}", exc_info=True)
+                logging.error("Error stopping Rich Live display: %s", e, exc_info=True)
             finally:
-                self.live = None  # Mark as stopped
+                self.live = None
 
     def run(self, func, *args, **kwargs):
         """Runs a function within the Live context."""
-        if self.live:  # Ensure not already running
+        if self.live:
             self.stop()
 
         try:
             with Live(
                 self._generate_renderable(),
                 console=self.console,
-                refresh_per_second=4,  # Same refresh rate
+                refresh_per_second=2,
                 transient=False,
                 vertical_overflow="visible",
             ) as live_context:
-                self.live = live_context  # Store the active context
+                self.live = live_context
                 try:
                     result = func(*args, **kwargs)
                     return result
                 finally:
-                    self.live = None  # Clear before context manager stops
+                    self.live = None 
         except Exception as e:
-            if self.live:  # Ensure stopped on error
+            if self.live:
                 try:
                     self.live.stop()
                 except Exception:
-                    pass
+                    pass # Suppress errors during stop on error
                 finally:
                     self.live = None
             logging.error("Error occurred within Live context run:", exc_info=True)
-            raise  # Re-raise
+            raise
