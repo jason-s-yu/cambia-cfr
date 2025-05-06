@@ -1,4 +1,5 @@
-# src/main_train.py
+"""src/main_train.py"""
+
 import logging
 import logging.handlers
 import argparse
@@ -9,15 +10,20 @@ import signal
 import threading
 import multiprocessing
 
+# Rich imports
+from rich.console import Console
+
+# from rich.logging import RichHandler # Using custom handler
+
 from typing import List, Optional, Tuple
-from tqdm import tqdm
 
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import load_config
 from .cfr.trainer import CFRTrainer
-
 from .utils import LogQueue as ProgressQueue
 from .cfr.exceptions import GracefulShutdownException
+from .live_display import LiveDisplayManager
+from .live_log_handler import LiveLogHandler
 
 # Global logger instance
 logger = logging.getLogger(__name__)
@@ -37,28 +43,16 @@ def handle_sigint(sig, frame):
         )
 
 
-class TqdmLoggingHandler(logging.Handler):
-    """Passes log records to tqdm.write(), ensuring they don't interfere with the progress bar."""
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            tqdm.write(msg, file=sys.stderr)  # nolock=True removed
-            self.flush()
-        except Exception:
-            self.handleError(record)
-
-
 def setup_logging(
-    config, verbose: bool
-) -> Optional[Tuple[str, str]]:  # Return tuple or None
-    """Configures logging directly for the main process."""
+    config, verbose: bool, live_display_manager: LiveDisplayManager
+) -> Optional[Tuple[str, str]]:
+    """Configures logging, integrating with the LiveDisplayManager."""
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
     file_log_level = getattr(logging, log_level_file_str, logging.DEBUG)
-    default_console_log_level = getattr(logging, log_level_console_str, logging.WARNING)
-    console_log_level = file_log_level if verbose else default_console_log_level
+    # Console level set low for handler, Rich display/filtering will manage output level if needed
+    console_log_level = logging.DEBUG
 
     main_log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
@@ -69,7 +63,6 @@ def setup_logging(
 
     # --- Create Run Directory ---
     try:
-        # Use underscores for timestamp format now
         run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
         run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run_{run_timestamp}")
         os.makedirs(run_log_dir, exist_ok=True)
@@ -79,31 +72,25 @@ def setup_logging(
         )
         return None
 
-    # --- Create Handlers (for the main process) ---
+    # --- Create Handlers ---
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)-8s - [%(processName)-20s] - %(name)-25s - %(message)s"
     )
     handlers: List[logging.Handler] = []
 
-    # Console Handler
-    if sys.stderr.isatty():
-        ch = TqdmLoggingHandler()
-    else:
-        ch = logging.StreamHandler(sys.stderr)
-    ch.setLevel(console_log_level)
-    ch.setFormatter(formatter)
-    handlers.append(ch)
+    # Live Handler
+    live_handler = LiveLogHandler(live_display_manager, level=console_log_level)
+    handlers.append(live_handler)
 
-    # Main Process File Handler (Serial Rotating)
+    # File Handler
     try:
-        # Use "...-main.log" for the main process log file base pattern
         main_log_pattern = os.path.join(
             run_log_dir, f"{log_prefix}_run_{run_timestamp}-main"
         )
         max_bytes = config.logging.log_max_bytes
         backup_count = config.logging.log_backup_count
         fh = SerialRotatingFileHandler(
-            main_log_pattern,  # Pass base pattern without _NNN.log
+            main_log_pattern,
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",
@@ -111,23 +98,21 @@ def setup_logging(
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
         handlers.append(fh)
-        main_log_file = fh.baseFilename  # Get initial file name
+        main_log_file = fh.baseFilename
     except Exception as e:
         print(f"ERROR: Could not set up main process file logging: {e}")
         main_log_file = "File logging disabled"
 
-    # --- Configure Root Logger (for the main process) ---
+    # --- Configure Root Logger ---
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # Set root to lowest level
-    # Remove any previous handlers
+    root_logger.setLevel(logging.DEBUG)
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
-    # Add the configured handlers directly
     for handler in handlers:
         root_logger.addHandler(handler)
 
     # --- Initial Log Messages ---
-    initial_logger = logging.getLogger(__name__)
+    initial_logger = logging.getLogger(__name__)  # Use __name__ logger
     initial_logger.info("-" * 50)
     initial_logger.info("Logging initialized for run: %s", run_timestamp)
     initial_logger.info("Run Log Directory: %s", run_log_dir)
@@ -137,7 +122,8 @@ def setup_logging(
         logging.getLevelName(file_log_level),
     )
     initial_logger.info(
-        "Console Logging: (Level: %s)", logging.getLevelName(console_log_level)
+        "Console Logging via Rich Display Manager (Handler Level: %s)",
+        logging.getLevelName(console_log_level),
     )
     initial_logger.info("Command: %s", " ".join(sys.argv))
     initial_logger.info("-" * 50)
@@ -166,12 +152,15 @@ def setup_logging(
     # Reduce Verbosity from Libraries
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("joblib").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.INFO)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
-    return run_log_dir, run_timestamp  # Return dir and timestamp
+    return run_log_dir, run_timestamp
 
 
 def main():
+    # --- DEBUG PRINT 1 ---
+    print("DEBUG: main() started", file=sys.stderr)
+
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(
         "--config",
@@ -192,9 +181,15 @@ def main():
         "--save_path", type=str, default=None, help="Override save path for agent data"
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose console logging"
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose console logging (DEBUG)",
     )
     args = parser.parse_args()
+
+    # --- DEBUG PRINT 2 ---
+    print(f"DEBUG: Args parsed: {args}", file=sys.stderr)
 
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -203,32 +198,57 @@ def main():
         print("ERROR: Failed to load configuration. Exiting.")
         sys.exit(1)
 
-    # --- Explicitly Manage the Multiprocessing Manager for ProgressQueue ---
+    # --- DEBUG PRINT 3 ---
+    print("DEBUG: Config loaded", file=sys.stderr)
+
+    # Initialize Rich Console and LiveDisplayManager
+    rich_console = Console(stderr=True, record=False)
+    total_iterations_for_display = (
+        args.iterations
+        if args.iterations is not None
+        else config.cfr_training.num_iterations
+    )
+    live_display_manager = LiveDisplayManager(
+        num_workers=config.cfr_training.num_workers,
+        total_iterations=total_iterations_for_display,
+        console=rich_console,
+    )
+
+    # --- DEBUG PRINT 4 ---
+    print("DEBUG: LiveDisplayManager initialized", file=sys.stderr)
+
+    # Multiprocessing Manager setup
     exit_code = 0
     manager: Optional[multiprocessing.managers.SyncManager] = None
     progress_queue: Optional[ProgressQueue] = None
+    trainer: Optional[CFRTrainer] = None
+
     try:
-        if (
-            config.cfr_training.num_workers > 1
-        ):  # Only need manager if running in parallel
-            # Create and start the manager
+        # --- DEBUG PRINT 5 ---
+        print("DEBUG: Entering main try block", file=sys.stderr)
+
+        if config.cfr_training.num_workers > 1:
             manager = multiprocessing.Manager()
-            # Create the progress queue
             progress_queue = manager.Queue(-1)
+            print(
+                "DEBUG: Multiprocessing manager and queue created", file=sys.stderr
+            )  # DEBUG
         else:
-            # Don't need manager or progress queue for sequential run
             manager = None
             progress_queue = None
+            print("DEBUG: Sequential mode - no manager/queue", file=sys.stderr)  # DEBUG
 
         # Setup logging
-        setup_result = setup_logging(config, args.verbose)
+        setup_result = setup_logging(config, args.verbose, live_display_manager)
         if not setup_result:
             print("ERROR: Failed to set up logging. Exiting.")
             exit_code = 1
             raise SystemExit(exit_code)
         run_log_dir, run_timestamp = setup_result
-
-        # Logger is now configured globally for the main process
+        # --- DEBUG PRINT 6 ---
+        # Logger might not be fully working if setup failed partially, use print
+        print(f"DEBUG: Logging setup complete. Run dir: {run_log_dir}", file=sys.stderr)
+        # Now use logger safely
         logger.info("--- Starting Cambia CFR+ Training ---")
         logger.info("Configuration loaded from: %s", args.config)
 
@@ -247,85 +267,143 @@ def main():
             except Exception as e:
                 logger.error("Failed to set recursion limit: %s", e)
 
-        # Initialize trainer, passing run details and progress queue
+        # --- DEBUG PRINT 7 ---
+        print("DEBUG: Initializing CFRTrainer...", file=sys.stderr)
+        # Initialize trainer
         try:
             trainer = CFRTrainer(
                 config=config,
                 run_log_dir=run_log_dir,
                 run_timestamp=run_timestamp,
                 shutdown_event=shutdown_event,
-                progress_queue=progress_queue,  # Pass progress queue (or None)
+                progress_queue=progress_queue,
+                live_display_manager=live_display_manager,
             )
-        except Exception:
-            logger.exception("Failed to initialize CFRTrainer:")
+            # --- DEBUG PRINT 8 ---
+            print("DEBUG: CFRTrainer initialized successfully.", file=sys.stderr)
+        except Exception as trainer_init_e:
+            print(
+                f"FATAL: Failed to initialize CFRTrainer: {trainer_init_e}",
+                file=sys.stderr,
+            )  # Use print
+            logger.exception("Failed to initialize CFRTrainer:")  # Log exception too
             exit_code = 1
-            raise
+            raise  # Re-raise the exception
 
         # Load data if requested
         if args.load:
+            # --- DEBUG PRINT 9 ---
+            print("DEBUG: Loading agent data...", file=sys.stderr)
             logger.info(
                 "Attempting to load agent data from: %s",
                 config.persistence.agent_data_save_path,
             )
             trainer.load_data()
+            if live_display_manager:
+                live_display_manager.update_overall_progress(trainer.current_iteration)
+                live_display_manager.update_stats(
+                    iteration=trainer.current_iteration,
+                    infosets=trainer._total_infosets_str,
+                    exploitability=trainer._last_exploit_str,
+                )
+            # --- DEBUG PRINT 10 ---
+            print(
+                f"DEBUG: Agent data loading complete. Current iteration: {trainer.current_iteration}",
+                file=sys.stderr,
+            )
         else:
             logger.info("Starting training from scratch.")
 
-        # Run training
+        # --- Run training within the Live display context ---
+        # --- DEBUG PRINT 11 ---
+        print(
+            "DEBUG: Calling live_display_manager.run(trainer.train)...", file=sys.stderr
+        )
         try:
-            trainer.train()
+            if live_display_manager:
+                live_display_manager.run(trainer.train)
+            else:
+                # Fallback if display manager somehow failed init (shouldn't happen)
+                print(
+                    "WARN: Live display not available, running train directly.",
+                    file=sys.stderr,
+                )
+                trainer.train()
+
+            # --- DEBUG PRINT 12 ---
+            # This will only be reached if trainer.train finishes normally
+            print("DEBUG: trainer.train() completed.", file=sys.stderr)
             logger.info("Training completed successfully.")
-        except (
-            KeyboardInterrupt,
-            GracefulShutdownException,
-        ) as e:
+        except (KeyboardInterrupt, GracefulShutdownException) as e:
+            # --- DEBUG PRINT 13 ---
+            print(
+                f"DEBUG: Caught {type(e).__name__} during trainer.train().",
+                file=sys.stderr,
+            )
             logger.warning(
                 "Training interrupted by user (Ctrl+C) or shutdown event (%s).",
                 type(e).__name__,
             )
-            logger.info("Exiting program.")
-            # Saving is handled within the trainer's exception handling
-        except Exception:
+        except Exception as train_exc:
+            # --- DEBUG PRINT 14 ---
+            print(
+                f"DEBUG: Caught Exception {type(train_exc).__name__} during trainer.train().",
+                file=sys.stderr,
+            )
             logger.exception("An unexpected error occurred during training:")
-            exit_code = 1  # Indicate error exit
+            exit_code = 1
 
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
+        # --- DEBUG PRINT 15 ---
+        print(f"DEBUG: Caught SystemExit with code {exit_code}.", file=sys.stderr)
         if logging.getLogger().hasHandlers():
             logger.error("System exit called with code %s.", exit_code)
     except Exception as e:
-        print(f"FATAL ERROR during setup: {e}", file=sys.stderr)
+        # --- DEBUG PRINT 16 ---
+        print(
+            f"DEBUG: Caught Exception {type(e).__name__} in outer try block.",
+            file=sys.stderr,
+        )
+        rich_console.print(f"[bold red]FATAL ERROR during setup:[/bold red] {e}")
+        rich_console.print_exception(show_locals=True)
         if logging.getLogger().hasHandlers():
             logger.exception("FATAL ERROR during setup:")
         exit_code = 1
     finally:
+        # --- DEBUG PRINT 17 ---
+        print("DEBUG: Entering main finally block.", file=sys.stderr)
         # --- Clean Shutdown ---
-        print("--- Initiating Final Shutdown Sequence ---", file=sys.stderr)
+        rich_console.print("--- Initiating Final Shutdown Sequence ---")
 
-        # 1. Remove log handlers from main process? Optional, logging.shutdown should handle it.
+        if live_display_manager and live_display_manager.live:
+            rich_console.print("Stopping Rich Live display...")
+            live_display_manager.stop()
 
-        # 2. Stop the QueueListener - REMOVED
-
-        # 3. Shut down the Manager (only if it was created)
         if manager:
-            print(
-                "Shutting down multiprocessing manager (for progress queue)...",
-                file=sys.stderr,
+            rich_console.print(
+                "Shutting down multiprocessing manager (for progress queue)..."
             )
             try:
                 manager.shutdown()
-                print("Manager shut down.", file=sys.stderr)
             except Exception as mgr_e:
-                print(f"Error shutting down manager: {mgr_e}", file=sys.stderr)
+                rich_console.print(f"[red]Error shutting down manager:[/red] {mgr_e}")
+            else:
+                rich_console.print("Manager shut down.")  # Print success only if no error
 
-        print("--- Cambia CFR+ Training Finished ---", file=sys.stderr)
+        if trainer:
+            rich_console.print("Writing run summary...")
+            trainer._write_run_summary()
 
-        # 4. Final logging shutdown
+        rich_console.print("--- Cambia CFR+ Training Finished ---")
         logging.shutdown()
+        # --- DEBUG PRINT 18 ---
+        print(f"DEBUG: Exiting with code {exit_code}.", file=sys.stderr)
         sys.exit(exit_code)
 
 
 if __name__ == "__main__":
+    # Multiprocessing start method setup remains same
     start_method_set = False
     try:
         preferred_method = "forkserver" if sys.platform != "win32" else "spawn"
@@ -351,10 +429,8 @@ if __name__ == "__main__":
                 print("INFO: Multiprocessing start method already 'spawn'")
         elif current_method is None:
             print("ERROR: Neither 'forkserver' nor 'spawn' start methods available!")
-
     except RuntimeError as e:
         print(f"DEBUG: Multiprocessing start method likely already set? ({e})")
-        pass
     except Exception as e:
         print(f"ERROR: Error setting multiprocessing start method: {e}")
 

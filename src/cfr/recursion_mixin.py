@@ -43,8 +43,6 @@ class CFRRecursionMixin:
     # self.max_depth_this_iter: int
     # self._last_exploit_str: str
 
-    # _cfr_recursive method is REMOVED as logic moved to worker.py
-
     # --- Observation Helper Methods (Retained for potential reuse) ---
 
     def _filter_observation(

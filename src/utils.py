@@ -119,3 +119,15 @@ def format_large_number(num: int) -> str:
     if num < 1_000_000_000_000:
         return f"{num / 1_000_000_000:.2f}B"
     return f"{num / 1_000_000_000_000:.2f}T"
+
+
+def format_infoset_count(count: int) -> str:
+    """Formats a large number with k/M suffixes (no decimals)."""
+    if count < 1000:
+        return str(count)
+    elif count < 1_000_000:
+        # Use integer division for k suffix
+        return f"{count // 1000}k"
+    else:
+        # Use floating point division for M suffix, format to 1 decimal place
+        return f"{count / 1_000_000:.1f}M"
