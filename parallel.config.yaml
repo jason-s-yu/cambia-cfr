@@ -16,7 +16,7 @@ cfr_training:
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
   exploitability_interval: 100  # Calculate exploitability every N iterations (0 to disable)
-  num_workers: 0                # Number of parallel workers for simulations (1 for sequential)
+  num_workers: 16                # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
@@ -39,7 +39,7 @@ cambia_rules:
   initial_view_count: 2          # Cards initially peeked by players
   cambia_allowed_round: 0        # First round (0-indexed) Cambia can be called (0 = immediately)
   allowOpponentSnapping: false   # Can players snap cards in opponent's hand?
-  max_game_turns: 200            # Maximum turns before game ends automatically (0 = no limit)
+  max_game_turns: 50            # Maximum turns before game ends automatically (0 = no limit)
 
 # Persistence Settings
 persistence:
