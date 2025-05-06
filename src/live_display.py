@@ -46,6 +46,12 @@ class LiveDisplayManager:
         self._last_iter_time = "N/A"
         self._log_records: Deque[logging.LogRecord] = deque(maxlen=15)
 
+        # Store previous renderables to compare for changes
+        self._last_header_text_str: Optional[str] = None
+        self._last_worker_table_title: Optional[str] = None
+        self._last_worker_statuses_repr: Optional[str] = None
+        self._last_log_panel_content_str: Optional[str] = None
+
         # Rich components
         self.progress = self._create_progress_bar()
         self.iteration_task_id = self.progress.add_task(
@@ -66,10 +72,9 @@ class LiveDisplayManager:
             TimeElapsedColumn(),
             TextColumn("• Remaining:"),
             TimeRemainingColumn(),
-            # Use status_text field to display dynamic info
             TextColumn("• [i]({task.fields[status_text]})[/i]"),
             console=self.console,
-            transient=False,  # Keep progress bar visible after completion
+            transient=False,
         )
 
     def _create_layout(self) -> Layout:
@@ -91,12 +96,10 @@ class LiveDisplayManager:
     def _generate_worker_table(self) -> Table:
         """Generates the table displaying worker status."""
         table = Table(
-            # Update title dynamically
             title=f"Worker Status (Iter {self._current_iteration})",
             show_header=True,
             header_style="bold magenta",
             expand=True,
-            # Add padding for better spacing
             padding=(0, 1),
         )
         table.add_column("ID", style="dim", width=4, justify="right")
@@ -119,7 +122,6 @@ class LiveDisplayManager:
             )
 
             if isinstance(status_info, WorkerStats):
-                # Display final stats
                 if status_info.error_count > 0:
                     status_str = "[bold red]Error[/bold red]"
                 elif status_info.warning_count > 0:
@@ -131,16 +133,12 @@ class LiveDisplayManager:
                 warn_str = str(status_info.warning_count)
                 err_str = str(status_info.error_count)
             elif isinstance(status_info, tuple) and len(status_info) == 4:
-                # Display live progress tuple: (state, cur_depth, max_depth, nodes)
                 state, cur_d, max_d, nodes = status_info
-                status_str = (
-                    state if state else "Running"
-                )  # Default to running if state is empty
+                status_str = state if state else "Running"
                 depth_str = f"{cur_d}/{max_d}"
                 nodes_str = format_large_number(nodes)
-                warn_str, err_str = "-", "-"  # Warn/Err counts only available at end
+                warn_str, err_str = "-", "-"
             elif isinstance(status_info, str):
-                # Display simple string status
                 if "Error" in status_info or "Fail" in status_info:
                     status_str = f"[bold red]{status_info}[/]"
                 elif (
@@ -149,133 +147,171 @@ class LiveDisplayManager:
                     or "Initializing" in status_info
                 ):
                     status_str = f"[yellow]{status_info}[/]"
-                elif (
-                    "Finished" in status_info or "Done" in status_info
-                ):  # Handle "Done" string status
+                elif "Finished" in status_info or "Done" in status_info:
                     status_str = "[green]Done[/green]"
                 elif "Idle" in status_info:
                     status_str = "[dim]Idle[/dim]"
                 else:
-                    status_str = status_info  # Default display for other strings
+                    status_str = status_info
                 depth_str, nodes_str, warn_str, err_str = "-", "-", "-", "-"
-
             table.add_row(str(i), status_str, depth_str, nodes_str, warn_str, err_str)
-
         return table
 
-    def _generate_log_panel(self) -> Panel:
-        """Generates the panel displaying recent log messages."""
-        log_texts: List[Text] = []  # Store Text objects
-        # Create a temporary RichHandler instance for formatting, don't add it to logger
+    def _generate_log_panel_content_str(self) -> str:
+        """Generates the string content for the log panel, for comparison."""
+        log_texts_plain: List[str] = []
+        # Ensure RichHandler uses the same console for consistent formatting, if needed.
         handler = RichHandler(
-            show_level=True, markup=True, rich_tracebacks=False, show_path=False
+            show_level=True,
+            markup=True,
+            rich_tracebacks=False,
+            show_path=False,
+            console=self.console,
         )
-
-        for record in list(self._log_records):  # Iterate over a copy
+        for record in list(self._log_records):
             try:
-                # Use RichHandler's render method to get renderables (like Text)
                 render_result = handler.render_message(
                     record, message=record.getMessage()
                 )
                 if render_result:
-                    # Add newline if not already present
+                    log_texts_plain.append(
+                        render_result.plain
+                        if isinstance(render_result, Text)
+                        else str(render_result)
+                    )
+            except Exception:  # pylint: disable=broad-except
+                log_texts_plain.append(f"Log Format Error: {record.getMessage()}\n")
+        return "".join(log_texts_plain)
+
+    def _generate_log_panel(self) -> Panel:
+        """Generates the panel displaying recent log messages."""
+        log_texts: List[Text] = []
+        handler = RichHandler(
+            show_level=True,
+            markup=True,
+            rich_tracebacks=False,
+            show_path=False,
+            console=self.console,
+        )
+        for record in list(self._log_records):
+            try:
+                render_result = handler.render_message(
+                    record, message=record.getMessage()
+                )
+                if render_result:
                     if isinstance(
                         render_result, Text
                     ) and not render_result.plain.endswith("\n"):
                         render_result.append("\n")
                     log_texts.append(render_result)
-
-            except Exception as fmt_exc:
-                # Avoid crashing display if a single log record fails formatting
+            except Exception as fmt_exc:  # pylint: disable=broad-except
                 log_texts.append(Text(f"Log Format Error: {fmt_exc}\n", style="red"))
-
-        # Combine all Text lines into one renderable Text object
         log_content = Group(*log_texts) if log_texts else Text("")
+        return Panel(log_content, title="Recent Logs", border_style="dim", expand=True)
 
-        return Panel(
-            log_content,
-            title="Recent Logs",
-            border_style="dim",
-            expand=True,
-        )
-
-    def format_log_message(self, record: logging.LogRecord) -> str:
-        """Formats a log record message, handling potential % formatting."""
-        # This method is less relevant now RichHandler.render_message is used
-        try:
-            return record.getMessage().strip()
-        except Exception as e:
-            return f"Log format error: {e}"
-
-    def _generate_header_text(self) -> Text:
-        """Generates the header text."""
-        header = (
+    def _generate_header_text_obj(self) -> Text:
+        """Generates the Rich Text object for the header."""
+        header_str = (
             f" Cambia CFR+ Training :: Iter: {self._current_iteration}/{self.total_iterations} "
             f":: Infosets: {self._total_infosets} :: Expl: {self._last_exploitability} "
             f":: Last Iter: {self._last_iter_time} "
         )
-        return Text(header, style="bold white on blue", justify="center")
+        return Text(header_str, style="bold white on blue", justify="center")
 
-    def _generate_renderable(self) -> Layout:
-        """Builds the complete layout with updated components."""
-        try:
-            self.layout["header"].update(self._generate_header_text())
+    # Method name matches user's traceback context
+    def _update_layout_if_changed(self) -> bool:
+        """
+        Updates individual components of the layout if their content has changed.
+        Returns True if any component was updated.
+        """
+        layout_updated = False
+
+        # Header
+        current_header_text_obj = self._generate_header_text_obj()
+        current_header_str = current_header_text_obj.plain
+        if self._last_header_text_str != current_header_str:
+            self.layout["header"].update(current_header_text_obj)
+            self._last_header_text_str = current_header_str
+            layout_updated = True
+
+        # Worker Table
+        current_worker_table_title = f"Worker Status (Iter {self._current_iteration})"
+        current_worker_statuses_repr = repr(sorted(self._worker_statuses.items()))
+        if (
+            self._last_worker_table_title != current_worker_table_title
+            or self._last_worker_statuses_repr != current_worker_statuses_repr
+        ):
             self.layout["workers"].update(
                 Panel(self._generate_worker_table(), title="Workers", border_style="blue")
             )
+            self._last_worker_table_title = current_worker_table_title
+            self._last_worker_statuses_repr = current_worker_statuses_repr
+            layout_updated = True
+
+        # Log Panel
+        current_log_str = self._generate_log_panel_content_str()
+        if self._last_log_panel_content_str != current_log_str:
             self.layout["logs"].update(self._generate_log_panel())
-            self.layout["progress_bar"].update(self.progress)
-            self.layout["padding"].update("")  # Ensure padding area is cleared
-            return self.layout
-        except Exception as e:
-            # Fallback if rendering fails during update
-            logging.error("Error generating display layout: %s", e, exc_info=True)
-            # Return a simple Text object indicating the error
-            return Layout(Text(f"Error generating display layout: {e}", style="bold red"))
+            self._last_log_panel_content_str = current_log_str
+            layout_updated = True
+
+        try:
+            pb_layout_region = self.layout.get("progress_bar")
+            if pb_layout_region is not None:
+                if pb_layout_region.renderable is not self.progress:
+                    pb_layout_region.update(self.progress)
+            else:
+                logging.error(
+                    "Critical: Layout region 'progress_bar' not found during update processing."
+                )
+        except Exception as e_pb_update:
+            logging.error(
+                f"Error accessing/updating 'progress_bar' layout region: {e_pb_update}",
+                exc_info=True,
+            )
+
+        self.layout["padding"].update("")
+        return layout_updated
 
     def refresh(self):
-        """Explicitly triggers a refresh of the Live display if active."""
-        if self.live and hasattr(self.live, "refresh"):
+        """Updates the Live display if necessary."""
+        if self.live:
             try:
-                # Rich's Live object manages its own refresh scheduling based on refresh_per_second.
-                # Calling live.update(renderable) is generally preferred to force a redraw with new content.
-                # However, if just internal data has changed that _generate_renderable uses,
-                # ensuring the Live object processes its next refresh cycle is key.
-                # A direct live.refresh() might be redundant if live.update() is used or if the internal
-                # refresh cycle is frequent enough.
-                # Forcing an update with the new renderable is safer.
-                self.live.update(self._generate_renderable(), refresh=True)
-
+                content_changed = self._update_layout_if_changed()
+                self.live.update(self.layout, refresh=content_changed)
             except Exception as e:
                 logging.error(
                     "Error explicitly refreshing Live display: %s", e, exc_info=True
                 )
 
-    # --- Public Update Methods ---
     def add_log_record(self, record: logging.LogRecord):
-        """Adds a log record to the display queue."""
+        """Adds a log record to the display queue and refreshes."""
         self._log_records.append(record)
         self.refresh()
 
     def update_worker_status(self, worker_id: int, status: WorkerDisplayStatus):
-        """Updates the status of a specific worker."""
+        """Updates the status of a specific worker and refreshes."""
         if 0 <= worker_id < self.num_workers:
-            self._worker_statuses[worker_id] = status
-            self.refresh()  # Refresh to show updated worker status
+            if self._worker_statuses.get(worker_id) != status:
+                self._worker_statuses[worker_id] = status
+                self.refresh()  # Refresh when worker status changes
         else:
-            logging.error(
-                "LiveDisplay: Invalid worker ID %d for status update.", worker_id
+            logging.warning(
+                "LiveDisplay: Invalid worker ID %s for status update.", worker_id
             )
 
     def update_overall_progress(self, completed: int):
-        """Updates the main iteration progress bar."""
-        self._current_iteration = completed
+        """Updates the main iteration progress bar and refreshes if iteration changed."""
+        needs_refresh_for_header = False
+        if self._current_iteration != completed:
+            self._current_iteration = completed
+            needs_refresh_for_header = (
+                True  # Iteration number change affects header & table title
+            )
         try:
             self.progress.update(self.iteration_task_id, completed=completed)
-            # No full refresh needed, progress bar updates efficiently.
-            # However, if other parts of the display depend on _current_iteration (e.g. table title),
-            # a selective refresh or relying on the general refresh cycle is needed.
-            # self.refresh() # Can add if other components need immediate update based on iteration
+            if needs_refresh_for_header:
+                self.refresh()
         except Exception as e:
             logging.error("Error updating progress bar completion: %s", e, exc_info=True)
 
@@ -286,32 +322,42 @@ class LiveDisplayManager:
         exploitability: str,
         last_iter_time: Optional[float] = None,
     ):
-        """Updates the displayed overall statistics."""
-        self._current_iteration = iteration
-        self._total_infosets = infosets
-        self._last_exploitability = exploitability
-        self._last_iter_time = (
+        """Updates the displayed overall statistics and refreshes if header data changed."""
+        needs_refresh_for_header = False
+        if self._current_iteration != iteration:
+            self._current_iteration = iteration
+            needs_refresh_for_header = True
+        if self._total_infosets != infosets:
+            self._total_infosets = infosets
+            needs_refresh_for_header = True
+        if self._last_exploitability != exploitability:
+            self._last_exploitability = exploitability
+            needs_refresh_for_header = True
+
+        new_last_iter_time_str = (
             f"{last_iter_time:.2f}s" if last_iter_time is not None else "N/A"
         )
-        status_text = f"Infosets: {infosets} | Expl: {exploitability} | Last T: {self._last_iter_time}"
+        if self._last_iter_time != new_last_iter_time_str:
+            self._last_iter_time = new_last_iter_time_str
+            needs_refresh_for_header = True
+
+        status_text_for_progress_bar = f"Infosets: {infosets} | Expl: {exploitability} | Last T: {self._last_iter_time}"
         try:
             self.progress.update(
-                self.iteration_task_id, status_text=status_text, advance=0
+                self.iteration_task_id, status_text=status_text_for_progress_bar
             )
-            self.refresh()  # Refresh to show updated header/table titles
+            if needs_refresh_for_header:
+                self.refresh()
         except Exception as e:
-            logging.error(
-                "Error updating progress bar stats field or refreshing: %s",
-                e,
-                exc_info=True,
-            )
+            logging.error("Error updating progress bar stats field: %s", e, exc_info=True)
 
     def start(self):
         """Starts the Rich Live display."""
         if not self.live:
             try:
+                self._update_layout_if_changed()
                 self.live = Live(
-                    self._generate_renderable(),
+                    self.layout,
                     console=self.console,
                     refresh_per_second=2,
                     transient=False,
@@ -328,7 +374,7 @@ class LiveDisplayManager:
         if self.live:
             try:
                 self.live.stop()
-                self.console.print()  # Print a final newline
+                self.console.print()
                 logging.debug("Rich Live display stopped.")
             except Exception as e:
                 logging.error("Error stopping Rich Live display: %s", e, exc_info=True)
@@ -338,11 +384,17 @@ class LiveDisplayManager:
     def run(self, func, *args, **kwargs):
         """Runs a function within the Live context."""
         if self.live:
-            self.stop()
+            current_live_instance = self.live
+            self.live = None
+            try:
+                current_live_instance.stop()
+            except Exception as e:  # pylint: disable=broad-except
+                logging.warning("Error stopping existing live instance in run(): %s", e)
 
         try:
+            self._update_layout_if_changed()
             with Live(
-                self._generate_renderable(),
+                self.layout,
                 console=self.console,
                 refresh_per_second=2,
                 transient=False,
@@ -354,12 +406,12 @@ class LiveDisplayManager:
                     return result
                 finally:
                     self.live = None
-        except Exception as e:
+        except Exception:
             if self.live:
                 try:
                     self.live.stop()
-                except Exception:
-                    pass  # Suppress errors during stop on error
+                except Exception:  # pylint: disable=broad-except
+                    pass
                 finally:
                     self.live = None
             logging.error("Error occurred within Live context run:", exc_info=True)
