@@ -16,7 +16,7 @@ cfr_training:
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
   exploitability_interval: 100  # Calculate exploitability every N iterations (0 to disable)
-  num_workers: 16                # Number of parallel workers for simulations (1 for sequential)
+  num_workers: 24               # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
@@ -48,22 +48,22 @@ persistence:
 
 # Logging Configuration
 logging:
-  log_level_file: "INFO"       # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
+  log_level_file: "DEBUG"       # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
   log_level_console: "ERROR"    # Logging level for the console
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory
   log_max_bytes: "10MB"        # Max size before rotation for an individual log file (e.g., worker_N_001.log)
   log_backup_count: 20         # Max number of backup (rotated) log files to keep *per worker*
 
-  worker_config:
-    default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
-    sequential_rules:
-      - "DEBUG"             # Worker 0: DEBUG. Subsequent workers use default_level unless overridden.
-    overrides: []
+  #worker_config:
+    #default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
+    #sequential_rules:
+    #  - "DEBUG"             # Worker 0: DEBUG. Subsequent workers use default_level unless overridden.
+    #overrides: []
 
   # Log Archiving Settings (for worker logs)
   log_archive_enabled: true                # Enable archiving of worker logs
-  log_compress_after_bytes: "500MB"        # If total size of a worker's *rotated* logs exceeds this, archive them
+  log_compress_after_bytes: "50MB"        # If total size of a worker's *rotated* logs exceeds this, archive them
   log_archive_max_archives: 0              # Max number of archive files (tar.gz) to keep per worker; <=0 is unlimited
   log_archive_dir: ""                      # Subdirectory within the run's log dir for storing archives; empty str is same dir
                                            # e.g. logs/cambia_run_YYYYMMDD_HHMMSS/archives/w0/
