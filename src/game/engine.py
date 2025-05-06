@@ -1,4 +1,5 @@
-# src/game/engine.py
+"""src/game/engine.py"""
+
 import random
 from collections import deque
 from typing import Callable, List, Tuple, Optional, Any, Dict, Deque
@@ -6,17 +7,13 @@ from dataclasses import dataclass, field
 import logging
 import copy
 
-# Use relative imports for modules within the 'game' package
 from .types import StateDelta, StateDeltaChange, UndoInfo
 from .player_state import PlayerState
 from .helpers import serialize_card
 
-# --- Import Mixins ---
 from ._query_mixin import QueryMixin
 from ._snap_mixin import SnapLogicMixin
 from ._ability_mixin import AbilityMixin
-
-# Add imports for other mixins if created (e.g., SetupMixin, TurnLogicMixin)
 
 # Use relative imports for modules outside the 'game' package but within 'src'
 from ..card import Card, create_standard_deck
@@ -550,7 +547,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
             delta_list.append(delta)  # Record the change event
             undo_stack.appendleft(
                 undo_func
-            )  # Add undo op to the *front* (for LIFO execution)
+            )
         except Exception as e:
             logger.exception(
                 "Error applying change function %s for delta %s: %s",

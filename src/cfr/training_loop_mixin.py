@@ -1,3 +1,4 @@
+# src/cfr/training_loop_mixin.py
 """src/cfr/training_loop_mixin.py"""
 
 import copy
@@ -92,7 +93,7 @@ class CFRTrainingLoopMixin:
         self._worker_statuses = {i: "Initializing" for i in range(num_workers)}
         if display:
             for i in range(num_workers):
-                display.update_worker_status(i, "Idle")
+                display.update_worker_status(i, "Idle")  # Set initial display status
 
         self._total_infosets_str = format_infoset_count(len(self.regret_sum))
         if display:
@@ -113,14 +114,17 @@ class CFRTrainingLoopMixin:
                 iter_start_time = time.time()
                 self.current_iteration = t
                 # Reset internal statuses for summary tracking at start of iter
+                initial_live_status = ("Starting", 0, 0, 0)  # Status, cur_d, max_d, nodes
                 self._worker_statuses = {
-                    i: ("Starting", 0, 0, 0) for i in range(num_workers)
+                    i: initial_live_status for i in range(num_workers)
                 }
                 if display:
                     for i in range(num_workers):
-                        display.update_worker_status(i, ("Starting", 0, 0, 0))
+                        display.update_worker_status(i, initial_live_status)
                     self._total_infosets_str = format_infoset_count(len(self.regret_sum))
+                    # Update overall progress bar completion
                     display.update_overall_progress(t)
+                    # Update stats in header/progress bar status field
                     display.update_stats(
                         iteration=t,
                         infosets=self._total_infosets_str,
@@ -129,8 +133,7 @@ class CFRTrainingLoopMixin:
 
                 # Prepare snapshot
                 try:
-                    regret_sum_copy = copy.deepcopy(self.regret_sum)
-                    regret_snapshot = dict(regret_sum_copy)
+                    regret_snapshot = dict(self.regret_sum)
                 except Exception as e:
                     logger.error(
                         "Failed to prepare regret snapshot: %s", e, exc_info=True
@@ -140,7 +143,12 @@ class CFRTrainingLoopMixin:
                     ) from e
 
                 # Worker execution logic
-                worker_base_args = (t, self.config, regret_snapshot, progress_queue)
+                worker_base_args = (
+                    t,
+                    self.config,
+                    regret_snapshot,
+                    progress_queue,
+                )  # Common args
                 results: List[Optional[WorkerResult]] = [None] * num_workers
                 sim_failed_count = 0
                 completed_worker_count = 0
@@ -156,9 +164,13 @@ class CFRTrainingLoopMixin:
                         0,
                     )  # Update internal status
                     try:
-                        worker_args = worker_base_args + (0, run_log_dir, run_timestamp)
+                        worker_args_seq = worker_base_args + (
+                            0,
+                            run_log_dir,
+                            run_timestamp,
+                        )
                         result: Optional[WorkerResult] = run_cfr_simulation_worker(
-                            worker_args
+                            worker_args_seq
                         )
                         results[0] = result
                         completed_worker_count = 1
@@ -168,13 +180,12 @@ class CFRTrainingLoopMixin:
                                 type(result),
                             )
                             self._worker_statuses[0] = "Error (Return Type)"
-                            if display:
-                                display.update_worker_status(0, self._worker_statuses[0])
-                            sim_failed_count += 1
                         elif isinstance(result, WorkerResult):
-                            self._worker_statuses[0] = result.stats  # Store final stats
+                            self._worker_statuses[0] = result.stats
                             if display:
-                                display.update_worker_status(0, result.stats)
+                                display.update_worker_status(
+                                    0, result.stats
+                                )  # Update display with final stats
                             if result.stats.error_count > 0:
                                 sim_failed_count += 1
                     except Exception as e:
@@ -183,10 +194,54 @@ class CFRTrainingLoopMixin:
                         if display:
                             display.update_worker_status(0, self._worker_statuses[0])
                         sim_failed_count += 1
+                    finally:
+                        # In sequential mode, drain progress queue AFTER simulation finishes
+                        progress_updates_processed = 0
+                        if progress_queue:
+                            try:
+                                while True:
+                                    prog_w_id, prog_cur_d, prog_max_d, prog_n = (
+                                        progress_queue.get_nowait()
+                                    )
+                                    if (
+                                        prog_w_id == 0
+                                    ):  # Process updates only for worker 0
+                                        new_status_tuple = (
+                                            "Running",
+                                            prog_cur_d,
+                                            prog_max_d,
+                                            prog_n,
+                                        )
+                                        # Don't overwrite final 'Error' or 'Done' status with intermediate updates
+                                        if isinstance(
+                                            self._worker_statuses.get(0), tuple
+                                        ):
+                                            self._worker_statuses[0] = (
+                                                new_status_tuple  # Update internal tracker
+                                            )
+                                            if display:
+                                                display.update_worker_status(
+                                                    prog_w_id, new_status_tuple
+                                                )
+                                        progress_updates_processed += 1
+                            except queue.Empty:
+                                pass  # Queue drained
+                            except Exception as prog_e:
+                                logger.error(
+                                    "Error draining progress queue (sequential): %s",
+                                    prog_e,
+                                )
+
+                        # Trigger a final refresh if display exists and updates were processed
+                        # This ensures the last status update is shown before potentially showing 'Done'
+                        if display and progress_updates_processed > 0:
+                            display.refresh()  # Call the display manager's refresh
+
                 else:
                     # Parallel execution
                     worker_args_list = [
-                        worker_base_args + (worker_id, run_log_dir, run_timestamp)
+                        worker_base_args
+                        + (worker_id, run_log_dir, run_timestamp)
                         for worker_id in range(num_workers)
                     ]
                     async_results: Dict[int, multiprocessing.pool.AsyncResult] = {}
@@ -197,23 +252,17 @@ class CFRTrainingLoopMixin:
                                 display.update_worker_status(i, ("Queued", 0, 0, 0))
                         self._worker_statuses = {
                             i: ("Queued", 0, 0, 0) for i in range(num_workers)
-                        }  # Update internal
+                        }
 
                         pool = multiprocessing.Pool(processes=num_workers)
                         for worker_id, args in enumerate(worker_args_list):
                             async_results[worker_id] = pool.apply_async(
                                 run_cfr_simulation_worker, (args,)
                             )
-                            self._worker_statuses[worker_id] = (
-                                "Running",
-                                0,
-                                0,
-                                0,
-                            )  # Update internal
+                            running_status = ("Running", 0, 0, 0)
+                            self._worker_statuses[worker_id] = running_status
                             if display:
-                                display.update_worker_status(
-                                    worker_id, self._worker_statuses[worker_id]
-                                )
+                                display.update_worker_status(worker_id, running_status)
 
                         pool.close()
 
@@ -224,69 +273,88 @@ class CFRTrainingLoopMixin:
                                     "Shutdown during worker execution"
                                 )
 
-                            if (
-                                progress_queue
-                            ):  # Process progress independent of display manager existence
+                            # Process progress queue items first
+                            progress_updates_processed_this_cycle = 0
+                            if progress_queue:
                                 try:
-                                    while True:
+                                    while True:  # Drain the queue for this cycle
                                         prog_w_id, prog_cur_d, prog_max_d, prog_n = (
                                             progress_queue.get_nowait()
                                         )
-                                        # Update internal status *first*
+                                        progress_updates_processed_this_cycle += 1
                                         current_internal_status = (
                                             self._worker_statuses.get(prog_w_id)
                                         )
-                                        if (
+                                        # Only update if status is currently 'Running' (or tuple starting with 'Running')
+                                        is_running = (
                                             isinstance(current_internal_status, tuple)
                                             and current_internal_status[0] == "Running"
-                                        ):
-                                            self._worker_statuses[prog_w_id] = (
+                                        ) or (
+                                            isinstance(current_internal_status, str)
+                                            and current_internal_status == "Running"
+                                        )
+
+                                        if is_running:
+                                            new_status_tuple = (
                                                 "Running",
                                                 prog_cur_d,
                                                 prog_max_d,
                                                 prog_n,
                                             )
-                                            # Then update display if available
+                                            self._worker_statuses[prog_w_id] = (
+                                                new_status_tuple
+                                            )
                                             if display:
                                                 display.update_worker_status(
-                                                    prog_w_id,
-                                                    self._worker_statuses[prog_w_id],
+                                                    prog_w_id, new_status_tuple
                                                 )
+                                        # else: logger.debug("Skipping progress update for non-running W:%d, status is %s", prog_w_id, current_internal_status)
+
                                 except queue.Empty:
-                                    pass
+                                    pass  # Normal case, queue is empty for now
                                 except Exception as prog_e:
                                     logger.error(
                                         "Error reading progress queue: %s", prog_e
                                     )
 
+                            # !! If we processed progress updates, trigger a display refresh !!
+                            if display and progress_updates_processed_this_cycle > 0:
+                                display.refresh()  # Call the display manager's refresh method
+
+                            # Check for completed workers
                             ready_workers = [
                                 wid
                                 for wid, res in async_results.items()
                                 if res and res.ready()
                             ]
+                            refreshed_after_completion = (
+                                False  # Flag to refresh once after processing completions
+                            )
                             for worker_id in ready_workers:
-                                if worker_id not in async_results:
-                                    continue
                                 async_res = async_results.pop(worker_id, None)
                                 if async_res is None:
                                     continue
+
                                 try:
                                     result: Optional[WorkerResult] = async_res.get(
                                         timeout=0.1
                                     )
                                     results[worker_id] = result
                                     completed_worker_count += 1
+                                    refreshed_after_completion = (
+                                        True  # Mark that we need a refresh
+                                    )
                                     if result is None or not isinstance(
                                         result, WorkerResult
                                     ):
                                         sim_failed_count += 1
-                                        self._worker_statuses[worker_id] = (
+                                        fail_status = (
                                             f"Failed (Type: {type(result).__name__})"
                                         )
+                                        self._worker_statuses[worker_id] = fail_status
                                         if display:
                                             display.update_worker_status(
-                                                worker_id,
-                                                self._worker_statuses[worker_id],
+                                                worker_id, fail_status
                                             )
                                     elif isinstance(result, WorkerResult):
                                         self._worker_statuses[worker_id] = (
@@ -295,11 +363,11 @@ class CFRTrainingLoopMixin:
                                         if display:
                                             display.update_worker_status(
                                                 worker_id, result.stats
-                                            )
+                                            )  # Show final stats
                                         if result.stats.error_count > 0:
                                             sim_failed_count += 1
                                 except multiprocessing.TimeoutError:
-                                    async_results[worker_id] = async_res
+                                    async_results[worker_id] = async_res  # Put it back
                                     continue
                                 except Exception as pool_e:
                                     logger.error(
@@ -309,46 +377,57 @@ class CFRTrainingLoopMixin:
                                         pool_e,
                                         exc_info=False,
                                     )
-                                    results[worker_id] = None
+                                    results[worker_id] = None  # Mark as failed
                                     completed_worker_count += 1
                                     sim_failed_count += 1
-                                    self._worker_statuses[worker_id] = (
-                                        "Error (Fetch Fail)"
-                                    )
+                                    error_status = "Error (Fetch Fail)"
+                                    self._worker_statuses[worker_id] = error_status
                                     if display:
                                         display.update_worker_status(
-                                            worker_id, self._worker_statuses[worker_id]
+                                            worker_id, error_status
                                         )
-                            if completed_worker_count < num_workers:
-                                time.sleep(0.1)
+                                    refreshed_after_completion = True  # Mark for refresh
+
+                            # Refresh display once after processing all ready workers in this cycle
+                            if display and refreshed_after_completion:
+                                display.refresh()
+
+                            # Avoid busy-waiting if no results are ready and no progress was made
+                            if (
+                                not ready_workers
+                                and progress_updates_processed_this_cycle == 0
+                                and completed_worker_count < num_workers
+                            ):
+                                time.sleep(0.1)  # Sleep briefly before checking again
+
                     except GracefulShutdownException:
-                        raise
+                        raise  # Propagate shutdown cleanly
                     except Exception as e:
                         logger.exception(
                             "Error during parallel pool management iter %d.", t
                         )
-                        sim_failed_count = num_workers
+                        sim_failed_count = num_workers  # Assume all failed
                         if display:
                             for i in range(num_workers):
-                                if i not in async_results:
-                                    self._worker_statuses[i] = (
-                                        "Error (Pool Mgmt)"  # Update internal
-                                    )
-                                    display.update_worker_status(
-                                        i, self._worker_statuses[i]
-                                    )
-                        raise e
+                                if i not in self._worker_statuses or not isinstance(
+                                    self._worker_statuses[i], (WorkerStats, str)
+                                ):
+                                    error_status = "Error (Pool Mgmt)"
+                                    self._worker_statuses[i] = error_status
+                                    display.update_worker_status(i, error_status)
+                        # Don't raise here, let merge step handle failures
                     finally:
                         if pool is not None:
                             pool.terminate()
                             pool.join()
 
                 # --- Process Results (Merge) ---
+                # (Merge logic remains the same)
                 if sim_failed_count == num_workers and num_workers > 0:
                     logger.error(
                         "All simulations failed for iteration %d. Skipping merge.", t
                     )
-                    if display:
+                    if display:  # Update display to reflect the failure state
                         display.update_stats(
                             iteration=t,
                             infosets=self._total_infosets_str,
@@ -356,22 +435,18 @@ class CFRTrainingLoopMixin:
                             last_iter_time=time.time() - iter_start_time,
                         )
                         for i in range(num_workers):
-                            current_status = self._worker_statuses.get(
-                                i
-                            )  # Use internal status
-                            if not isinstance(current_status, WorkerStats):
-                                if (
-                                    not isinstance(current_status, str)
-                                    or "Fail" not in current_status
+                            current_status = self._worker_statuses.get(i)
+                            if not isinstance(current_status, WorkerStats) and (
+                                not isinstance(current_status, str)
+                                or (
+                                    "Fail" not in current_status
                                     and "Error" not in current_status
-                                ):
-                                    self._worker_statuses[i] = (
-                                        "Failed (Iter End)"  # Update internal
-                                    )
-                                    display.update_worker_status(
-                                        i, self._worker_statuses[i]
-                                    )
-                    continue
+                                )
+                            ):
+                                fail_status = "Failed (Iter End)"
+                                self._worker_statuses[i] = fail_status
+                                display.update_worker_status(i, fail_status)
+                    continue  # Skip to next iteration
 
                 if sim_failed_count > 0:
                     logger.warning(
@@ -380,12 +455,11 @@ class CFRTrainingLoopMixin:
                         num_workers,
                         t,
                     )
+
                 valid_results = [res for res in results if isinstance(res, WorkerResult)]
-                if not valid_results or all(
-                    r.regret_updates is None for r in valid_results
-                ):
+                if not valid_results:
                     logger.error(
-                        "All simulations failed or returned no update data for iteration %d. Skipping merge.",
+                        "No valid worker results found for iteration %d after filtering. Skipping merge.",
                         t,
                     )
                     if display:
@@ -397,13 +471,17 @@ class CFRTrainingLoopMixin:
                         )
                     continue
 
-                logger.debug("Merging results for iteration %d...", t)
+                logger.debug(
+                    "Merging results from %d valid workers for iteration %d...",
+                    len(valid_results),
+                    t,
+                )
                 merge_start_time = time.time()
                 try:
                     self._merge_local_updates(valid_results)
                     merge_time = time.time() - merge_start_time
                     logger.debug("Iter %d merge took %.3fs", t, merge_time)
-                except Exception:
+                except Exception as merge_err:
                     logger.exception("Error merging results iter %d.", t)
                     if display:
                         display.update_stats(
@@ -412,9 +490,9 @@ class CFRTrainingLoopMixin:
                             exploitability="Merge FAILED",
                             last_iter_time=time.time() - iter_start_time,
                         )
-                    continue
+                    continue  # Skip to next iteration on merge failure
 
-                # --- Iteration Completed ---
+                # --- Iteration Completed Successfully ---
                 iter_time = time.time() - iter_start_time
                 self._total_infosets_str = format_infoset_count(len(self.regret_sum))
 
@@ -445,12 +523,20 @@ class CFRTrainingLoopMixin:
 
                 # --- Final Update for Iteration ---
                 if display:
+                    # Update overall stats including iteration time
                     display.update_stats(
                         iteration=t,
                         infosets=self._total_infosets_str,
                         exploitability=self._last_exploit_str,
                         last_iter_time=iter_time,
                     )
+                    # Set final status for workers who completed *this* iteration successfully
+                    for i in range(num_workers):
+                        status = self._worker_statuses.get(i)
+                        # Only update if the worker returned WorkerStats (implies success for the iter)
+                        if isinstance(status, WorkerStats):
+                            display.update_worker_status(i, status)
+                        # Keep error/failed strings as they are
 
                 # --- Save Interval ---
                 if t % self.config.cfr_training.save_interval == 0:
@@ -469,21 +555,9 @@ class CFRTrainingLoopMixin:
                 "Shutdown/Interrupt (%s) caught in train loop. Terminating pool and saving progress...",
                 exception_type,
             )
-            if num_workers > 1 and pool is not None:
-                logger.warning("Terminating worker pool due to %s...", exception_type)
-                pool.terminate()
-                try:
-                    pool.join()
-                except Exception as join_e:
-                    logger.error(
-                        "Error joining pool after %s: %s", exception_type, join_e
-                    )
-                pool = None
-            # Save logic
             completed_iter_to_save = (
                 self.current_iteration - 1
-                if hasattr(self, "current_iteration")
-                and self.current_iteration > last_completed_iteration
+                if self.current_iteration > last_completed_iteration
                 else last_completed_iteration
             )
             if completed_iter_to_save >= 0:
@@ -512,21 +586,9 @@ class CFRTrainingLoopMixin:
                 "Shutdown/Interrupt (%s) caught in train loop. Terminating pool and saving progress...",
                 exception_type,
             )
-            if num_workers > 1 and pool is not None:
-                logger.warning("Terminating worker pool due to %s...", exception_type)
-                pool.terminate()
-                try:
-                    pool.join()
-                except Exception as join_e:
-                    logger.error(
-                        "Error joining pool after %s: %s", exception_type, join_e
-                    )
-                pool = None
-            # Save logic
             completed_iter_to_save = (
                 self.current_iteration - 1
-                if hasattr(self, "current_iteration")
-                and self.current_iteration > last_completed_iteration
+                if self.current_iteration > last_completed_iteration
                 else last_completed_iteration
             )
             if completed_iter_to_save >= 0:
@@ -553,22 +615,10 @@ class CFRTrainingLoopMixin:
 
         except Exception as main_loop_e:
             logger.exception("Unhandled exception in main training loop:")
-            if num_workers > 1 and pool is not None:
-                logger.warning("Terminating worker pool due to unhandled error...")
-                pool.terminate()
-                try:
-                    pool.join()
-                except Exception as join_e:
-                    logger.error(
-                        "Error joining worker pool during error handling: %s", join_e
-                    )
-                pool = None
             logger.warning("Attempting emergency save after unhandled exception...")
-            # Save logic
             completed_iter_to_save = (
                 self.current_iteration - 1
-                if hasattr(self, "current_iteration")
-                and self.current_iteration > last_completed_iteration
+                if self.current_iteration > last_completed_iteration
                 else last_completed_iteration
             )
             if completed_iter_to_save >= 0:
@@ -582,28 +632,6 @@ class CFRTrainingLoopMixin:
                     self.current_iteration = saved_iter_num
             raise main_loop_e
 
-        finally:
-            # Final pool cleanup
-            if num_workers > 1 and pool is not None:
-                is_active = False
-                try:
-                    is_active = True
-                except Exception:
-                    is_active = False
-                if is_active:
-                    logger.warning(
-                        "Terminating/Joining pool in main finally block (unexpected loop exit?)."
-                    )
-                    pool.terminate()
-                    try:
-                        pool.join()
-                    except Exception as final_join_e:
-                        logger.error(
-                            "Error joining pool in main finally block: %s", final_join_e
-                        )
-                pool = None
-            # Display manager stopping handled by main_train.py
-
         # --- Training Loop Finished Normally ---
         end_time = time.time()
         total_completed_in_run = self.current_iteration - last_completed_iteration
@@ -616,6 +644,7 @@ class CFRTrainingLoopMixin:
             "Current iteration count (last completed): %d", self.current_iteration
         )
 
+        # --- Final Calculations and Save ---
         logger.info("Computing final average strategy...")
         final_avg_strategy = self.compute_average_strategy()
         if final_avg_strategy:
@@ -642,6 +671,7 @@ class CFRTrainingLoopMixin:
 
         self._total_infosets_str = format_infoset_count(len(self.regret_sum))
 
+        # Final display update
         if display:
             display.update_stats(
                 iteration=self.current_iteration,
@@ -650,17 +680,15 @@ class CFRTrainingLoopMixin:
                 last_iter_time=None,
             )
             for i in range(num_workers):
-                # Ensure final status shows completion or last known stats
-                if not isinstance(self._worker_statuses.get(i), WorkerStats):
-                    if (
-                        self._worker_statuses.get(i) is not None
-                        and "Fail" not in str(self._worker_statuses.get(i))
-                        and "Error" not in str(self._worker_statuses.get(i))
-                    ):
-                        display.update_worker_status(i, "Finished")
-                    # Otherwise, keep the Error/Failed status
+                status = self._worker_statuses.get(i)
+                if isinstance(status, WorkerStats):
+                    display.update_worker_status(i, status)  # Show final stats
+                elif not isinstance(status, str) or (
+                    "Fail" not in status and "Error" not in status
+                ):
+                    display.update_worker_status(i, "Finished")  # Mark as Finished
 
-        self.save_data()
+        self.save_data()  # Final save
         logger.info("Final average strategy and data saved.")
 
     def _write_run_summary(self):
@@ -671,7 +699,6 @@ class CFRTrainingLoopMixin:
             )
             return
 
-        # Construct summary file path using the stored run details
         summary_file_path = os.path.join(
             self.run_log_dir,
             f"{self.config.logging.log_file_prefix}_run_{self.run_timestamp}-summary.log",
@@ -693,11 +720,12 @@ class CFRTrainingLoopMixin:
                 )
                 f.write(f"Total Run Time: {total_time:.2f} seconds\n")
                 f.write(f"Final Exploitability: {self._last_exploit_str}\n")
-                f.write(f"Total Unique Infosets: {len(self.regret_sum):,}\n")
-                f.write("\n--- Worker Summary ---\n")
+                f.write(f"Total Unique Infosets Reached: {len(self.regret_sum):,}\n")
+                f.write(f"Number of Workers: {self.config.cfr_training.num_workers}\n")
+                f.write("\n--- Worker Summary (Final Status) ---\n")
 
                 num_workers = self.config.cfr_training.num_workers
-                if num_workers > 0:
+                if num_workers > 0 and self._worker_statuses:
                     total_nodes = 0
                     max_depth_overall = 0
                     total_warnings = 0
@@ -706,7 +734,6 @@ class CFRTrainingLoopMixin:
                     failed_workers = 0
                     error_in_stats_workers = 0
 
-                    # Use the internal _worker_statuses which holds final state
                     for i in range(num_workers):
                         status_info = self._worker_statuses.get(i)
                         status_line = f"Worker {i}: "
@@ -744,11 +771,13 @@ class CFRTrainingLoopMixin:
                         f.write(status_line + "\n")
 
                     f.write("\n--- Aggregated Worker Stats ---\n")
-                    f.write(f"Completed Workers (Returned Stats): {completed_workers}\n")
                     f.write(
-                        f"Failed/Error Workers (String/Tuple Status): {failed_workers}\n"
+                        f"Workers Successfully Completed (Returned Stats): {completed_workers}\n"
                     )
-                    f.write(f"Workers with Errors in Stats: {error_in_stats_workers}\n")
+                    f.write(f"Workers Failed/Stopped Abnormally: {failed_workers}\n")
+                    f.write(
+                        f"Workers with Errors Reported in Stats: {error_in_stats_workers}\n"
+                    )
                     f.write(
                         f"Total Nodes Visited (Sum Across Completed Workers): {format_large_number(total_nodes)} ({total_nodes:,})\n"
                     )
@@ -756,12 +785,13 @@ class CFRTrainingLoopMixin:
                         f"Max Depth Reached (Overall Across Completed Workers): {max_depth_overall}\n"
                     )
                     f.write(
-                        f"Total Warnings Logged (Sum Across Completed Workers): {total_warnings}\n"
+                        f"Total Warnings Reported (Sum Across Completed Workers): {total_warnings}\n"
                     )
                     f.write(
-                        f"Total Errors Logged (Sum Across Completed Workers + Failed): {total_errors}\n"
+                        f"Total Errors Reported (Sum Across Completed Workers + Failed): {total_errors}\n"
                     )
-                else:  # Sequential
+
+                elif num_workers == 1 and self._worker_statuses:  # Sequential Case Check
                     f.write("Sequential execution (1 worker).\n")
                     status_info = self._worker_statuses.get(0)
                     if isinstance(status_info, WorkerStats):
@@ -781,6 +811,19 @@ class CFRTrainingLoopMixin:
                         f.write(
                             f"  Final Status: Stopped ({state}, D:{cur_d}/{max_d}, N:{nodes_fmt})\n"
                         )
+                    else:
+                        f.write(
+                            f"  Final Status: Unknown ({type(status_info).__name__})\n"
+                        )
+                else:
+                    f.write("Worker status information not available.\n")
+
+                f.write("\n--- Exploitability History ---\n")
+                if self.exploitability_results:
+                    for iter_num, exploit in self.exploitability_results:
+                        f.write(f"Iteration {iter_num}: {exploit:.6f}\n")
+                else:
+                    f.write("No exploitability data recorded.\n")
 
                 f.write("\n--- End Summary ---\n")
         except IOError as e:

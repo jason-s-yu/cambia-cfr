@@ -66,9 +66,10 @@ class LiveDisplayManager:
             TimeElapsedColumn(),
             TextColumn("• Remaining:"),
             TimeRemainingColumn(),
-            TextColumn("• {task.fields[status_text]}"),
+            # Use status_text field to display dynamic info
+            TextColumn("• [i]({task.fields[status_text]})[/i]"),
             console=self.console,
-            transient=False,
+            transient=False,  # Keep progress bar visible after completion
         )
 
     def _create_layout(self) -> Layout:
@@ -90,13 +91,18 @@ class LiveDisplayManager:
     def _generate_worker_table(self) -> Table:
         """Generates the table displaying worker status."""
         table = Table(
-            title=f"Worker Status (Iteration {self._current_iteration})",
+            # Update title dynamically
+            title=f"Worker Status (Iter {self._current_iteration})",
             show_header=True,
             header_style="bold magenta",
             expand=True,
+            # Add padding for better spacing
+            padding=(0, 1),
         )
         table.add_column("ID", style="dim", width=4, justify="right")
-        table.add_column("Status", style="cyan", justify="left", no_wrap=True)
+        table.add_column(
+            "Status", style="cyan", justify="left", no_wrap=True, min_width=10
+        )
         table.add_column("Depth", style="green", width=10, justify="right")
         table.add_column("Nodes", style="blue", width=12, justify="right")
         table.add_column("Warn", style="yellow", width=5, justify="right")
@@ -113,24 +119,44 @@ class LiveDisplayManager:
             )
 
             if isinstance(status_info, WorkerStats):
-                status_str = "[green]Done[/green]"
+                # Display final stats
+                if status_info.error_count > 0:
+                    status_str = "[bold red]Error[/bold red]"
+                elif status_info.warning_count > 0:
+                    status_str = "[yellow]Warn[/yellow]"
+                else:
+                    status_str = "[green]Done[/green]"
                 depth_str = str(status_info.max_depth)
                 nodes_str = format_large_number(status_info.nodes_visited)
                 warn_str = str(status_info.warning_count)
                 err_str = str(status_info.error_count)
             elif isinstance(status_info, tuple) and len(status_info) == 4:
+                # Display live progress tuple: (state, cur_depth, max_depth, nodes)
                 state, cur_d, max_d, nodes = status_info
-                status_str = state
+                status_str = (
+                    state if state else "Running"
+                )  # Default to running if state is empty
                 depth_str = f"{cur_d}/{max_d}"
                 nodes_str = format_large_number(nodes)
-                warn_str, err_str = "-", "-"
+                warn_str, err_str = "-", "-"  # Warn/Err counts only available at end
             elif isinstance(status_info, str):
+                # Display simple string status
                 if "Error" in status_info or "Fail" in status_info:
                     status_str = f"[bold red]{status_info}[/]"
-                elif "Queued" in status_info or "Starting" in status_info:
+                elif (
+                    "Queued" in status_info
+                    or "Starting" in status_info
+                    or "Initializing" in status_info
+                ):
                     status_str = f"[yellow]{status_info}[/]"
+                elif (
+                    "Finished" in status_info or "Done" in status_info
+                ):  # Handle "Done" string status
+                    status_str = "[green]Done[/green]"
+                elif "Idle" in status_info:
+                    status_str = "[dim]Idle[/dim]"
                 else:
-                    status_str = status_info
+                    status_str = status_info  # Default display for other strings
                 depth_str, nodes_str, warn_str, err_str = "-", "-", "-", "-"
 
             table.add_row(str(i), status_str, depth_str, nodes_str, warn_str, err_str)
@@ -140,21 +166,30 @@ class LiveDisplayManager:
     def _generate_log_panel(self) -> Panel:
         """Generates the panel displaying recent log messages."""
         log_texts: List[Text] = []  # Store Text objects
-        handler = RichHandler(show_level=True, markup=True)  # For level styling
+        # Create a temporary RichHandler instance for formatting, don't add it to logger
+        handler = RichHandler(
+            show_level=True, markup=True, rich_tracebacks=False, show_path=False
+        )
 
         for record in list(self._log_records):  # Iterate over a copy
             try:
-                level_text = handler.get_level_text(record)  # Get styled level
-                message_text = self.format_log_message(record)  # Get formatted message
-                # Combine level and message into a single Text line, add newline
-                log_line = Text.assemble(level_text, " ", message_text, "\n")
-                log_texts.append(log_line)
+                # Use RichHandler's render method to get renderables (like Text)
+                render_result = handler.render_message(
+                    record, message=record.getMessage()
+                )
+                if render_result:
+                    # Add newline if not already present
+                    if isinstance(
+                        render_result, Text
+                    ) and not render_result.plain.endswith("\n"):
+                        render_result.append("\n")
+                    log_texts.append(render_result)
+
             except Exception as fmt_exc:
                 # Avoid crashing display if a single log record fails formatting
                 log_texts.append(Text(f"Log Format Error: {fmt_exc}\n", style="red"))
 
         # Combine all Text lines into one renderable Text object
-        # Use Group for potentially better vertical overflow handling
         log_content = Group(*log_texts) if log_texts else Text("")
 
         return Panel(
@@ -166,12 +201,9 @@ class LiveDisplayManager:
 
     def format_log_message(self, record: logging.LogRecord) -> str:
         """Formats a log record message, handling potential % formatting."""
+        # This method is less relevant now RichHandler.render_message is used
         try:
-            msg = record.getMessage()
-            # Optional: Simplify further?
-            # msg = msg.replace(f"[{record.processName}]", "").strip()
-            # msg = msg.replace(f"- {record.name} -", "").strip()
-            return msg.strip()
+            return record.getMessage().strip()
         except Exception as e:
             return f"Log format error: {e}"
 
@@ -189,26 +221,39 @@ class LiveDisplayManager:
         try:
             self.layout["header"].update(self._generate_header_text())
             self.layout["workers"].update(
-                Panel(self._generate_worker_table(), title="Workers")
+                Panel(self._generate_worker_table(), title="Workers", border_style="blue")
             )
             self.layout["logs"].update(self._generate_log_panel())
             self.layout["progress_bar"].update(self.progress)
-            self.layout["padding"].update("")
+            self.layout["padding"].update("")  # Ensure padding area is cleared
             return self.layout
         except Exception as e:
             # Fallback if rendering fails during update
             logging.error(f"Error generating display layout: {e}", exc_info=True)
-            return Text(f"Error generating display layout: {e}", style="bold red")
+            # Return a simple Text object indicating the error
+            return Layout(Text(f"Error generating display layout: {e}", style="bold red"))
+
+    def refresh(self):
+        """Explicitly triggers a refresh of the Live display if active."""
+        # Re-introduce explicit refresh call
+        if self.live and hasattr(self.live, "refresh"):
+            try:
+                self.live.refresh()
+            except Exception as e:
+                # Log error if refresh fails, but don't crash
+                logging.error(f"Error explicitly refreshing Live display: {e}")
 
     # --- Public Update Methods ---
     def add_log_record(self, record: logging.LogRecord):
         """Adds a log record to the display queue."""
         self._log_records.append(record)
+        self.refresh()  # Refresh after adding log to show it sooner
 
     def update_worker_status(self, worker_id: int, status: WorkerDisplayStatus):
         """Updates the status of a specific worker."""
         if 0 <= worker_id < self.num_workers:
             self._worker_statuses[worker_id] = status
+            # No explicit refresh here; rely on the main loop's refresh call after processing queue
         else:
             logging.error(
                 f"LiveDisplay: Invalid worker ID {worker_id} for status update."
@@ -218,9 +263,11 @@ class LiveDisplayManager:
         """Updates the main iteration progress bar."""
         self._current_iteration = completed
         try:
+            # Update the progress bar task directly
             self.progress.update(self.iteration_task_id, completed=completed)
+            # Progress bar updates are handled efficiently by Live, no full refresh needed
         except Exception as e:
-            logging.error(f"Error updating progress bar: {e}")
+            logging.error(f"Error updating progress bar completion: {e}")
 
     def update_stats(
         self,
@@ -230,6 +277,7 @@ class LiveDisplayManager:
         last_iter_time: Optional[float] = None,
     ):
         """Updates the displayed overall statistics."""
+        # Update internal state variables that affect header/table title/progress status
         self._current_iteration = iteration
         self._total_infosets = infosets
         self._last_exploitability = exploitability
@@ -238,11 +286,14 @@ class LiveDisplayManager:
         )
         status_text = f"Infosets: {infosets} | Expl: {exploitability} | Last T: {self._last_iter_time}"
         try:
+            # Update the status_text field in the progress bar task
             self.progress.update(
                 self.iteration_task_id, status_text=status_text, advance=0
             )
+            # Since header and table title depend on these stats, trigger a refresh
+            self.refresh()
         except Exception as e:
-            logging.error(f"Error updating progress bar stats: {e}")
+            logging.error(f"Error updating progress bar stats field or refreshing: {e}")
 
     def start(self):
         """Starts the Rich Live display."""
@@ -251,15 +302,15 @@ class LiveDisplayManager:
                 self.live = Live(
                     self._generate_renderable(),
                     console=self.console,
-                    refresh_per_second=4,
-                    transient=False,
+                    refresh_per_second=4,  # Refresh rate
+                    transient=False,  # Keep display after exit
                     vertical_overflow="visible",
                 )
-                self.live.start(refresh=True)
+                self.live.start(refresh=True)  # Start background refresh thread
                 logging.debug("Rich Live display started.")
             except Exception as e:
                 logging.error(f"Failed to start Rich Live display: {e}", exc_info=True)
-                self.live = None
+                self.live = None  # Ensure live is None if start fails
 
     def stop(self):
         """Stops the Rich Live display."""
@@ -271,30 +322,34 @@ class LiveDisplayManager:
             except Exception as e:
                 logging.error(f"Error stopping Rich Live display: {e}", exc_info=True)
             finally:
-                self.live = None
+                self.live = None  # Mark as stopped
 
     def run(self, func, *args, **kwargs):
         """Runs a function within the Live context."""
+        if self.live:  # Ensure not already running
+            self.stop()
+
         try:
-            if not self.live:
-                with Live(
-                    self._generate_renderable(),
-                    console=self.console,
-                    refresh_per_second=4,
-                    transient=False,
-                    vertical_overflow="visible",
-                ) as live_context:
-                    self.live = live_context
-                    try:
-                        result = func(*args, **kwargs)
-                        return result
-                    finally:
-                        self.live = None  # Ensure live is cleared before context exits
-            else:
-                # Already live (shouldn't happen)
-                result = func(*args, **kwargs)
-                return result
-        except Exception:
-            if self.live:
-                self.stop()  # Ensure display is stopped on error
-            raise
+            with Live(
+                self._generate_renderable(),
+                console=self.console,
+                refresh_per_second=4,  # Same refresh rate
+                transient=False,
+                vertical_overflow="visible",
+            ) as live_context:
+                self.live = live_context  # Store the active context
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                finally:
+                    self.live = None  # Clear before context manager stops
+        except Exception as e:
+            if self.live:  # Ensure stopped on error
+                try:
+                    self.live.stop()
+                except Exception:
+                    pass
+                finally:
+                    self.live = None
+            logging.error("Error occurred within Live context run:", exc_info=True)
+            raise  # Re-raise

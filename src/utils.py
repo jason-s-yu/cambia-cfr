@@ -101,22 +101,22 @@ def get_rm_plus_strategy(regret_sum: np.ndarray) -> np.ndarray:
     return normalize_probabilities(positive_regrets)
 
 
-def format_large_number(num: int) -> str:
-    """Formats a large integer with metric prefixes (k, M, B, T).
-
-    Args:
-        num: The integer to format.
-
-    Returns:
-        A formatted string representation of the number.
+def format_large_number(num: int | float) -> str:
+    """Formats a large number with metric prefixes (k, M, B, T).
+    k uses no decimals. M, B, T use 2 decimal places.
     """
-    if num < 1000:
-        return str(num)
-    if num < 1_000_000:
-        return f"{num / 1_000:.0f}k"  # No decimals for thousands
-    if num < 1_000_000_000:
+    if not isinstance(num, (int, float)):  # Handle potential non-numeric input
+        return "N/A"
+    num_int = int(num)  # Ensure integer for comparisons
+
+    if abs(num_int) < 1000:
+        return str(num_int)
+    if abs(num_int) < 1_000_000:
+        # Use integer division or format to 0 decimal places for k
+        return f"{num / 1_000:.0f}k"
+    if abs(num_int) < 1_000_000_000:
         return f"{num / 1_000_000:.2f}M"
-    if num < 1_000_000_000_000:
+    if abs(num_int) < 1_000_000_000_000:
         return f"{num / 1_000_000_000:.2f}B"
     return f"{num / 1_000_000_000_000:.2f}T"
 
