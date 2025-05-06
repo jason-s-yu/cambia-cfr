@@ -13,7 +13,7 @@ The configuration file is structured with the following top-level keys:
 * `agent_params`: Settings defining agent behavior, particularly memory and abstraction.
 * `cambia_rules`: Defines the specific game rules of Cambia to be used during training and simulation.
 * `persistence`: Configuration for saving and loading trained agent data.
-* `logging`: Settings for configuring logging behavior for the main process and workers.
+* `logging`: Settings for configuring logging behavior for the main process and workers, including log rotation and archiving.
 
 ---
 
@@ -229,12 +229,12 @@ Configuration for logging messages generated during training.
   * Default: `"cambia"`
   * Example: `"cambia_experiment_A"`
 * **`log_max_bytes`**:
-  * Description: The maximum size (in bytes) a log file can reach before it's rotated.
-  * Type: `integer`
+  * Description: The maximum size a single log file can reach before it's rotated. Can be an integer (bytes) or a human-readable string (e.g., "10MB", "1GB").
+  * Type: `integer` or `string`
   * Default: `9437184` (approx. 9MB)
-  * Example: `10485760` (10MB)
+  * Example: `10485760` (10MB), `"500MB"`, `"2GB"`
 * **`log_backup_count`**:
-  * Description: The maximum number of backup log files to keep after rotation.
+  * Description: The maximum number of backup (rotated) log files to keep for each log stream (e.g., per worker).
   * Type: `integer`
   * Default: `999`
   * Example: `10`
@@ -293,3 +293,51 @@ Configuration for logging messages generated during training.
             - worker_ids: [10]
               level: "ERROR"
         ```
+* **`log_archive_enabled`**:
+  * Description: If `true`, enables archiving of worker log files. The main process log and summary log are exempt.
+  * Type: `boolean`
+  * Default: `false`
+  * Example: `true`
+* **`log_compress_after_bytes`**:
+  * Description: For each worker, if the total size of its *non-active* log files exceeds this threshold, they will be considered for archiving. Can be an integer (bytes) or a human-readable string (e.g., "1GB", "500MB"). The currently active log file (latest serial) is not compressed.
+  * Type: `integer` or `string`
+  * Default: `1073741824` (1GB)
+  * Example: `"500MB"`, `2147483648` (2GB)
+* **`log_archive_max_archives`**:
+  * Description: The maximum number of `tar.gz` archive files to keep per worker within its designated archive location. If new archives are created exceeding this limit, the oldest ones for that worker will be deleted. **A value of 0 or less means unlimited archives.**
+  * Type: `integer`
+  * Default: `10`
+  * Example: `5`, `0` (unlimited)
+* **`log_archive_dir`**:
+  * Description: The name of the subdirectory *within each worker's log directory* where `tar.gz` archives will be stored. **If left empty or unspecified, archives will be stored directly in the worker's log directory itself** (e.g., `logs/<run_id>/w0/archive.tar.gz`). If specified (e.g., "archives"), they will be stored in `logs/<run_id>/w0/archives/archive.tar.gz`.
+  * Type: `string`
+  * Default: `""` (empty string, meaning archive in the worker's root log dir)
+  * Example: `"archives"`, `"old_logs"`
+
+---
+
+## Example Full `logging` Section
+
+```yaml
+logging:
+  log_level_file: "INFO"
+  log_level_console: "ERROR"
+  log_dir: "logs"
+  log_file_prefix: "cambia_expC"
+  log_max_bytes: "10MB"         # For individual file rotation
+  log_backup_count: 50
+
+  worker_config:
+    default_level: "INFO"
+    sequential_rules:
+      - "DEBUG"
+    overrides:
+      - worker_ids: [7]
+        level: "WARNING"
+
+  log_archive_enabled: true
+  log_compress_after_bytes: "200MB" # Archive worker logs when their rotated files exceed 200MB
+  log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker
+  log_archive_dir: ""               # Store archives directly in worker dirs (e.g., logs/run_xxx/w0/)
+                                    # Alternatively: log_archive_dir: "archives"
+```

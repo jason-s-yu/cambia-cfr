@@ -5,17 +5,16 @@ from typing import Optional, ClassVar, Dict
 import uuid
 import logging
 
-# Import constants ensuring correct names are used
 from .constants import (
     ACE,
     JACK,
     QUEEN,
     KING,
-    TEN,  # Use TEN constant
+    TEN,
     ALL_RANKS_STR,
     ALL_SUITS,
     RED_SUITS,
-    JOKER_RANK_STR,  # Use JOKER_RANK_STR
+    JOKER_RANK_STR,
 )
 
 logger = logging.getLogger(__name__)

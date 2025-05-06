@@ -1,10 +1,11 @@
 """src/config.py"""
 
-from typing import List, Dict, TypeVar, Optional, Union
+from typing import List, Dict, TypeVar, Optional, Union, Callable
 from dataclasses import dataclass, field
 import os
 import logging
 import yaml
+import re  # For parsing human-readable sizes
 
 T = TypeVar("T")
 
@@ -21,11 +22,34 @@ def get_nested(data: Dict, keys: List[str], default: T) -> T:
     # Handle case where the final value retrieved is None, but default isn't None
     if current is None and default is not None:
         return default
-    # Type check for safety, though it might be too strict sometimes
-    # if default is not None and not isinstance(current, type(default)):
-    #     print(f"Warning: Type mismatch for config key {'/'.join(keys)}. Expected {type(default)}, got {type(current)}. Using default.")
-    #     return default
     return current  # type: ignore
+
+
+def parse_human_readable_size(size_str: Union[str, int]) -> int:
+    """Parses a human-readable size string (e.g., '1GB', '500MB', '1024') into bytes."""
+    if isinstance(size_str, int):
+        return size_str
+    if not isinstance(size_str, str):
+        raise ValueError(f"Invalid size format: {size_str}. Must be int or string.")
+
+    size_str = size_str.upper().strip()
+    match = re.fullmatch(r"(\d+)\s*(KB|MB|GB|TB)?", size_str)
+    if not match:
+        raise ValueError(f"Invalid size format: {size_str}")
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == "KB":
+        value *= 1024
+    elif unit == "MB":
+        value *= 1024**2
+    elif unit == "GB":
+        value *= 1024**3
+    elif unit == "TB":
+        value *= 1024**4
+    # If unit is None, value is already in bytes
+    return value
 
 
 def parse_num_workers(num_workers: str | int) -> int:
@@ -141,9 +165,18 @@ class LoggingConfig:
     log_level_console: str = "ERROR"  # Logging level for the console
     log_dir: str = "logs"
     log_file_prefix: str = "cambia"
-    log_max_bytes: int = 9 * 1024 * 1024
+    log_max_bytes: int = (
+        9 * 1024 * 1024
+    )  # Default for SerialRotatingFileHandler, can be string like "9MB"
     log_backup_count: int = 999
     worker_config: Optional[WorkerLoggingConfig] = None
+    # Archiving settings
+    log_archive_enabled: bool = False
+    log_compress_after_bytes: int = 1 * 1024**3  # Default: 1GB, can be string like "1GB"
+    log_archive_max_archives: int = (
+        10  # Max number of tar.gz archives to keep per worker type
+    )
+    log_archive_dir: str = "archives"  # Subdirectory within log_dir for archives
 
     def get_worker_log_level(self, worker_id: int, num_total_workers: int) -> str:
         """
@@ -304,10 +337,12 @@ def load_config(
                     ["logging", "log_file_prefix"],
                     LoggingConfig.log_file_prefix,
                 ),
-                log_max_bytes=get_nested(
-                    config_dict,
-                    ["logging", "log_max_bytes"],
-                    LoggingConfig.log_max_bytes,
+                log_max_bytes=parse_human_readable_size(
+                    get_nested(
+                        config_dict,
+                        ["logging", "log_max_bytes"],
+                        LoggingConfig.log_max_bytes,
+                    )
                 ),
                 log_backup_count=get_nested(
                     config_dict,
@@ -315,6 +350,28 @@ def load_config(
                     LoggingConfig.log_backup_count,
                 ),
                 worker_config=worker_logging_config,
+                log_archive_enabled=get_nested(
+                    config_dict,
+                    ["logging", "log_archive_enabled"],
+                    LoggingConfig.log_archive_enabled,
+                ),
+                log_compress_after_bytes=parse_human_readable_size(
+                    get_nested(
+                        config_dict,
+                        ["logging", "log_compress_after_bytes"],
+                        LoggingConfig.log_compress_after_bytes,
+                    )
+                ),
+                log_archive_max_archives=get_nested(
+                    config_dict,
+                    ["logging", "log_archive_max_archives"],
+                    LoggingConfig.log_archive_max_archives,
+                ),
+                log_archive_dir=get_nested(
+                    config_dict,
+                    ["logging", "log_archive_dir"],
+                    LoggingConfig.log_archive_dir,
+                ),
             )
 
             cfg = Config(
@@ -458,6 +515,7 @@ def load_config(
         KeyError,
         AttributeError,
         yaml.YAMLError,
+        ValueError,  # For parse_human_readable_size or parse_num_workers
     ) as e:
         print(
             f"Error loading or parsing config file '{config_path}': {e}. "

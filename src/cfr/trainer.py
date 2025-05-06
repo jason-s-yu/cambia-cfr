@@ -1,5 +1,8 @@
-# src/cfr/trainer.py
-"""Main CFR Trainer class, composing functionality from mixins."""
+"""
+src/cfr/trainer.py
+
+Main CFR Trainer class, composing functionality from mixins.
+"""
 
 import logging
 import threading
@@ -14,7 +17,6 @@ from ..constants import NUM_PLAYERS
 from ..utils import PolicyDict, ReachProbDict, LogQueue as ProgressQueue
 from ..live_display import LiveDisplayManager
 
-# Import mixins
 from .data_manager_mixin import CFRDataManagerMixin
 from .recursion_mixin import CFRRecursionMixin
 from .training_loop_mixin import CFRTrainingLoopMixin
