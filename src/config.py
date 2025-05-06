@@ -1,9 +1,10 @@
-# src/config.py
-from typing import List, Dict, TypeVar, Optional, Union, Any
+"""src/config.py"""
+
+from typing import List, Dict, TypeVar, Optional, Union
 from dataclasses import dataclass, field
 import os
+import logging
 import yaml
-import logging  # Added import
 
 T = TypeVar("T")
 
