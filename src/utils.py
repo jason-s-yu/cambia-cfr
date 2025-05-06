@@ -108,19 +108,19 @@ def format_large_number(num: int | float) -> str:
     """
     if not isinstance(num, (int, float)):  # Handle potential non-numeric input
         return "N/A"
-    
+
     # Use float for calculations to preserve decimals before formatting
     num_float = float(num)
 
     if abs(num_float) < 1_000:
-        return str(int(num_float)) # Display as int if less than 1k
+        return str(int(num_float))  # Display as int if less than 1k
     if abs(num_float) < 1_000_000:
         return f"{num_float / 1_000:.0f}k"  # k with 0 decimal places
     if abs(num_float) < 1_000_000_000:
-        return f"{num_float / 1_000_000:.2f}M" # M with 2 decimal places
+        return f"{num_float / 1_000_000:.2f}M"  # M with 2 decimal places
     if abs(num_float) < 1_000_000_000_000:
-        return f"{num_float / 1_000_000_000:.2f}B" # B with 2 decimal places
-    return f"{num_float / 1_000_000_000_000:.2f}T" # T with 2 decimal places
+        return f"{num_float / 1_000_000_000:.2f}B"  # B with 2 decimal places
+    return f"{num_float / 1_000_000_000_000:.2f}T"  # T with 2 decimal places
 
 
 def format_infoset_count(count: int) -> str:

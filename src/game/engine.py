@@ -545,9 +545,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
         try:
             change_func()  # Apply the state modification
             delta_list.append(delta)  # Record the change event
-            undo_stack.appendleft(
-                undo_func
-            )
+            undo_stack.appendleft(undo_func)
         except Exception as e:
             logger.exception(
                 "Error applying change function %s for delta %s: %s",

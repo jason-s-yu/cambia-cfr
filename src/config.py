@@ -1,8 +1,9 @@
 # src/config.py
-from typing import List, Dict, TypeVar, Optional
+from typing import List, Dict, TypeVar, Optional, Union, Any
 from dataclasses import dataclass, field
 import os
 import yaml
+import logging  # Added import
 
 T = TypeVar("T")
 
@@ -30,14 +31,32 @@ def parse_num_workers(num_workers: str | int) -> int:
     """Parse the number of workers, ensuring it's a positive integer."""
     if isinstance(num_workers, int):
         if num_workers < 0:
-            raise ValueError("num_workers must be a positive integer.")
-        if num_workers == 0:
-            return os.cpu_count() - 1
+            # Allow 0 for auto, interpreted as os.cpu_count()
+            if num_workers == 0:  # 0 means auto
+                cpu_count = os.cpu_count()
+                return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+            raise ValueError("num_workers must be a positive integer or 0 for auto.")
+        return num_workers
     if isinstance(num_workers, str):
         if num_workers.lower() == "auto":
-            return os.cpu_count() - 1
-        raise ValueError("num_workers must be 'auto' or a positive integer.")
-    return num_workers
+            cpu_count = os.cpu_count()
+            return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+        try:
+            val = int(num_workers)
+            if val < 0:
+                # Allow 0 for auto
+                if val == 0:  # 0 means auto
+                    cpu_count = os.cpu_count()
+                    return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+                raise ValueError("num_workers must be a positive integer or 0 for auto.")
+            return val
+        except ValueError:
+            raise ValueError(
+                f"num_workers string '{num_workers}' must be 'auto' or an integer."
+            ) from None
+    raise ValueError(
+        f"num_workers must be 'auto' or a positive integer. Got: {num_workers}"
+    )
 
 
 @dataclass
@@ -103,13 +122,90 @@ class PersistenceConfig:
 
 
 @dataclass
+class WorkerLogOverrideConfig:
+    worker_ids: List[int] = field(default_factory=list)
+    level: str = "INFO"
+
+
+@dataclass
+class WorkerLoggingConfig:
+    default_level: str = "INFO"
+    sequential_rules: List[Union[str, Dict[str, int]]] = field(default_factory=list)
+    overrides: List[WorkerLogOverrideConfig] = field(default_factory=list)
+
+
+@dataclass
 class LoggingConfig:
-    log_level_file: str = "DEBUG"  # Logging level for the file
+    log_level_file: str = "DEBUG"  # Logging level for the main process file
     log_level_console: str = "ERROR"  # Logging level for the console
-    log_dir: str = "logs"  # Directory to store log files
-    log_file_prefix: str = "cambia"  # Prefix for log files within the run directory
-    log_max_bytes: int = 9 * 1024 * 1024  # Max size before rotation (~9MB)
-    log_backup_count: int = 999  # Max number of backup log files
+    log_dir: str = "logs"
+    log_file_prefix: str = "cambia"
+    log_max_bytes: int = 9 * 1024 * 1024
+    log_backup_count: int = 999
+    worker_config: Optional[WorkerLoggingConfig] = None
+
+    def get_worker_log_level(self, worker_id: int, num_total_workers: int) -> str:
+        """
+        Determines the log level for a specific worker based on the configuration.
+        """
+        if self.worker_config is None:
+            return (
+                self.log_level_file
+            )  # Fallback to global file_level if no worker_config
+
+        # 1. Check Overrides first
+        if self.worker_config.overrides:
+            for override_rule in self.worker_config.overrides:
+                if worker_id in override_rule.worker_ids:
+                    return override_rule.level.upper()
+
+        # 2. Check Sequential Rules
+        current_worker_idx_in_rules = 0
+        if self.worker_config.sequential_rules:
+            for rule_entry in self.worker_config.sequential_rules:
+                level_to_apply: str
+                num_workers_for_rule = 1
+
+                if isinstance(rule_entry, str):
+                    level_to_apply = rule_entry.upper()
+                elif isinstance(rule_entry, dict):
+                    # Expecting { "LEVEL": count }
+                    if len(rule_entry) != 1:
+                        logging.warning(
+                            "Invalid sequential_rule format: %s. Skipping.", rule_entry
+                        )
+                        continue
+                    level_to_apply = list(rule_entry.keys())[0].upper()
+                    num_workers_for_rule = list(rule_entry.values())[0]
+                    if (
+                        not isinstance(num_workers_for_rule, int)
+                        or num_workers_for_rule < 1
+                    ):
+                        logging.warning(
+                            "Invalid count in sequential_rule: %s. Using 1.", rule_entry
+                        )
+                        num_workers_for_rule = 1
+                else:
+                    logging.warning(
+                        "Unknown sequential_rule type: %s. Skipping.", rule_entry
+                    )
+                    continue
+
+                # Check if the current worker_id falls into this rule's range
+                if (
+                    current_worker_idx_in_rules
+                    <= worker_id
+                    < current_worker_idx_in_rules + num_workers_for_rule
+                ):
+                    return level_to_apply
+                current_worker_idx_in_rules += num_workers_for_rule
+
+        # 3. Fallback to worker_config.default_level
+        if self.worker_config.default_level:
+            return self.worker_config.default_level.upper()
+
+        # 4. Ultimate fallback to global log_level_file
+        return self.log_level_file.upper()
 
 
 @dataclass
@@ -122,11 +218,12 @@ class Config:
     cambia_rules: CambiaRulesConfig = field(default_factory=CambiaRulesConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    _source_path: Optional[str] = None  # Internal field to store config path
 
 
 def load_config(
     config_path: str = "config.yaml",
-) -> Optional[Config]:  # Return Optional[Config]
+) -> Optional[Config]:
     """Loads configuration from a YAML file."""
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -136,22 +233,91 @@ def load_config(
                     f"Warning: Config file '{config_path}' is empty or invalid. "
                     f"Using default configuration."
                 )
-                config_dict = {}  # Use empty dict to proceed with defaults
+                config_dict = {}
 
-            # Retrieve the 'api' section safely, defaulting to an empty dict if not found
             api_config_dict = config_dict.get("api", {})
-            # Retrieve the nested 'auth' dictionary within 'api', defaulting to empty if not found
             auth_dict = api_config_dict.get("auth", {})
-
-            # Construct ApiConfig using values from the loaded dict or defaults
             api_config = ApiConfig(
                 base_url=api_config_dict.get("base_url", ApiConfig.base_url),
-                auth=auth_dict,  # Directly assign the retrieved auth dictionary
+                auth=auth_dict,
             )
 
-            # Using helper for safer nested access with defaults from dataclasses for other sections
-            return Config(
-                api=api_config,  # Use the manually constructed ApiConfig
+            # Parse WorkerLoggingConfig if present
+            worker_log_cfg_dict = get_nested(
+                config_dict, ["logging", "worker_config"], None
+            )
+            worker_logging_config: Optional[WorkerLoggingConfig] = None
+            if worker_log_cfg_dict and isinstance(worker_log_cfg_dict, dict):
+                sequential_rules_raw = worker_log_cfg_dict.get("sequential_rules", [])
+                overrides_raw = worker_log_cfg_dict.get("overrides", [])
+                parsed_overrides = []
+                if isinstance(overrides_raw, list):
+                    for override_item in overrides_raw:
+                        if (
+                            isinstance(override_item, dict)
+                            and "worker_ids" in override_item
+                            and "level" in override_item
+                            and isinstance(override_item["worker_ids"], list)
+                            and isinstance(override_item["level"], str)
+                        ):
+                            parsed_overrides.append(
+                                WorkerLogOverrideConfig(
+                                    worker_ids=override_item["worker_ids"],
+                                    level=override_item["level"],
+                                )
+                            )
+                        else:
+                            logging.warning(
+                                "Skipping invalid worker log override item: %s",
+                                override_item,
+                            )
+
+                worker_logging_config = WorkerLoggingConfig(
+                    default_level=worker_log_cfg_dict.get(
+                        "default_level", WorkerLoggingConfig.default_level
+                    ),
+                    sequential_rules=(
+                        sequential_rules_raw
+                        if isinstance(sequential_rules_raw, list)
+                        else []
+                    ),
+                    overrides=parsed_overrides,
+                )
+
+            logging_config = LoggingConfig(
+                log_level_file=get_nested(
+                    config_dict,
+                    ["logging", "log_level_file"],
+                    LoggingConfig.log_level_file,
+                ),
+                log_level_console=get_nested(
+                    config_dict,
+                    ["logging", "log_level_console"],
+                    LoggingConfig.log_level_console,
+                ),
+                log_dir=get_nested(
+                    config_dict, ["logging", "log_dir"], LoggingConfig.log_dir
+                ),
+                log_file_prefix=get_nested(
+                    config_dict,
+                    ["logging", "log_file_prefix"],
+                    LoggingConfig.log_file_prefix,
+                ),
+                log_max_bytes=get_nested(
+                    config_dict,
+                    ["logging", "log_max_bytes"],
+                    LoggingConfig.log_max_bytes,
+                ),
+                log_backup_count=get_nested(
+                    config_dict,
+                    ["logging", "log_backup_count"],
+                    LoggingConfig.log_backup_count,
+                ),
+                worker_config=worker_logging_config,
+            )
+
+            cfg = Config(
+                api=api_config,
                 system=SystemConfig(
                     recursion_limit=get_nested(
                         config_dict,
@@ -276,58 +442,29 @@ def load_config(
                         PersistenceConfig.agent_data_save_path,
                     )
                 ),
-                logging=LoggingConfig(
-                    log_level_file=get_nested(
-                        config_dict,
-                        ["logging", "log_level_file"],
-                        LoggingConfig.log_level_file,
-                    ),
-                    log_level_console=get_nested(
-                        config_dict,
-                        ["logging", "log_level_console"],
-                        LoggingConfig.log_level_console,
-                    ),
-                    log_dir=get_nested(
-                        config_dict, ["logging", "log_dir"], LoggingConfig.log_dir
-                    ),
-                    log_file_prefix=get_nested(
-                        config_dict,
-                        ["logging", "log_file_prefix"],
-                        LoggingConfig.log_file_prefix,
-                    ),
-                    log_max_bytes=get_nested(
-                        config_dict,
-                        ["logging", "log_max_bytes"],
-                        LoggingConfig.log_max_bytes,
-                    ),
-                    log_backup_count=get_nested(
-                        config_dict,
-                        ["logging", "log_backup_count"],
-                        LoggingConfig.log_backup_count,
-                    ),
-                ),
+                logging=logging_config,
+                _source_path=os.path.abspath(config_path),
             )
+            return cfg
 
     except FileNotFoundError:
         print(
             f"Warning: Config file '{config_path}' not found. Using default configuration."
         )
-        return Config()  # Return default config object
+        return Config(_source_path=None)
     except (
         TypeError,
         KeyError,
         AttributeError,
         yaml.YAMLError,
-    ) as e:  # Catch more specific errors
+    ) as e:
         print(
             f"Error loading or parsing config file '{config_path}': {e}. "
             f"Check config structure/types."
         )
         print("Using default configuration.")
-        return Config()  # Return default config object
+        return Config(_source_path=None)
     except IOError as e:
         print(f"Unexpected error loading config file '{config_path}': {e}")
-        # Optionally re-raise or return None/default
-        # raise # Re-raise the exception for debugging
         print("Using default configuration.")
-        return Config()
+        return Config(_source_path=None)

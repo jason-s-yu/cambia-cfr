@@ -1,3 +1,4 @@
+# src/cfr/worker.py
 """src/cfr/worker.py"""
 
 import copy
@@ -12,7 +13,7 @@ import numpy as np
 
 # Relative imports from parent directories
 from ..agent_state import AgentObservation, AgentState
-from ..config import Config
+from ..config import Config  # Keep direct import for type hinting
 from ..constants import (
     NUM_PLAYERS,
     ActionAbilityBlindSwapSelect,
@@ -533,19 +534,26 @@ def run_cfr_simulation_worker(
                 backupCount=config.logging.log_backup_count,
                 encoding="utf-8",
             )
-            # Use the file log level from config for workers too
-            file_log_level = getattr(
-                logging, config.logging.log_level_file.upper(), logging.DEBUG
+
+            # Get worker-specific log level from config
+            worker_log_level_str = config.logging.get_worker_log_level(
+                worker_id, config.cfr_training.num_workers
             )
+            file_log_level = getattr(logging, worker_log_level_str.upper(), logging.DEBUG)
+
             file_handler.setLevel(file_log_level)
             file_handler.setFormatter(formatter)
             worker_root_logger.addHandler(file_handler)
 
             # Set worker's root logger level (e.g., DEBUG to capture everything for the file)
+            # This should be the most verbose level any handler might use.
             worker_root_logger.setLevel(logging.DEBUG)
             logger = logging.getLogger(__name__)  # Now safe to get child logger
             logger.info(
-                "Worker %d logging initialized to directory %s", worker_id, worker_log_dir
+                "Worker %d logging initialized to directory %s with level %s",
+                worker_id,
+                worker_log_dir,
+                logging.getLevelName(file_log_level),
             )
 
         except Exception as log_setup_e:

@@ -247,8 +247,9 @@ class LiveDisplayManager:
                 self.live.update(self._generate_renderable(), refresh=True)
 
             except Exception as e:
-                logging.error("Error explicitly refreshing Live display: %s", e, exc_info=True)
-
+                logging.error(
+                    "Error explicitly refreshing Live display: %s", e, exc_info=True
+                )
 
     # --- Public Update Methods ---
     def add_log_record(self, record: logging.LogRecord):
@@ -260,7 +261,7 @@ class LiveDisplayManager:
         """Updates the status of a specific worker."""
         if 0 <= worker_id < self.num_workers:
             self._worker_statuses[worker_id] = status
-            self.refresh() # Refresh to show updated worker status
+            self.refresh()  # Refresh to show updated worker status
         else:
             logging.error(
                 "LiveDisplay: Invalid worker ID %d for status update.", worker_id
@@ -297,9 +298,13 @@ class LiveDisplayManager:
             self.progress.update(
                 self.iteration_task_id, status_text=status_text, advance=0
             )
-            self.refresh() # Refresh to show updated header/table titles
+            self.refresh()  # Refresh to show updated header/table titles
         except Exception as e:
-            logging.error("Error updating progress bar stats field or refreshing: %s", e, exc_info=True)
+            logging.error(
+                "Error updating progress bar stats field or refreshing: %s",
+                e,
+                exc_info=True,
+            )
 
     def start(self):
         """Starts the Rich Live display."""
@@ -323,7 +328,7 @@ class LiveDisplayManager:
         if self.live:
             try:
                 self.live.stop()
-                self.console.print() # Print a final newline
+                self.console.print()  # Print a final newline
                 logging.debug("Rich Live display stopped.")
             except Exception as e:
                 logging.error("Error stopping Rich Live display: %s", e, exc_info=True)
@@ -348,13 +353,13 @@ class LiveDisplayManager:
                     result = func(*args, **kwargs)
                     return result
                 finally:
-                    self.live = None 
+                    self.live = None
         except Exception as e:
             if self.live:
                 try:
                     self.live.stop()
                 except Exception:
-                    pass # Suppress errors during stop on error
+                    pass  # Suppress errors during stop on error
                 finally:
                     self.live = None
             logging.error("Error occurred within Live context run:", exc_info=True)

@@ -44,13 +44,24 @@ cambia_rules:
 # Persistence Settings
 persistence:
   # Path relative to execution directory where agent data is saved/loaded
-  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.6-l1-p0-20250502.joblib"
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.14-l1-p16-paralog.joblib" # Updated version
 
 # Logging Configuration
 logging:
-  log_level_file: "DEBUG"       # Logging level for the file (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level_file: "INFO"       # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
   log_level_console: "ERROR"    # Logging level for the console
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory
   log_max_bytes: 9437184        # Max size before rotation (~9MB = 9 * 1024 * 1024)
   log_backup_count: 9999        # Max number of backup log files
+
+  worker_config:
+    default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
+    sequential_rules:
+      - "DEBUG"             # Worker 0: DEBUG. Subsequent workers use default_level unless overridden.
+    overrides: []           # No specific ID overrides in this example.
+                            # Example:
+                            # - worker_ids: [5, 7]
+                            #   level: "WARNING"
+                            # - worker_ids: [10]
+                            #   level: "CRITICAL"
