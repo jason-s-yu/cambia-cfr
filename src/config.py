@@ -176,6 +176,9 @@ class LoggingConfig:
         10  # Max number of tar.gz archives to keep per worker type
     )
     log_archive_dir: str = "archives"  # Subdirectory within log_dir for archives
+    log_size_update_interval_sec: int = (
+        60  # Interval in seconds to update log size display
+    )
 
     def get_worker_log_level(self, worker_id: int, num_total_workers: int) -> str:
         """
@@ -363,6 +366,11 @@ def load_config(
                     config_dict,
                     ["logging", "log_archive_dir"],
                     LoggingConfig.log_archive_dir,
+                ),
+                log_size_update_interval_sec=get_nested(
+                    config_dict,
+                    ["logging", "log_size_update_interval_sec"],
+                    LoggingConfig.log_size_update_interval_sec,
                 ),
             )
 

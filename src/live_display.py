@@ -1,8 +1,4 @@
-"""
-src/live_display.py
-
-Manages the Rich-based live console display for training progress.
-"""
+"""src/live_display.py"""
 
 import logging
 from collections import deque
@@ -123,9 +119,10 @@ class LiveDisplayManager:
             "Status", style="cyan", justify="left", no_wrap=True, min_width=9
         )
         table.add_column("Cur/Max Depth", style="green", width=13, justify="right")
-        table.add_column(
-            "Min Depth (Dist)", style="purple", width=14, justify="right"
-        )  # New column
+        table.add_column("Min Depth (BT)", style="purple", width=14, justify="right")
+        table.add_column(  # New Column for Min Depth Diff
+            "Min Depth (Diff)", style="deep_sky_blue1", width=16, justify="right"
+        )
         table.add_column("Nodes", style="blue", width=10, justify="right")
         table.add_column("Warn", style="yellow", width=5, justify="right")
         table.add_column("Err", style="red", width=5, justify="right")
@@ -140,6 +137,8 @@ class LiveDisplayManager:
                 "0",
             )
             min_depth_backtrack_str = "N/A"
+            min_depth_diff_str = "N/A"
+            current_depth_for_diff = 0
 
             if isinstance(status_info, WorkerStats):
                 if status_info.error_count > 0:
@@ -149,26 +148,55 @@ class LiveDisplayManager:
                 else:
                     status_str = "[green]Done[/green]"
                 depth_str = f"{status_info.max_depth}/{status_info.max_depth}"
+                current_depth_for_diff = (
+                    status_info.max_depth
+                )  # Use max_depth as current when done
                 nodes_str = format_large_number(status_info.nodes_visited)
                 warn_str = str(status_info.warning_count)
                 err_str = str(status_info.error_count)
+                min_depth_backtrack_val = status_info.min_depth_after_bottom_out
                 min_depth_backtrack_str = (
-                    str(int(status_info.min_depth_after_bottom_out))
-                    if status_info.min_depth_after_bottom_out != float("inf")
+                    str(int(min_depth_backtrack_val))
+                    if min_depth_backtrack_val != float("inf")
                     else "N/A"
                 )
+                if (
+                    min_depth_backtrack_val != float("inf")
+                    and min_depth_backtrack_val > 0
+                ):
+                    diff = current_depth_for_diff - int(min_depth_backtrack_val)
+                    min_depth_diff_str = (
+                        f"{int(min_depth_backtrack_val)} [dim](+{diff})[/dim]"
+                        if diff >= 0
+                        else f"{int(min_depth_backtrack_val)} [dim]({diff})[/dim]"
+                    )
+                else:
+                    min_depth_diff_str = (
+                        min_depth_backtrack_str  # Show N/A if no backtrack
+                    )
 
             elif isinstance(status_info, tuple) and len(status_info) == 5:
-                state, cur_d, max_d, nodes, min_d_bt = (
-                    status_info  # min_d_bt is the new field
-                )
+                state, cur_d, max_d, nodes, min_d_bt_val = status_info
                 status_str = state if state else "Running"
                 depth_str = f"{cur_d}/{max_d}"
+                current_depth_for_diff = cur_d
                 min_depth_backtrack_str = (
-                    str(min_d_bt) if min_d_bt != float("inf") else "N/A"
+                    str(min_d_bt_val)
+                    if min_d_bt_val != float("inf") and min_d_bt_val > 0
+                    else "N/A"
                 )
                 nodes_str = format_large_number(nodes)
                 warn_str, err_str = "-", "-"
+                if min_d_bt_val != float("inf") and min_d_bt_val > 0:
+                    diff = current_depth_for_diff - min_d_bt_val
+                    min_depth_diff_str = (
+                        f"{min_d_bt_val} [dim](+{diff})[/dim]"
+                        if diff >= 0
+                        else f"{min_d_bt_val} [dim]({diff})[/dim]"
+                    )
+                else:
+                    min_depth_diff_str = min_depth_backtrack_str
+
             elif isinstance(status_info, str):
                 if "Error" in status_info or "Fail" in status_info:
                     status_str = f"[bold red]{status_info}[/]"
@@ -186,12 +214,14 @@ class LiveDisplayManager:
                     status_str = status_info
                 depth_str, nodes_str, warn_str, err_str = "N/A", "-", "-", "-"
                 min_depth_backtrack_str = "N/A"
+                min_depth_diff_str = "N/A"
 
             table.add_row(
                 str(i),
                 status_str,
                 depth_str,
                 min_depth_backtrack_str,
+                min_depth_diff_str,
                 nodes_str,
                 warn_str,
                 err_str,

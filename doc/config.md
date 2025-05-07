@@ -238,6 +238,11 @@ Configuration for logging messages generated during training.
   * Type: `integer`
   * Default: `999`
   * Example: `10`
+* **`log_size_update_interval_sec`**:
+  * Description: The interval in seconds at which the live display will attempt to update the total log size summary (Active + Archived). Set to `0` or a negative value to disable periodic updates within an iteration (updates will still occur at the start and end of the training run).
+  * Type: `integer`
+  * Default: `60`
+  * Example: `30`, `120`
 * **`worker_config`**:
   * Description: (Optional) Provides fine-grained logging level control for individual worker processes. If omitted, workers will use `log_level_file`.
   * Type: `object` (dictionary)
@@ -323,6 +328,7 @@ logging:
   log_file_prefix: "cambia_expC"
   log_max_bytes: "10MB"         # For individual file rotation
   log_backup_count: 50          # Keep 50 uncompressed logs before archiving
+  log_size_update_interval_sec: 60 # Update log size in display every 60 seconds
 
   worker_config:
     default_level: "INFO"
@@ -335,3 +341,4 @@ logging:
   log_archive_enabled: true
   log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker/main log stream
   log_archive_dir: "archives"       # Store archives in a subdirectory named "archives"
+```

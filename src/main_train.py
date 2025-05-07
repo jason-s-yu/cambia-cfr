@@ -206,7 +206,6 @@ def setup_logging(
 
 def main():
     global live_display_manager_global, log_archiver_global, archive_queue_global
-    # Removed global last_log_size_update_time as it's managed by CFRTrainingLoopMixin
 
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(

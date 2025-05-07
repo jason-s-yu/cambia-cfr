@@ -55,6 +55,7 @@ logging:
   log_max_bytes: "10MB"         # Max size before rotation for an individual log file (e.g., worker_N_001.log)
   log_backup_count: 5           # Max number of backup (rotated) log files to keep *uncompressed* per worker/main process.
                                 # Files rotating beyond this count are archived if log_archive_enabled is true.
+  log_size_update_interval_sec: 30 # Interval in seconds to update the log size summary in the live display. 0 to disable.
 
   #worker_config:
     #default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
