@@ -13,7 +13,7 @@ from ..utils import (
     ReachProbDict,
     WorkerResult,
     normalize_probabilities,
-    format_infoset_count
+    format_infoset_count,
 )
 from ..config import Config
 

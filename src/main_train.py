@@ -43,9 +43,7 @@ shutdown_event = threading.Event()
 # Global references for SIGINT handler and final shutdown
 live_display_manager_global: Optional["LiveDisplayManager"] = None
 log_archiver_global: Optional["LogArchiver"] = None
-archive_queue_global: Optional[Union[queue.Queue, "multiprocessing.Queue"]] = (
-    None
-)
+archive_queue_global: Optional[Union[queue.Queue, "multiprocessing.Queue"]] = None
 
 
 def handle_sigint(sig, frame):

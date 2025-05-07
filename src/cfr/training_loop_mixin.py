@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     WorkerDisplayStatus = Any  # Placeholder
 
 
-
 logger = logging.getLogger(__name__)
 
 POOL_TERMINATE_TIMEOUT_SECONDS = 10
