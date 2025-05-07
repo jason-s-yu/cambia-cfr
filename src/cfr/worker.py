@@ -11,9 +11,8 @@ from typing import Dict, List, Optional, Tuple, TypeAlias, Union
 
 import numpy as np
 
-# Relative imports from parent directories
 from ..agent_state import AgentObservation, AgentState
-from ..config import Config  # Keep direct import for type hinting
+from ..config import Config
 from ..constants import (
     NUM_PLAYERS,
     ActionAbilityBlindSwapSelect,
@@ -42,18 +41,13 @@ from ..utils import (
 )
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
-ProgressQueueWorker: TypeAlias = (
-    queue.Queue
-)  # Standard queue for progress from worker to main via MP Manager
-ArchiveQueueWorker: TypeAlias = Union[
-    queue.Queue, "multiprocessing.Queue"
-]  # Can be MP or threading
+ProgressQueueWorker: TypeAlias = queue.Queue
+ArchiveQueueWorker: TypeAlias = Union[queue.Queue, "multiprocessing.Queue"]
 
 
-PROGRESS_UPDATE_NODE_INTERVAL = 1000  # Send update every N nodes
+PROGRESS_UPDATE_NODE_INTERVAL = 1000
 
 
-# --- Traversal Logic ---
 def _traverse_game_for_worker(
     game_state: CambiaGameState,
     agent_states: List[AgentState],
@@ -70,28 +64,27 @@ def _traverse_game_for_worker(
     worker_stats: WorkerStats,
     progress_queue: Optional[ProgressQueueWorker],
     worker_id: int,
+    min_depth_for_segment: List[int],  # Pass as a list to modify in place
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
-    # Get logger instance AFTER setup in run_cfr_simulation_worker
     logger = logging.getLogger(__name__)
 
-    # Update stats
     worker_stats.nodes_visited += 1
+    # Update the minimum depth encountered in this specific traversal segment
+    min_depth_for_segment[0] = min(min_depth_for_segment[0], depth)
     worker_stats.max_depth = max(worker_stats.max_depth, depth)
 
-    # Send Progress Update Periodically
     if progress_queue and (
         worker_stats.nodes_visited % PROGRESS_UPDATE_NODE_INTERVAL == 0
     ):
         try:
-            # Send current depth, max depth for this worker, and nodes visited
             progress_update = (
                 worker_id,
-                depth,  # Current recursion depth
-                worker_stats.max_depth,  # Max depth seen by this worker so far
-                worker_stats.nodes_visited,  # Total nodes visited by this worker
+                depth,
+                worker_stats.max_depth,
+                worker_stats.nodes_visited,
+                min_depth_for_segment[0],  # Send current min depth for this segment
             )
-            # Use put_nowait for manager queue if progress_queue comes from manager
             progress_queue.put_nowait(progress_update)
         except queue.Full:
             pass
@@ -103,13 +96,11 @@ def _traverse_game_for_worker(
             )
             worker_stats.error_count += 1
 
-    # Base Case
     if game_state.is_terminal():
         return np.array(
             [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
         )
 
-    # Check depth limit
     if depth >= config.system.recursion_limit:
         logger.error(
             "Worker %d: Max recursion depth (%d) reached. Returning 0.", worker_id, depth
@@ -117,7 +108,6 @@ def _traverse_game_for_worker(
         worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-    # Determine Context, Acting Player, Infoset Key
     if game_state.snap_phase_active:
         current_context = DecisionContext.SNAP_DECISION
     elif game_state.pending_action:
@@ -144,8 +134,8 @@ def _traverse_game_for_worker(
                 type(pending).__name__,
             )
             worker_stats.warning_count += 1
-            current_context = DecisionContext.START_TURN  # Fallback
-    else:  # Normal start of turn
+            current_context = DecisionContext.START_TURN
+    else:
         current_context = DecisionContext.START_TURN
 
     player = game_state.get_acting_player()
@@ -201,7 +191,6 @@ def _traverse_game_for_worker(
         worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-    # --- Get Legal Actions ---
     try:
         legal_actions_set = game_state.get_legal_actions()
         legal_actions = sorted(list(legal_actions_set), key=repr)
@@ -234,20 +223,18 @@ def _traverse_game_for_worker(
                 ),
             )
             worker_stats.error_count += 1
-            # Non-terminal state bug candidate (Backlog #1)
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
-        else:  # Correctly terminal
+        else:
             return np.array(
                 [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
             )
 
-    # --- Get Strategy from Snapshot ---
     current_regrets: Optional[np.ndarray] = regret_sum_snapshot.get(infoset_key)
-    strategy = np.array([])  # Initialize strategy
+    strategy = np.array([])
     if current_regrets is not None and len(current_regrets) == num_actions:
         strategy = get_rm_plus_strategy(current_regrets)
     else:
-        if current_regrets is not None:  # Dimension mismatch
+        if current_regrets is not None:
             logger.warning(
                 "Worker %d: Regret dim mismatch key %s. Snap:%d Need:%d. Using uniform.",
                 worker_id,
@@ -270,7 +257,6 @@ def _traverse_game_for_worker(
                 num_actions, dtype=np.float64
             )
 
-    # --- Accumulate Updates & Iterate Through Actions ---
     player_reach = reach_probs[player]
     opponent_reach = reach_probs[opponent]
     if player == updating_player and weight > 0 and player_reach > 1e-9:
@@ -347,13 +333,12 @@ def _traverse_game_for_worker(
             worker_stats.error_count += 1
             continue
 
-        # Create observation and update agent states
         observation = _create_observation(
             None,
             action,
             game_state,
             player,
-            game_state.snap_results_log,  # Pass current snap results from game state
+            game_state.snap_results_log,
             drawn_card_this_step,
         )
         next_agent_states = []
@@ -397,7 +382,9 @@ def _traverse_game_for_worker(
         temp_reach_probs = reach_probs.copy()
         temp_reach_probs[player] *= action_prob
 
-        # Recursive call
+        # Pass a new tracker for the sub-branch, initialized to infinity
+        recursive_min_depth_tracker = [float("inf")]
+
         try:
             recursive_utilities = _traverse_game_for_worker(
                 game_state,
@@ -415,6 +402,7 @@ def _traverse_game_for_worker(
                 worker_stats,
                 progress_queue,
                 worker_id,
+                recursive_min_depth_tracker,
             )
             action_utilities[i] = recursive_utilities
         except Exception as recursive_err:
@@ -430,7 +418,6 @@ def _traverse_game_for_worker(
             worker_stats.error_count += 1
             action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-        # Undo action
         if undo_info:
             try:
                 undo_info()
@@ -446,7 +433,6 @@ def _traverse_game_for_worker(
                 worker_stats.error_count += 1
                 return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-    # --- Calculate Node Value & Accumulate Regret Update ---
     valid_strategy_for_value_calc = (
         strategy
         if len(strategy) == num_actions
@@ -488,36 +474,33 @@ def _traverse_game_for_worker(
 
 def run_cfr_simulation_worker(
     worker_args: Tuple[
-        int,  # iteration
+        int,
         Config,
         RegretSnapshotDict,
-        Optional[ProgressQueueWorker],  # progress_queue
-        Optional[ArchiveQueueWorker],  # archive_queue
-        int,  # worker_id
-        str,  # run_log_dir
-        str,  # run_timestamp
+        Optional[ProgressQueueWorker],
+        Optional[ArchiveQueueWorker],
+        int,
+        str,
+        str,
     ],
 ) -> Optional[WorkerResult]:
     """Top-level function executed by each worker process. Sets up per-worker logging."""
-    logger_instance = None  # Initialize logger variable
-    worker_stats = WorkerStats()  # Initialize stats early for exception handling
+    logger_instance = None
+    worker_stats = WorkerStats()
     (
         iteration,
         config,
         regret_sum_snapshot,
         progress_queue,
-        archive_queue,  # Unpack archive_queue
+        archive_queue,
         worker_id,
         run_log_dir,
         run_timestamp,
     ) = worker_args
 
     try:
-        # Per-Worker Logging Setup
-        worker_root_logger = logging.getLogger()  # Get root logger for this process
-        for handler in worker_root_logger.handlers[
-            :
-        ]:  # Remove any handlers inherited from parent
+        worker_root_logger = logging.getLogger()
+        for handler in worker_root_logger.handlers[:]:
             worker_root_logger.removeHandler(handler)
             if hasattr(handler, "close"):
                 handler.close()
@@ -537,8 +520,8 @@ def run_cfr_simulation_worker(
                 maxBytes=config.logging.log_max_bytes,
                 backupCount=config.logging.log_backup_count,
                 encoding="utf-8",
-                archive_queue=archive_queue,  # Pass archive_queue to handler
-                logging_config_snapshot=config.logging,  # Pass logging config
+                archive_queue=archive_queue,
+                logging_config_snapshot=config.logging,
             )
             worker_log_level_str = config.logging.get_worker_log_level(
                 worker_id, config.cfr_training.num_workers
@@ -547,12 +530,8 @@ def run_cfr_simulation_worker(
             file_handler.setLevel(file_log_level)
             file_handler.setFormatter(formatter)
             worker_root_logger.addHandler(file_handler)
-            worker_root_logger.setLevel(
-                logging.DEBUG
-            )  # Set worker's root logger to DEBUG
-            logger_instance = logging.getLogger(
-                __name__
-            )  # Get a logger for this module within worker
+            worker_root_logger.setLevel(logging.DEBUG)
+            logger_instance = logging.getLogger(__name__)
             logger_instance.info(
                 "Worker %d logging initialized to directory %s with level %s",
                 worker_id,
@@ -565,20 +544,14 @@ def run_cfr_simulation_worker(
                 file=sys.stderr,
             )
             worker_stats.error_count += 1
-            if (
-                not worker_root_logger.hasHandlers()
-            ):  # Ensure there's at least a NullHandler
+            if not worker_root_logger.hasHandlers():
                 worker_root_logger.addHandler(logging.NullHandler())
-            logger_instance = logging.getLogger(
-                __name__
-            )  # Get logger even if setup failed
+            logger_instance = logging.getLogger(__name__)
 
-        # --- Main Worker Logic ---
         try:
             game_state = CambiaGameState(house_rules=config.cambia_rules)
             initial_agent_states = []
             if not game_state.is_terminal():
-                # Pass empty list for snap_results during initial observation creation
                 initial_obs = _create_observation(None, None, game_state, -1, [], None)
                 initial_hands_for_log = [list(p.hand) for p in game_state.players]
                 initial_peeks_for_log = [
@@ -630,6 +603,9 @@ def run_cfr_simulation_worker(
             )
             local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
 
+            # Initialize min_depth for this worker's simulation segment
+            min_depth_for_this_simulation_segment = [float("inf")]
+
             _traverse_game_for_worker(
                 game_state=game_state,
                 agent_states=initial_agent_states,
@@ -646,6 +622,7 @@ def run_cfr_simulation_worker(
                 worker_stats=worker_stats,
                 progress_queue=progress_queue,
                 worker_id=worker_id,
+                min_depth_for_segment=min_depth_for_this_simulation_segment,
             )
 
             return WorkerResult(
@@ -656,19 +633,18 @@ def run_cfr_simulation_worker(
             )
 
         except KeyboardInterrupt:
-            if logger_instance:  # Use the initialized logger if available
+            if logger_instance:
                 logger_instance.warning(
                     "Worker %d iter %d received KeyboardInterrupt. Exiting gracefully.",
                     worker_id,
                     iteration,
                 )
-            else:  # Fallback print if logger setup failed
+            else:
                 print(
                     f"Worker {worker_id} iter {iteration} received KeyboardInterrupt (logger not available). Exiting.",
                     file=sys.stderr,
                 )
-            # Return stats collected so far, marking an error due to interrupt
-            worker_stats.error_count += 1  # Count interrupt as an error for aggregation
+            worker_stats.error_count += 1
             return WorkerResult(stats=worker_stats)
         except Exception as e_inner:
             worker_stats.error_count += 1
@@ -699,7 +675,6 @@ def run_cfr_simulation_worker(
         return WorkerResult(stats=worker_stats)
 
 
-# --- Helper functions _create_observation, _filter_observation ---
 def _create_observation(
     prev_state: Optional[CambiaGameState],
     action: Optional[GameAction],
@@ -709,7 +684,7 @@ def _create_observation(
     explicit_drawn_card: Optional[CardObject] = None,
 ) -> AgentObservation:
     """Creates the AgentObservation object based on the state *after* the action."""
-    logger_obs = logging.getLogger(__name__)  # Get logger instance for this helper
+    logger_obs = logging.getLogger(__name__)
     discard_top = next_state.get_discard_top()
     hand_sizes = [next_state.get_player_card_count(i) for i in range(NUM_PLAYERS)]
     stock_size = next_state.get_stockpile_size()
@@ -797,17 +772,6 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
             )
         )
         if not is_observer_peek_action:
-            # If observer is not the one peeking, they don't see the peeked cards.
-            # However, if the peeked_cards dict contains info *about the observer*, they should see that.
-            # This case is subtle: KingLook reveals both. PeekOwn reveals self. PeekOther reveals other.
-            # The current logic in AgentState.update correctly processes based on player_id.
-            # For filtering, we should only nullify if the entire peeked_cards dict is irrelevant.
-            # A simpler approach: if the observer is not the actor of a peek, they see nothing.
-            # If they are the actor, they see what the action dictates.
-            # This means if actor == observer, they see the full peeked_cards.
-            # If actor != observer, they see None. This is already handled by AgentState.update using obs.peeked_cards.
-            # The critical part is AgentState.update will only *use* the peeked_cards info if it's relevant.
-            # So, for filtering, if observer is not the actor of a PEEK/LOOK action, clear peeked_cards.
             if not (
                 obs.acting_player == observer_id
                 and (
@@ -822,10 +786,8 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
                 )
             ):
                 filtered_obs.peeked_cards = None
-            # If it IS the observer's peek action, they get the full dict (as created by _create_observation)
-            # and their AgentState.update will use the relevant parts.
     else:
         filtered_obs.peeked_cards = None
 
-    filtered_obs.snap_results = obs.snap_results  # Snap results are public
+    filtered_obs.snap_results = obs.snap_results
     return filtered_obs

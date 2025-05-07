@@ -1,4 +1,8 @@
-"""Manages the Rich-based live console display for training progress."""
+"""
+src/live_display.py
+
+Manages the Rich-based live console display for training progress.
+"""
 
 import logging
 from collections import deque
@@ -22,7 +26,9 @@ from rich.text import Text
 from .utils import WorkerStats, format_large_number
 
 # Define worker status type alias used internally by the display
-WorkerDisplayStatus = Union[str, WorkerStats, Tuple[str, int, int, int]]
+WorkerDisplayStatus = Union[
+    str, WorkerStats, Tuple[str, int, int, int, int]
+]  # state, cur_d, max_d, nodes, min_d
 
 
 class LiveDisplayManager:
@@ -33,14 +39,13 @@ class LiveDisplayManager:
         num_workers: int,
         total_iterations: int,
         console: Console,
-        console_log_level_value: int = logging.ERROR,  # Default to ERROR
+        console_log_level_value: int = logging.ERROR,
     ):
         self.num_workers = num_workers
         self.total_iterations = total_iterations
         self.console = console
         self.console_log_level_value = console_log_level_value
 
-        # Internal state tracking
         self._worker_statuses: Dict[int, WorkerDisplayStatus] = {
             i: "Initializing" for i in range(num_workers)
         }
@@ -48,22 +53,16 @@ class LiveDisplayManager:
         self._last_exploitability = "N/A"
         self._total_infosets = "0"
         self._last_iter_time = "N/A"
-        self._min_worker_nodes_str: str = "N/A"
+        self._min_worker_nodes_overall_str: str = "N/A"
         self._total_log_size_str: str = "Calculating..."
-        # Log records will be filtered by RichHandler's level, so deque can be larger if needed
-        # for internal history, but display will be filtered.
-        self._log_records: Deque[logging.LogRecord] = deque(
-            maxlen=50
-        )  # Max items in internal deque
+        self._log_records: Deque[logging.LogRecord] = deque(maxlen=50)
 
-        # Store previous renderables to compare for changes
         self._last_header_text_str: Optional[str] = None
         self._last_worker_table_title: Optional[str] = None
         self._last_worker_statuses_repr: Optional[str] = None
         self._last_log_panel_content_str: Optional[str] = None
         self._last_log_summary_str: Optional[str] = None
 
-        # Rich components
         self.progress = self._create_progress_bar()
         self.iteration_task_id = self.progress.add_task(
             "Overall Progress", total=total_iterations, status_text="Initializing..."
@@ -93,16 +92,15 @@ class LiveDisplayManager:
         layout = Layout()
         layout.split(
             Layout(name="header", size=1),
-            Layout(name="main_content", ratio=1),  # Renamed for clarity
+            Layout(name="main_content", ratio=1),
             Layout(name="footer", size=7),
         )
-        # Main content now has two rows: main_row (workers/logs), and log_summary_panel
         layout["main_content"].split_column(
             Layout(name="main_row", ratio=1),
             Layout(name="log_summary_panel", size=3),
         )
-        layout["main_row"].split_row(  # This was layout["main"] before
-            Layout(name="workers", ratio=2), Layout(name="logs", ratio=3)
+        layout["main_row"].split_row(
+            Layout(name="workers", ratio=60), Layout(name="logs", ratio=40)
         )
         layout["footer"].split(
             Layout(name="progress_bar", size=3), Layout(name="padding", size=4)
@@ -118,12 +116,12 @@ class LiveDisplayManager:
             expand=True,
             padding=(0, 1),
         )
-        table.add_column("ID", style="dim", width=4, justify="right")
+        table.add_column("ID", style="dim", width=3, justify="right")
         table.add_column(
-            "Status", style="cyan", justify="left", no_wrap=True, min_width=10
+            "Status", style="cyan", justify="left", no_wrap=True, min_width=9
         )
-        table.add_column("Depth", style="green", width=10, justify="right")
-        table.add_column("Nodes", style="blue", width=12, justify="right")
+        table.add_column("Depth (Min)", style="green", width=13, justify="right")
+        table.add_column("Nodes", style="blue", width=10, justify="right")
         table.add_column("Warn", style="yellow", width=5, justify="right")
         table.add_column("Err", style="red", width=5, justify="right")
 
@@ -144,14 +142,16 @@ class LiveDisplayManager:
                     status_str = "[yellow]Warn[/yellow]"
                 else:
                     status_str = "[green]Done[/green]"
-                depth_str = str(status_info.max_depth)
+                # For completed workers, min_depth is just their max_depth for that run
+                depth_str = f"({status_info.max_depth}) {status_info.max_depth}"
                 nodes_str = format_large_number(status_info.nodes_visited)
                 warn_str = str(status_info.warning_count)
                 err_str = str(status_info.error_count)
-            elif isinstance(status_info, tuple) and len(status_info) == 4:
-                state, cur_d, max_d, nodes = status_info
+            elif isinstance(status_info, tuple) and len(status_info) == 5:
+                state, cur_d, max_d, nodes, min_d_for_worker = status_info
                 status_str = state if state else "Running"
-                depth_str = f"{cur_d}/{max_d}"
+                # Use min_d_for_worker (min depth for this segment) in parentheses
+                depth_str = f"({min_d_for_worker}) {cur_d}/{max_d}"
                 nodes_str = format_large_number(nodes)
                 warn_str, err_str = "-", "-"
             elif isinstance(status_info, str):
@@ -169,29 +169,32 @@ class LiveDisplayManager:
                     status_str = "[dim]Idle[/dim]"
                 else:
                     status_str = status_info
-                depth_str, nodes_str, warn_str, err_str = "-", "-", "-", "-"
+                depth_str, nodes_str, warn_str, err_str = "N/A", "-", "-", "-"
+
             table.add_row(str(i), status_str, depth_str, nodes_str, warn_str, err_str)
         return table
 
     def _generate_log_panel_content_str(self) -> str:
         """Generates the string content for the log panel, for comparison."""
         log_texts_plain: List[str] = []
-        # Ensure RichHandler uses the same console for consistent formatting, if needed.
         handler = RichHandler(
             show_level=True,
             markup=True,
             rich_tracebacks=False,
             show_path=False,
-            level=self.console_log_level_value,  # Apply console log level here
+            level=self.console_log_level_value,
             console=self.console,
         )
         for record in list(self._log_records):
-            try:
-                # RichHandler.level should filter records before render_message is even effectively used by Live.
-                # However, if we were manually iterating and deciding to render, we'd check record.levelno
-                if (
-                    record.levelno >= handler.level
-                ):  # Explicit check matching handler's behavior
+            if (
+                record.name == "src.serial_rotating_handler"
+                and "Queued" in record.getMessage()
+                and "for archiving" in record.getMessage()
+            ):
+                continue
+
+            if record.levelno >= handler.level:
+                try:
                     render_result = handler.render_message(
                         record, message=record.getMessage()
                     )
@@ -201,8 +204,8 @@ class LiveDisplayManager:
                             if isinstance(render_result, Text)
                             else str(render_result)
                         )
-            except Exception:  # pylint: disable=broad-except
-                log_texts_plain.append(f"Log Format Error: {record.getMessage()}\n")
+                except Exception:
+                    log_texts_plain.append(f"Log Format Error: {record.getMessage()}\n")
         return "".join(log_texts_plain)
 
     def _generate_log_panel(self) -> Panel:
@@ -213,29 +216,33 @@ class LiveDisplayManager:
             markup=True,
             rich_tracebacks=False,
             show_path=False,
-            level=self.console_log_level_value,  # Apply console log level here
+            level=self.console_log_level_value,
             console=self.console,
         )
-        for record in list(
-            self._log_records
-        ):  # Iterate over a copy for thread safety if needed
-            try:
-                # RichHandler.level handles filtering. Records not meeting the level won't be rendered.
-                # The RichHandler will internally filter based on its configured level.
-                # We just feed it all records from our deque that LiveLogHandler (which also filters) gave us.
-                render_result = handler.render_message(
-                    record, message=record.getMessage()
-                )  # This will return None or empty if filtered by level
-                if render_result:  # Only add if RichHandler decided to render it
-                    if isinstance(
-                        render_result, Text
-                    ) and not render_result.plain.endswith("\n"):
-                        render_result.append("\n")
-                    log_texts.append(render_result)
-            except Exception as fmt_exc:  # pylint: disable=broad-except
-                # Only append error if the record itself was at or above the display level
-                if record.levelno >= handler.level:
-                    log_texts.append(Text(f"Log Format Error: {fmt_exc}\n", style="red"))
+        for record in list(self._log_records):
+            if (
+                record.name == "src.serial_rotating_handler"
+                and "Queued" in record.getMessage()
+                and "for archiving" in record.getMessage()
+            ):
+                continue
+
+            if record.levelno >= handler.level:
+                try:
+                    render_result = handler.render_message(
+                        record, message=record.getMessage()
+                    )
+                    if render_result:
+                        if isinstance(
+                            render_result, Text
+                        ) and not render_result.plain.endswith("\n"):
+                            render_result.append("\n")
+                        log_texts.append(render_result)
+                except Exception as fmt_exc:
+                    if record.levelno >= handler.level:
+                        log_texts.append(
+                            Text(f"Log Format Error: {fmt_exc}\n", style="red")
+                        )
 
         log_content = Group(*log_texts) if log_texts else Text("")
         return Panel(log_content, title="Recent Logs", border_style="dim", expand=True)
@@ -245,7 +252,7 @@ class LiveDisplayManager:
         header_str = (
             f" Cambia CFR+ :: Iter: {self._current_iteration}/{self.total_iterations} "
             f":: Infosets: {self._total_infosets} :: Expl: {self._last_exploitability} "
-            f":: Min Nodes: {self._min_worker_nodes_str} "
+            f":: Min Nodes (Overall): {self._min_worker_nodes_overall_str} "
             f":: Last Iter: {self._last_iter_time} "
         )
         return Text(header_str, style="bold white on blue", justify="center")
@@ -259,7 +266,6 @@ class LiveDisplayManager:
             expand=True,
         )
 
-    # Method name matches user's traceback context
     def _update_layout_if_changed(self) -> bool:
         """
         Updates individual components of the layout if their content has changed.
@@ -267,7 +273,6 @@ class LiveDisplayManager:
         """
         layout_updated = False
 
-        # Header
         current_header_text_obj = self._generate_header_text_obj()
         current_header_str = current_header_text_obj.plain
         if self._last_header_text_str != current_header_str:
@@ -275,7 +280,6 @@ class LiveDisplayManager:
             self._last_header_text_str = current_header_str
             layout_updated = True
 
-        # Worker Table
         current_worker_table_title = f"Worker Status (Iter {self._current_iteration})"
         current_worker_statuses_repr = repr(sorted(self._worker_statuses.items()))
         if (
@@ -289,16 +293,13 @@ class LiveDisplayManager:
             self._last_worker_statuses_repr = current_worker_statuses_repr
             layout_updated = True
 
-        # Log Panel
-        # The comparison string should also be generated using the level-filtered RichHandler
         current_log_str = self._generate_log_panel_content_str()
         if self._last_log_panel_content_str != current_log_str:
             self.layout["logs"].update(self._generate_log_panel())
             self._last_log_panel_content_str = current_log_str
             layout_updated = True
 
-        # Log Summary Panel
-        current_log_summary_str = self._total_log_size_str  # Direct comparison
+        current_log_summary_str = self._total_log_size_str
         if self._last_log_summary_str != current_log_summary_str:
             self.layout["log_summary_panel"].update(self._generate_log_summary_panel())
             self._last_log_summary_str = current_log_summary_str
@@ -315,7 +316,8 @@ class LiveDisplayManager:
                 )
         except Exception as e_pb_update:
             logging.error(
-                f"Error accessing/updating 'progress_bar' layout region: {e_pb_update}",
+                "Error accessing/updating 'progress_bar' layout region: %s",
+                e_pb_update,
                 exc_info=True,
             )
 
@@ -327,13 +329,8 @@ class LiveDisplayManager:
         if self.live:
             try:
                 content_changed = self._update_layout_if_changed()
-                # Only refresh the live object if content actually changed or if progress bar itself needs update.
-                # Rich's Progress bar updates independently if it's part of the layout.
-                # The explicit self.live.update is more for the Panels.
                 if content_changed:
                     self.live.update(self.layout, refresh=True)
-                # If only progress bar updated, Rich handles it.
-                # We could potentially call self.live.refresh() to force it, but usually not needed.
             except Exception as e:
                 logging.error(
                     "Error explicitly refreshing Live display: %s", e, exc_info=True
@@ -341,11 +338,7 @@ class LiveDisplayManager:
 
     def add_log_record(self, record: logging.LogRecord):
         """Adds a log record to the display queue and refreshes."""
-        # LiveLogHandler already filters by its level.
-        # We add it to our internal deque.
         self._log_records.append(record)
-        # The refresh will cause _generate_log_panel to be called,
-        # which uses RichHandler that filters by *its* level.
         self.refresh()
 
     def update_worker_status(self, worker_id: int, status: WorkerDisplayStatus):
@@ -361,33 +354,28 @@ class LiveDisplayManager:
             )
 
         if changed:
-            # Update min worker nodes if any worker status changed
-            min_nodes = float("inf")
-            found_stats = False
+            min_nodes_overall = float("inf")
+            found_any_stats = False
             for i in range(self.num_workers):
                 s_info = self._worker_statuses.get(i)
+                current_worker_nodes = float("inf")
                 if isinstance(s_info, WorkerStats):
-                    min_nodes = min(min_nodes, s_info.nodes_visited)
-                    found_stats = True
-                elif (
-                    isinstance(s_info, tuple) and len(s_info) == 4
-                ):  # Running status with node count
-                    # s_info[3] is nodes_visited
-                    min_nodes = min(min_nodes, s_info[3])
-                    found_stats = True
+                    current_worker_nodes = s_info.nodes_visited
+                    found_any_stats = True
+                elif isinstance(s_info, tuple) and len(s_info) == 5:
+                    current_worker_nodes = s_info[3]
+                    found_any_stats = True
 
-            if found_stats and min_nodes != float("inf"):
-                new_min_nodes_str = format_large_number(
-                    int(min_nodes)
-                )  # Ensure it's int for format_large_number
-                if self._min_worker_nodes_str != new_min_nodes_str:
-                    self._min_worker_nodes_str = new_min_nodes_str
-                    # The refresh call below will pick up header change
-            elif not found_stats:  # Or if all are inf (e.g. init)
-                if (
-                    self._min_worker_nodes_str != "N/A"
-                ):  # Avoid unnecessary updates if already N/A
-                    self._min_worker_nodes_str = "N/A"
+                if current_worker_nodes != float("inf"):
+                    min_nodes_overall = min(min_nodes_overall, current_worker_nodes)
+
+            if found_any_stats and min_nodes_overall != float("inf"):
+                new_min_nodes_overall_str = format_large_number(int(min_nodes_overall))
+                if self._min_worker_nodes_overall_str != new_min_nodes_overall_str:
+                    self._min_worker_nodes_overall_str = new_min_nodes_overall_str
+            elif not found_any_stats:
+                if self._min_worker_nodes_overall_str != "N/A":
+                    self._min_worker_nodes_overall_str = "N/A"
             self.refresh()
 
     def update_overall_progress(self, completed: int):
@@ -395,14 +383,11 @@ class LiveDisplayManager:
         needs_refresh_for_header = False
         if self._current_iteration != completed:
             self._current_iteration = completed
-            needs_refresh_for_header = (
-                True  # Iteration number change affects header & table title
-            )
+            needs_refresh_for_header = True
         try:
             self.progress.update(self.iteration_task_id, completed=completed)
             if needs_refresh_for_header:
-                self.refresh()  # Refresh if header elements changed
-            # No explicit refresh needed just for progress bar numbers, Rich handles that.
+                self.refresh()
         except Exception as e:
             logging.error("Error updating progress bar completion: %s", e, exc_info=True)
 
@@ -415,9 +400,7 @@ class LiveDisplayManager:
     ):
         """Updates the displayed overall statistics and refreshes if header data changed."""
         needs_refresh_for_header = False
-        if (
-            self._current_iteration != iteration
-        ):  # Though update_overall_progress usually handles this
+        if self._current_iteration != iteration:
             self._current_iteration = iteration
             needs_refresh_for_header = True
         if self._total_infosets != infosets:
@@ -434,18 +417,13 @@ class LiveDisplayManager:
             self._last_iter_time = new_last_iter_time_str
             needs_refresh_for_header = True
 
-        # Min worker nodes string is updated by update_worker_status, so header will pick it up
-        # No need to explicitly check self._min_worker_nodes_str here for refresh trigger,
-        # as any change to it would have already called self.refresh() via update_worker_status.
-
         status_text_for_progress_bar = f"Infosets: {infosets} | Expl: {exploitability} | Last T: {self._last_iter_time}"
         try:
             self.progress.update(
                 self.iteration_task_id, status_text=status_text_for_progress_bar
             )
             if needs_refresh_for_header:
-                self.refresh()  # Refresh if header elements changed
-            # No explicit refresh needed just for progress bar status text, Rich handles that.
+                self.refresh()
         except Exception as e:
             logging.error("Error updating progress bar stats field: %s", e, exc_info=True)
 
@@ -455,7 +433,6 @@ class LiveDisplayManager:
         """Updates the total log size string and refreshes the display."""
         total_bytes = current_logs_bytes + archived_logs_bytes
 
-        # Use format_large_number for individual components as it's more aligned with existing display
         current_formatted = format_large_number(current_logs_bytes)
         archived_formatted = format_large_number(archived_logs_bytes)
 
@@ -477,15 +454,15 @@ class LiveDisplayManager:
         """Starts the Rich Live display."""
         if not self.live:
             try:
-                self._update_layout_if_changed()  # Ensure layout is current before starting
+                self._update_layout_if_changed()
                 self.live = Live(
                     self.layout,
                     console=self.console,
-                    refresh_per_second=2,  # Lowered refresh rate might help with perceived flicker too
-                    transient=False,  # Keep display after exit
+                    refresh_per_second=2,
+                    transient=False,
                     vertical_overflow="visible",
                 )
-                self.live.start(refresh=True)  # Initial refresh
+                self.live.start(refresh=True)
                 logging.debug("Rich Live display started.")
             except Exception as e:
                 logging.error("Failed to start Rich Live display: %s", e, exc_info=True)
@@ -496,7 +473,6 @@ class LiveDisplayManager:
         if self.live:
             try:
                 self.live.stop()
-                # self.console.print() # Avoid extra print if transient=False
                 logging.debug("Rich Live display stopped.")
             except Exception as e:
                 logging.error("Error stopping Rich Live display: %s", e, exc_info=True)
@@ -505,19 +481,16 @@ class LiveDisplayManager:
 
     def run(self, func, *args, **kwargs):
         """Runs a function within the Live context."""
-        # If a Live instance is already active from a previous self.start(), stop it.
         if self.live:
             current_live_instance = self.live
-            self.live = None  # Nullify self.live before stopping the old one
+            self.live = None
             try:
                 current_live_instance.stop()
-                # self.console.print() # Avoid extra print if transient=False
-            except Exception as e:  # pylint: disable=broad-except
+            except Exception as e:
                 logging.warning("Error stopping existing live instance in run(): %s", e)
 
-        # Create a new Live context for the duration of `func`
         try:
-            self._update_layout_if_changed()  # Ensure layout is current before starting new Live
+            self._update_layout_if_changed()
             with Live(
                 self.layout,
                 console=self.console,
@@ -525,22 +498,19 @@ class LiveDisplayManager:
                 transient=False,
                 vertical_overflow="visible",
             ) as live_context:
-                self.live = live_context  # Store the new active Live instance
+                self.live = live_context
                 try:
                     result = func(*args, **kwargs)
                     return result
                 finally:
-                    # self.live is implicitly stopped by exiting the 'with' block.
-                    # We should nullify self.live here so self.stop() doesn't try to stop it again.
                     self.live = None
         except Exception:
-            # If an error occurs setting up or during the Live context for func
-            if self.live:  # If self.live was set but 'with' block failed or func failed
+            if self.live:
                 try:
-                    self.live.stop()  # Attempt to stop it if it's still around
-                except Exception:  # pylint: disable=broad-except
-                    pass  # Best effort
+                    self.live.stop()
+                except Exception:
+                    pass
                 finally:
-                    self.live = None  # Ensure it's nullified
+                    self.live = None
             logging.error("Error occurred within Live context run:", exc_info=True)
             raise
