@@ -19,6 +19,10 @@ from ..constants import NUM_PLAYERS
 from ..utils import PolicyDict, ReachProbDict, LogQueue as ProgressQueue
 from ..live_display import LiveDisplayManager
 
+# Assuming LogArchiver might be passed or referenced
+from ..log_archiver import LogArchiver
+
+
 from .data_manager_mixin import CFRDataManagerMixin
 from .recursion_mixin import CFRRecursionMixin
 from .training_loop_mixin import CFRTrainingLoopMixin
@@ -40,9 +44,7 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
         shutdown_event: Optional[threading.Event] = None,
         progress_queue: Optional[ProgressQueue] = None,
         live_display_manager: Optional[LiveDisplayManager] = None,
-        archive_queue: Optional[
-            Union[queue.Queue, "multiprocessing.Queue"]
-        ] = None,
+        archive_queue: Optional[Union[queue.Queue, "multiprocessing.Queue"]] = None,
     ):
         """
         Initializes the CFRTrainer.
@@ -61,6 +63,11 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
         self.progress_queue = progress_queue
         self.live_display_manager = live_display_manager
         self.archive_queue = archive_queue
+
+        # This attribute will hold a reference to the global LogArchiver instance
+        # It's set externally by main_train.py after both are initialized.
+        # Used by CFRTrainingLoopMixin for periodic log size updates.
+        self.log_archiver_global_ref: Optional[LogArchiver] = None
 
         # Initialize data structures (managed primarily by CFRDataManagerMixin)
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -90,8 +97,7 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
         self.shutdown_event = shutdown_event or threading.Event()
 
         # Initialize CFRTrainingLoopMixin parts that might need config/run_log_dir early
-        # (LogArchiver init is handled in CFRTrainingLoopMixin itself or main_train now)
-        CFRTrainingLoopMixin.__init__(self)
+        CFRTrainingLoopMixin.__init__(self)  # This will init _last_log_size_update_time
 
         logger.info("CFRTrainer initialized with %d players.", self.num_players)
         logger.debug("Config loaded: %s", self.config)

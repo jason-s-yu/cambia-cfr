@@ -38,6 +38,11 @@ log_archiver_global: Optional[LogArchiver] = None
 archive_queue_global: Optional[Union[queue.Queue, multiprocessing.Queue]] = None
 
 
+# For periodic log size update - to be used by CFRTrainingLoopMixin primarily
+# log_size_update_interval = 60  # seconds - This will be a constant in training_loop_mixin
+# last_log_size_update_time = 0 - This will be an attribute in training_loop_mixin
+
+
 def handle_sigint(sig, frame):
     """Signal handler for SIGINT (Ctrl+C)."""
     global live_display_manager_global, log_archiver_global
@@ -73,9 +78,15 @@ def setup_logging(
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
-    file_log_level = getattr(logging, log_level_file_str, logging.DEBUG)
+    file_log_level_value = getattr(logging, log_level_file_str, logging.DEBUG)
     # Console level set low for handler, Rich display/filtering will manage output level if needed
-    console_log_level = logging.DEBUG
+    # This 'console_log_level' is the base level for the LiveLogHandler, which then forwards
+    # to LiveDisplayManager. The LiveDisplayManager's internal RichHandler uses its own level
+    # (passed to its constructor) for actual display filtering.
+    # The level here should be the one intended for console display.
+    effective_console_log_level_value = getattr(
+        logging, log_level_console_str, logging.ERROR
+    )
 
     main_log_dir = config.logging.log_dir
     log_prefix = config.logging.log_file_prefix
@@ -102,7 +113,11 @@ def setup_logging(
     handlers: List[logging.Handler] = []
 
     # Live Handler
-    live_handler = LiveLogHandler(live_display_manager, level=console_log_level)
+    # This handler will filter messages based on the effective_console_log_level_value before
+    # even sending them to the LiveDisplayManager.
+    live_handler = LiveLogHandler(
+        live_display_manager, level=effective_console_log_level_value
+    )
     handlers.append(live_handler)
 
     # File Handler
@@ -122,7 +137,7 @@ def setup_logging(
             archive_queue=archive_q,
             logging_config_snapshot=config.logging,  # Pass the logging part of config
         )
-        fh.setLevel(file_log_level)
+        fh.setLevel(file_log_level_value)
         fh.setFormatter(formatter)
         handlers.append(fh)
         main_log_file = fh.baseFilename
@@ -148,11 +163,14 @@ def setup_logging(
     initial_logger.info(
         "Main Log File: %s (Level: %s)",
         main_log_file,
-        logging.getLevelName(file_log_level),
+        logging.getLevelName(file_log_level_value),
     )
     initial_logger.info(
-        "Console Logging via Rich Display Manager (Handler Level: %s)",
-        logging.getLevelName(console_log_level),
+        "Console Logging via Rich Display Manager (Effective Level: %s, LiveLogHandler Level: %s)",
+        logging.getLevelName(
+            effective_console_log_level_value
+        ),  # Level used by RichHandler in LiveDisplay
+        logging.getLevelName(live_handler.level),  # Level used by LiveLogHandler itself
     )
     initial_logger.info("Command: %s", " ".join(sys.argv))
     initial_logger.info("-" * 50)
@@ -188,6 +206,7 @@ def setup_logging(
 
 def main():
     global live_display_manager_global, log_archiver_global, archive_queue_global
+    # Removed global last_log_size_update_time as it's managed by CFRTrainingLoopMixin
 
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(
@@ -228,10 +247,15 @@ def main():
         if args.iterations is not None
         else config.cfr_training.num_iterations
     )
+    # Get the numeric console log level for the LiveDisplayManager
+    console_log_level_value_for_display = getattr(
+        logging, config.logging.log_level_console.upper(), logging.ERROR
+    )
     live_display_manager_global = LiveDisplayManager(
         num_workers=config.cfr_training.num_workers,
         total_iterations=total_iterations_for_display,
         console=rich_console,
+        console_log_level_value=console_log_level_value_for_display,
     )
 
     exit_code = 0
@@ -257,14 +281,16 @@ def main():
                 archive_queue_global = queue.Queue(-1)
         else:
             manager = None
-            progress_queue = None
+            progress_queue = (
+                None  # For single worker, direct progress updates not via MP queue
+            )
             archive_queue_global = queue.Queue(-1)
 
         if config.logging.log_archive_enabled:
             # Corrected LogArchiver instantiation
             log_archiver_global = LogArchiver(
-                config, archive_queue_global, ""
-            )  # run_log_dir set later
+                config, archive_queue_global, ""  # run_log_dir set later
+            )
             log_archiver_global.start()
 
         setup_result = setup_logging(
@@ -307,6 +333,10 @@ def main():
                 live_display_manager=live_display_manager_global,
                 archive_queue=archive_queue_global,  # Pass archive queue to trainer
             )
+            # Pass the global log archiver to the trainer if it exists, for periodic updates
+            if trainer and log_archiver_global:
+                trainer.log_archiver_global_ref = log_archiver_global
+
         except Exception as trainer_init_e:
             print(
                 f"FATAL: Failed to initialize CFRTrainer: {trainer_init_e}",
@@ -333,6 +363,19 @@ def main():
                 )
         else:
             logger.info("Starting training from scratch.")
+
+        # Initial log size update before training starts
+        if log_archiver_global and live_display_manager_global:
+            try:
+                current_size, archived_size = (
+                    log_archiver_global.get_total_log_size_info()
+                )
+                live_display_manager_global.update_log_summary_display(
+                    current_size, archived_size
+                )
+            except Exception as log_size_e:
+                logger.error("Error in initial log size display: %s", log_size_e)
+
         try:
             if live_display_manager_global:
                 live_display_manager_global.run(trainer.train)
@@ -341,7 +384,7 @@ def main():
                     "WARN: Live display not available, running train directly.",
                     file=sys.stderr,
                 )
-                trainer.train()
+                trainer.train()  # This call is blocking until training completes or is interrupted
             logger.info("Training completed successfully.")
 
         except (KeyboardInterrupt, GracefulShutdownException) as e:
@@ -368,6 +411,23 @@ def main():
     finally:
         rich_console.print("--- Initiating Final Shutdown Sequence ---")
 
+        # Final log size update
+        if log_archiver_global and live_display_manager_global:
+            try:
+                current_size, archived_size = (
+                    log_archiver_global.get_total_log_size_info()
+                )
+                live_display_manager_global.update_log_summary_display(
+                    current_size, archived_size
+                )
+                # Force one last refresh of the display if it's still active to show final log size
+                if live_display_manager_global.live:  # Check if live is still active
+                    live_display_manager_global.refresh()
+            except Exception as final_log_size_e:
+                rich_console.print(
+                    f"[yellow]Could not perform final log size update: {final_log_size_e}[/yellow]"
+                )
+
         if live_display_manager_global and live_display_manager_global.live:
             rich_console.print("Ensuring Rich Live display is stopped...")
             try:
@@ -388,7 +448,10 @@ def main():
                     rich_console.print(
                         "Writing run summary (main_train.py finally block)..."
                     )
-                    trainer._write_run_summary()  # This should happen AFTER trainer's own emergency save
+                    # Ensure trainer's internal state is consistent for summary if shutdown occurred
+                    # For example, if shutdown_event is set, trainer.train might have called emergency_save
+                    # which also calls _write_run_summary. Redundant call here is okay if idempotent.
+                    trainer._write_run_summary()
 
         else:
             rich_console.print(
@@ -446,12 +509,21 @@ if __name__ == "__main__":
                 multiprocessing.set_start_method("spawn", force=force_set)
                 start_method_set = True
         elif current_method is None:
-            print(
-                "ERROR: Neither 'forkserver' nor 'spawn' start methods available and none set!"
-            )
+            # This case should ideally not be reached if 'spawn' is usually available.
+            # Defaulting to 'spawn' if no preference set or forkserver not available.
+            if "spawn" in available_methods:  # Should always be true
+                multiprocessing.set_start_method("spawn", force=True)
+                start_method_set = True
+            else:  # Highly unlikely fallback
+                print(
+                    "ERROR: Critical - 'spawn' multiprocessing start method not available and none set!",
+                    file=sys.stderr,
+                )
+
     except RuntimeError:  # Can happen if context already set
+        # print("DEBUG: Multiprocessing context already set.", file=sys.stderr)
         pass
     except Exception as e:
-        print(f"ERROR: Error setting multiprocessing start method: {e}")
+        print(f"ERROR: Error setting multiprocessing start method: {e}", file=sys.stderr)
 
     main()

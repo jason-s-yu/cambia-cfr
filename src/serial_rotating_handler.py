@@ -36,14 +36,10 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         mode: str = "a",
         maxBytes: int = 0,
         backupCount: int = 0,
-        encoding: Optional[
-            str
-        ] = None,
+        encoding: Optional[str] = None,
         delay: bool = False,
         archive_queue: Optional[Union[queue.Queue, "multiprocessing.Queue"]] = None,
-        logging_config_snapshot: Optional[
-            LoggingConfig
-        ] = None
+        logging_config_snapshot: Optional[LoggingConfig] = None,
     ):
         """
         Initialize the handler.

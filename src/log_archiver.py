@@ -4,6 +4,7 @@ src/log_archiver.py
 Manages archiving of worker log files.
 """
 
+import multiprocessing
 import os
 import glob
 import tarfile
@@ -13,7 +14,7 @@ import re
 import queue
 import threading
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 from .config import Config
 
@@ -452,3 +453,83 @@ class LogArchiver:
         logger.warning(
             "scan_and_archive_worker_logs is deprecated. Archiving is now event-driven via the archive queue. No action taken."
         )
+
+    def get_total_log_size_info(self) -> Tuple[int, int]:
+        """
+        Calculates the total size of current (active/backup) log files and archived log files.
+        Returns:
+            Tuple[int, int]: (total_current_log_size_bytes, total_archived_size_bytes)
+        """
+        total_current_log_bytes = 0
+        total_archived_bytes = 0
+
+        if not self.run_log_dir or not os.path.isdir(self.run_log_dir):
+            logger.warning(
+                "LogArchiver: run_log_dir not set or invalid, cannot calculate log sizes."
+            )
+            return 0, 0
+
+        try:
+            # Scan for all .log files (current and uncompressed backups)
+            # This includes the main log directory and worker subdirectories (w0, w1, etc.)
+            for dirpath, dirnames, filenames in os.walk(self.run_log_dir, topdown=True):
+                # If an archive subdirectory is configured, skip scanning .log files within it
+                archive_subdir_name = self.config.logging.log_archive_dir
+                if archive_subdir_name and archive_subdir_name in dirnames:
+                    # Remove the archive subdir from dirnames to prevent os.walk from descending into it for this loop pass
+                    # This ensures we don't count .log files if they somehow end up in an archive dir.
+                    # And also prevents the .tar.gz scan below from running inside this .log scan.
+                    dirnames[:] = [d for d in dirnames if d != archive_subdir_name]
+
+                for filename in filenames:
+                    if filename.endswith(".log"):
+                        try:
+                            full_path = os.path.join(dirpath, filename)
+                            total_current_log_bytes += os.path.getsize(full_path)
+                        except OSError:
+                            # This might happen if a file is deleted between os.walk and os.path.getsize
+                            logger.debug(
+                                "Could not get size for current log file (may have been removed): %s",
+                                full_path,
+                            )
+
+            # Scan for .tar.gz files in archive directories
+            # This needs to specifically look inside designated archive subdirectories if configured,
+            # or in the log owner's main directory if archive_subdir_name is empty.
+
+            archive_subdir_name = self.config.logging.log_archive_dir
+
+            # Iterate through potential log owner directories (main run_log_dir and worker dirs)
+            potential_log_owner_dirs = [self.run_log_dir]  # For main logs
+            for item in os.listdir(self.run_log_dir):
+                item_path = os.path.join(self.run_log_dir, item)
+                if (
+                    os.path.isdir(item_path)
+                    and item.startswith("w")
+                    and item[1:].isdigit()
+                ):
+                    potential_log_owner_dirs.append(item_path)  # Add w0, w1, ...
+
+            for owner_dir in potential_log_owner_dirs:
+                # Determine the actual directory where archives for this owner would be stored
+                actual_archive_scan_dir = owner_dir
+                if archive_subdir_name:  # If archives are in a specific subdirectory
+                    actual_archive_scan_dir = os.path.join(owner_dir, archive_subdir_name)
+
+                if os.path.isdir(actual_archive_scan_dir):
+                    for filename in os.listdir(actual_archive_scan_dir):
+                        if filename.endswith(".tar.gz"):
+                            try:
+                                full_path = os.path.join(
+                                    actual_archive_scan_dir, filename
+                                )
+                                total_archived_bytes += os.path.getsize(full_path)
+                            except OSError:
+                                logger.debug(
+                                    "Could not get size for archive file (may have been removed): %s",
+                                    full_path,
+                                )
+        except Exception as e:
+            logger.error("Error calculating total log sizes: %s", e, exc_info=True)
+
+        return total_current_log_bytes, total_archived_bytes
