@@ -4,10 +4,12 @@ from typing import List, Dict, TypeVar, Optional, Union
 from dataclasses import dataclass, field
 import os
 import logging
+import re
 import yaml
-import re  # For parsing human-readable sizes
 
 T = TypeVar("T")
+
+# --- Configuration Dataclasses ---
 
 
 # Helper to get nested dict values safely
@@ -86,6 +88,8 @@ def parse_num_workers(num_workers: str | int) -> int:
 
 @dataclass
 class ApiConfig:
+    """API Client Settings (for online play)."""
+
     base_url: str = "http://localhost:8080"  # Example default
     auth: Dict[str, str] = field(
         default_factory=dict
@@ -94,11 +98,15 @@ class ApiConfig:
 
 @dataclass
 class SystemConfig:
+    """General system-level settings."""
+
     recursion_limit: int = 10000  # Limit for recursion depth
 
 
 @dataclass
 class CfrTrainingConfig:
+    """Parameters controlling the CFR training process."""
+
     num_iterations: int = 100000
     save_interval: int = 5000
     pruning_enabled: bool = True  # Enable Regret-Based Pruning
@@ -115,6 +123,8 @@ class CfrTrainingConfig:
 
 @dataclass
 class CfrPlusParamsConfig:
+    """Parameters specific to CFR+ algorithm variants."""
+
     weighted_averaging_enabled: bool = True
     averaging_delay: int = (
         100  # Start averaging from iteration d+1 (weight = max(0, t - d))
@@ -123,12 +133,16 @@ class CfrPlusParamsConfig:
 
 @dataclass
 class AgentParamsConfig:
+    """Settings defining CFR agent behavior (memory, abstraction)."""
+
     memory_level: int = 1  # 0: Perfect Recall, 1: Event Decay, 2: Event+Time Decay
     time_decay_turns: int = 3  # Used only if memory_level == 2
 
 
 @dataclass
 class CambiaRulesConfig:
+    """Defines the specific game rules of Cambia."""
+
     allowDrawFromDiscardPile: bool = False  # Default House Rules
     allowReplaceAbilities: bool = False
     snapRace: bool = False
@@ -143,17 +157,23 @@ class CambiaRulesConfig:
 
 @dataclass
 class PersistenceConfig:
+    """Configuration for saving and loading trained agent data."""
+
     agent_data_save_path: str = "cambia_cfr_agent_level1.joblib"
 
 
 @dataclass
 class WorkerLogOverrideConfig:
+    """Specifies a logging level override for specific worker IDs."""
+
     worker_ids: List[int] = field(default_factory=list)
     level: str = "INFO"
 
 
 @dataclass
 class WorkerLoggingConfig:
+    """Configuration for worker-specific logging levels."""
+
     default_level: str = "INFO"
     sequential_rules: List[Union[str, Dict[str, int]]] = field(default_factory=list)
     overrides: List[WorkerLogOverrideConfig] = field(default_factory=list)
@@ -161,6 +181,8 @@ class WorkerLoggingConfig:
 
 @dataclass
 class LoggingConfig:
+    """Settings for configuring logging behavior."""
+
     log_level_file: str = "DEBUG"  # Logging level for the main process file
     log_level_console: str = "ERROR"  # Logging level for the console
     log_dir: str = "logs"
@@ -244,8 +266,26 @@ class LoggingConfig:
         return self.log_level_file.upper()
 
 
+# --- NEW: Baseline Agent Configuration ---
+@dataclass
+class GreedyAgentConfig:
+    """Configuration specific to the Greedy baseline agent."""
+
+    cambia_call_threshold: int = 5
+
+
+@dataclass
+class AgentsConfig:
+    """Configuration for baseline agents (used for evaluation)."""
+
+    greedy_agent: GreedyAgentConfig = field(default_factory=GreedyAgentConfig)
+
+
+# --- Main Config Class ---
 @dataclass
 class Config:
+    """Root configuration object."""
+
     api: ApiConfig = field(default_factory=ApiConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
     cfr_training: CfrTrainingConfig = field(default_factory=CfrTrainingConfig)
@@ -254,6 +294,9 @@ class Config:
     cambia_rules: CambiaRulesConfig = field(default_factory=CambiaRulesConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    agents: AgentsConfig = field(
+        default_factory=AgentsConfig
+    )  # NEW: Baseline agent configs
     _source_path: Optional[str] = None  # Internal field to store config path
 
 
@@ -265,12 +308,13 @@ def load_config(
         with open(config_path, "r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
             if config_dict is None:
-                print(
-                    f"Warning: Config file '{config_path}' is empty or invalid. "
-                    f"Using default configuration."
+                logging.warning(
+                    "Config file '%s' is empty or invalid. Using default configuration.",
+                    config_path,
                 )
                 config_dict = {}
 
+            # --- Parse sections ---
             api_config_dict = config_dict.get("api", {})
             auth_dict = api_config_dict.get("auth", {})
             api_config = ApiConfig(
@@ -278,45 +322,34 @@ def load_config(
                 auth=auth_dict,
             )
 
-            # Parse WorkerLoggingConfig if present
+            # Parse WorkerLoggingConfig
             worker_log_cfg_dict = get_nested(
                 config_dict, ["logging", "worker_config"], None
             )
-            worker_logging_config: Optional[WorkerLoggingConfig] = None
+            worker_logging_config = None
             if worker_log_cfg_dict and isinstance(worker_log_cfg_dict, dict):
-                sequential_rules_raw = worker_log_cfg_dict.get("sequential_rules", [])
-                overrides_raw = worker_log_cfg_dict.get("overrides", [])
+                seq_rules = worker_log_cfg_dict.get("sequential_rules", [])
+                over_raw = worker_log_cfg_dict.get("overrides", [])
                 parsed_overrides = []
-                if isinstance(overrides_raw, list):
-                    for override_item in overrides_raw:
+                if isinstance(over_raw, list):
+                    for item in over_raw:
                         if (
-                            isinstance(override_item, dict)
-                            and "worker_ids" in override_item
-                            and "level" in override_item
-                            and isinstance(override_item["worker_ids"], list)
-                            and isinstance(override_item["level"], str)
+                            isinstance(item, dict)
+                            and isinstance(item.get("worker_ids"), list)
+                            and isinstance(item.get("level"), str)
                         ):
                             parsed_overrides.append(
                                 WorkerLogOverrideConfig(
-                                    worker_ids=override_item["worker_ids"],
-                                    level=override_item["level"],
+                                    worker_ids=item["worker_ids"], level=item["level"]
                                 )
                             )
                         else:
-                            logging.warning(
-                                "Skipping invalid worker log override item: %s",
-                                override_item,
-                            )
-
+                            logging.warning("Skipping invalid override: %s", item)
                 worker_logging_config = WorkerLoggingConfig(
                     default_level=worker_log_cfg_dict.get(
                         "default_level", WorkerLoggingConfig.default_level
                     ),
-                    sequential_rules=(
-                        sequential_rules_raw
-                        if isinstance(sequential_rules_raw, list)
-                        else []
-                    ),
+                    sequential_rules=seq_rules if isinstance(seq_rules, list) else [],
                     overrides=parsed_overrides,
                 )
 
@@ -374,6 +407,19 @@ def load_config(
                 ),
             )
 
+            # --- NEW: Parse Baseline Agents Config ---
+            agents_config_dict = config_dict.get("agents", {})
+            greedy_agent_config_dict = agents_config_dict.get(
+                "greedy_agent", {}
+            )  # Use .get for safety
+            greedy_agent_config = GreedyAgentConfig(
+                cambia_call_threshold=greedy_agent_config_dict.get(
+                    "cambia_call_threshold", GreedyAgentConfig.cambia_call_threshold
+                )
+            )
+            agents_config = AgentsConfig(greedy_agent=greedy_agent_config)
+
+            # --- Assemble Main Config ---
             cfg = Config(
                 api=api_config,
                 system=SystemConfig(
@@ -501,29 +547,25 @@ def load_config(
                     )
                 ),
                 logging=logging_config,
+                agents=agents_config,
                 _source_path=os.path.abspath(config_path),
             )
             return cfg
 
     except FileNotFoundError:
-        print(
-            f"Warning: Config file '{config_path}' not found. Using default configuration."
+        logging.error(
+            "Config file '%s' not found. Using default configuration.", config_path
         )
         return Config(_source_path=None)
-    except (
-        TypeError,
-        KeyError,
-        AttributeError,
-        yaml.YAMLError,
-        ValueError,  # For parse_human_readable_size or parse_num_workers
-    ) as e:
-        print(
-            f"Error loading or parsing config file '{config_path}': {e}. "
-            f"Check config structure/types."
+    except (TypeError, KeyError, AttributeError, yaml.YAMLError, ValueError) as e:
+        logging.exception(
+            "Error loading or parsing config file '%s': %s. Check structure/types. Using default config.",
+            config_path,
+            e,
         )
-        print("Using default configuration.")
         return Config(_source_path=None)
     except IOError as e:
-        print(f"Unexpected error loading config file '{config_path}': {e}")
-        print("Using default configuration.")
+        logging.exception(
+            "IOError loading config file '%s': %s. Using default config.", config_path, e
+        )
         return Config(_source_path=None)

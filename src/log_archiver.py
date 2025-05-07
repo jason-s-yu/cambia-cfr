@@ -508,7 +508,7 @@ class LogArchiver:
                     and item.startswith("w")
                     and item[1:].isdigit()
                 ):
-                    potential_log_owner_dirs.append(item_path)  # Add w0, w1, ...
+                    potential_log_owner_dirs.append(item_path)
 
             for owner_dir in potential_log_owner_dirs:
                 # Determine the actual directory where archives for this owner would be stored

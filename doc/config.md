@@ -318,6 +318,30 @@ Configuration for logging messages generated during training.
 
 ---
 
+## `agents`
+
+Configuration settings for baseline agents, primarily used during separate evaluation phases, not directly during CFR training.
+
+* **`greedy_agent`**:
+  * Description: Settings for the simple rule-based greedy agent.
+  * Type: `object`
+  * Fields:
+    * **`cambia_call_threshold`**:
+      * Description: The hand value threshold at or below which the greedy agent will attempt to call "Cambia", if it's a legal action.
+      * Type: `integer`
+      * Default: `5`
+      * Example: `3`
+
+* Example:
+
+    ```yaml
+    agents:
+      greedy_agent:
+        cambia_call_threshold: 5
+    ```
+
+---
+
 ## Example Full `logging` Section
 
 ```yaml

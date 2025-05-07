@@ -46,6 +46,11 @@ persistence:
   # Path relative to execution directory where agent data is saved/loaded
   agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.21-l1-p16-archlog.joblib"
 
+agents:
+  greedy_agent:
+    # Parameters for the simple greedy baseline agent
+    cambia_call_threshold: 5  # Call Cambia if hand value is this or lower (if legal)
+
 # Logging Configuration
 logging:
   log_level_file: "INFO"            # Global fallback for main process, and for workers if worker_config missing/doesn't cover.

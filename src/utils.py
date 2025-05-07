@@ -2,9 +2,12 @@
 
 import multiprocessing
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, TypeAlias
+from typing import Dict, Tuple, TypeAlias, List, Any
 
 import numpy as np
+
+# Need StateDelta type for WorkerResult
+from .game.types import StateDelta
 
 
 # Type alias for Regret/Strategy Dictionaries
@@ -46,22 +49,13 @@ class WorkerStats:
     nodes_visited: int = 0
     warning_count: int = 0
     error_count: int = 0
-    min_depth_after_bottom_out: float = float(
-        "inf"
-    )  # Min depth reached during backtracking
-    # Add other stats as needed (e.g., time taken, specific events)
+    min_depth_after_bottom_out: float = float("inf")
 
 
 # Type aliases for worker results (local updates)
-LocalRegretUpdateDict: TypeAlias = Dict[
-    InfosetKey, np.ndarray
-]  # Accumulates opponent_reach * instantaneous_regret
-LocalStrategyUpdateDict: TypeAlias = Dict[
-    InfosetKey, np.ndarray
-]  # Accumulates weight * player_reach * strategy
-LocalReachProbUpdateDict: TypeAlias = Dict[
-    InfosetKey, float
-]  # Accumulates weight * player_reach
+LocalRegretUpdateDict: TypeAlias = Dict[InfosetKey, np.ndarray]
+LocalStrategyUpdateDict: TypeAlias = Dict[InfosetKey, np.ndarray]
+LocalReachProbUpdateDict: TypeAlias = Dict[InfosetKey, float]
 
 
 # Type alias for the combined results returned by a single worker
@@ -73,6 +67,9 @@ class WorkerResult:
     strategy_updates: LocalStrategyUpdateDict = field(default_factory=dict)
     reach_prob_updates: LocalReachProbUpdateDict = field(default_factory=dict)
     stats: WorkerStats = field(default_factory=WorkerStats)
+    # NEW (Backlog 8): Store the game history as action/delta pairs
+    # Use 'Any' for serialized action type, StateDelta for the delta list
+    game_history_deltas: List[Tuple[Any, StateDelta]] = field(default_factory=list)
 
 
 # Type alias for the logging queue
@@ -105,24 +102,21 @@ def get_rm_plus_strategy(regret_sum: np.ndarray) -> np.ndarray:
 
 
 def format_large_number(num: int | float) -> str:
-    """Formats a large number with metric prefixes (k, M, B, T).
-    k uses no decimals. M, B, T use 2 decimal places.
-    """
-    if not isinstance(num, (int, float)):  # Handle potential non-numeric input
+    """Formats a large number with metric prefixes (k, M, B, T)."""
+    if not isinstance(num, (int, float)):
         return "N/A"
 
-    # Use float for calculations to preserve decimals before formatting
     num_float = float(num)
 
     if abs(num_float) < 1_000:
-        return str(int(num_float))  # Display as int if less than 1k
+        return str(int(num_float))
     if abs(num_float) < 1_000_000:
-        return f"{num_float / 1_000:.0f}k"  # k with 0 decimal places
+        return f"{num_float / 1_000:.0f}k"
     if abs(num_float) < 1_000_000_000:
-        return f"{num_float / 1_000_000:.2f}M"  # M with 2 decimal places
+        return f"{num_float / 1_000_000:.2f}M"
     if abs(num_float) < 1_000_000_000_000:
-        return f"{num_float / 1_000_000_000:.2f}B"  # B with 2 decimal places
-    return f"{num_float / 1_000_000_000_000:.2f}T"  # T with 2 decimal places
+        return f"{num_float / 1_000_000_000:.2f}B"
+    return f"{num_float / 1_000_000_000_000:.2f}T"
 
 
 def format_infoset_count(count: int) -> str:
@@ -130,8 +124,6 @@ def format_infoset_count(count: int) -> str:
     if count < 1000:
         return str(count)
     elif count < 1_000_000:
-        # Use integer division for k suffix
         return f"{count // 1000}k"
     else:
-        # Use floating point division for M suffix, format to 1 decimal place
         return f"{count / 1_000_000:.1f}M"
