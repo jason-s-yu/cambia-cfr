@@ -494,7 +494,7 @@ def run_cfr_simulation_worker(
     ],
 ) -> Optional[WorkerResult]:
     """Top-level function executed by each worker process. Sets up per-worker logging."""
-    logger = None  # Initialize logger variable
+    logger_instance = None  # Initialize logger variable
     worker_stats = WorkerStats()  # Initialize stats early for exception handling
     (
         iteration,
@@ -508,23 +508,17 @@ def run_cfr_simulation_worker(
 
     try:
         # --- Per-Worker Logging Setup ---
-        worker_root_logger = logging.getLogger()  # Get root logger for this process
-        # Remove any inherited handlers
+        worker_root_logger = logging.getLogger()
         for handler in worker_root_logger.handlers[:]:
             worker_root_logger.removeHandler(handler)
 
         try:
-            # Create worker-specific directory
             worker_log_dir = os.path.join(run_log_dir, f"w{worker_id}")
             os.makedirs(worker_log_dir, exist_ok=True)
-
-            # Construct base log pattern (handler adds _NNN.log)
             log_pattern = os.path.join(
                 worker_log_dir,
                 f"{config.logging.log_file_prefix}_run_{run_timestamp}-w{worker_id}",
             )
-
-            # Create and add the SerialRotatingFileHandler for this worker
             formatter = logging.Formatter(
                 "%(asctime)s - %(levelname)-8s - [%(processName)-20s] - %(name)-25s - %(message)s"
             )
@@ -534,45 +528,35 @@ def run_cfr_simulation_worker(
                 backupCount=config.logging.log_backup_count,
                 encoding="utf-8",
             )
-
-            # Get worker-specific log level from config
             worker_log_level_str = config.logging.get_worker_log_level(
                 worker_id, config.cfr_training.num_workers
             )
             file_log_level = getattr(logging, worker_log_level_str.upper(), logging.DEBUG)
-
             file_handler.setLevel(file_log_level)
             file_handler.setFormatter(formatter)
             worker_root_logger.addHandler(file_handler)
-
-            # Set worker's root logger level (e.g., DEBUG to capture everything for the file)
-            # This should be the most verbose level any handler might use.
             worker_root_logger.setLevel(logging.DEBUG)
-            logger = logging.getLogger(__name__)  # Now safe to get child logger
-            logger.info(
+            logger_instance = logging.getLogger(__name__)
+            logger_instance.info(
                 "Worker %d logging initialized to directory %s with level %s",
                 worker_id,
                 worker_log_dir,
                 logging.getLevelName(file_log_level),
             )
-
         except Exception as log_setup_e:
-            # If logging setup fails, print error and continue without logging
             print(
                 f"!!! CRITICAL Error setting up logging for worker {worker_id}: {log_setup_e} !!!",
                 file=sys.stderr,
             )
-            worker_stats.error_count += 1  # Count logging setup error
-            # Add a NullHandler to prevent "No handler found" warnings
+            worker_stats.error_count += 1
             if not worker_root_logger.hasHandlers():
                 worker_root_logger.addHandler(logging.NullHandler())
-            logger = logging.getLogger(__name__)  # Get logger anyway
+            logger_instance = logging.getLogger(
+                __name__
+            )  # Get logger even if setup failed
 
-        # --- Now wrap the main worker logic ---
+        # --- Main Worker Logic ---
         try:
-            # logger.debug("Worker %d starting iteration %d.", worker_id, iteration) # Reduced noise
-
-            # Initialize Game and Agent States
             game_state = CambiaGameState(house_rules=config.cambia_rules)
             initial_agent_states = []
             if not game_state.is_terminal():
@@ -595,20 +579,23 @@ def run_cfr_simulation_worker(
                     )
                     initial_agent_states.append(agent)
             else:
-                logger.error(
-                    "Worker %d: Game terminal at init. State: %s", worker_id, game_state
-                )
+                if logger_instance:
+                    logger_instance.error(
+                        "Worker %d: Game terminal at init. State: %s",
+                        worker_id,
+                        game_state,
+                    )
                 worker_stats.error_count += 1
-                return WorkerResult(stats=worker_stats)  # Return stats even on error
+                return WorkerResult(stats=worker_stats)
 
             if len(initial_agent_states) != NUM_PLAYERS:
-                logger.error(
-                    "Worker %d: Failed to initialize all agent states.", worker_id
-                )
+                if logger_instance:
+                    logger_instance.error(
+                        "Worker %d: Failed to initialize all agent states.", worker_id
+                    )
                 worker_stats.error_count += 1
-                return WorkerResult(stats=worker_stats)  # Return stats even on error
+                return WorkerResult(stats=worker_stats)
 
-            # Determine Updating Player & Iteration Weight
             updating_player = iteration % NUM_PLAYERS
             if config.cfr_plus_params.weighted_averaging_enabled:
                 delay = config.cfr_plus_params.averaging_delay
@@ -616,7 +603,6 @@ def run_cfr_simulation_worker(
             else:
                 weight = 1.0
 
-            # Initialize Local Update Dictionaries
             local_regret_updates: LocalRegretUpdateDict = defaultdict(
                 lambda: np.array([], dtype=np.float64)
             )
@@ -625,7 +611,6 @@ def run_cfr_simulation_worker(
             )
             local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
 
-            # Run Traversal
             _traverse_game_for_worker(
                 game_state=game_state,
                 agent_states=initial_agent_states,
@@ -644,7 +629,6 @@ def run_cfr_simulation_worker(
                 worker_id=worker_id,
             )
 
-            # logger.debug("Worker %d finished iteration %d.", worker_id, iteration) # Reduced noise
             return WorkerResult(
                 regret_updates=dict(local_regret_updates),
                 strategy_updates=dict(local_strategy_sum_updates),
@@ -652,27 +636,40 @@ def run_cfr_simulation_worker(
                 stats=worker_stats,
             )
 
+        except KeyboardInterrupt:
+            if logger_instance:  # Use the initialized logger if available
+                logger_instance.warning(
+                    "Worker %d iter %d received KeyboardInterrupt. Exiting gracefully.",
+                    worker_id,
+                    iteration,
+                )
+            else:  # Fallback print if logger setup failed
+                print(
+                    f"Worker {worker_id} iter {iteration} received KeyboardInterrupt (logger not available). Exiting.",
+                    file=sys.stderr,
+                )
+            # Return stats collected so far, marking an error due to interrupt
+            worker_stats.error_count += 1  # Count interrupt as an error for aggregation
+            return WorkerResult(stats=worker_stats)
         except Exception as e_inner:
-            worker_stats.error_count += 1  # Count inner simulation error
-            if logger:  # Log if logger was successfully set up
-                logger.error(
+            worker_stats.error_count += 1
+            if logger_instance:
+                logger_instance.error(
                     "!!! Unhandled Error in worker %d iter %d simulation: %s !!!",
                     worker_id,
                     iteration,
                     e_inner,
                     exc_info=True,
                 )
-            else:  # Fallback print
+            else:
                 print(
                     f"!!! FATAL WORKER ERROR (Worker {worker_id}, Iter {iteration}): {e_inner} !!!",
                     file=sys.stderr,
                 )
-            # Return only stats on inner error
             return WorkerResult(stats=worker_stats)
 
-    # This outer try...except catches errors during initial setup before logger might exist
     except Exception as e_outer:
-        worker_stats.error_count += 1  # Count outer setup error
+        worker_stats.error_count += 1
         print(
             f"!!! CRITICAL Error during worker {worker_id} init (Iter {iteration}): {e_outer} !!!",
             file=sys.stderr,
@@ -680,13 +677,7 @@ def run_cfr_simulation_worker(
         import traceback
 
         traceback.print_exc(file=sys.stderr)
-        # Return only stats on outer error
         return WorkerResult(stats=worker_stats)
-
-    finally:
-        # Explicitly shutdown logging for the worker process?
-        # logging.shutdown() # Maybe needed depending on start method / OS
-        pass
 
 
 # --- Helper functions _create_observation, _filter_observation ---
@@ -711,10 +702,8 @@ def _create_observation(
     drawn_card_for_obs = None
     if isinstance(action, (ActionDiscard, ActionReplace)):
         drawn_card_for_obs = explicit_drawn_card
-        # logger_obs.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card}, set drawn_card_for_obs: {drawn_card_for_obs}")
     elif explicit_drawn_card is not None and acting_player != -1:
         drawn_card_for_obs = explicit_drawn_card
-        # logger_obs.debug(f"## OBS CREATE ## Action {type(action).__name__}, explicit_drawn_card: {explicit_drawn_card} (actor {acting_player}), set drawn_card_for_obs: {drawn_card_for_obs}")
 
     peeked_cards_dict = None
     if isinstance(action, ActionAbilityPeekOwnSelect) and acting_player != -1:
@@ -762,20 +751,16 @@ def _create_observation(
         is_game_over=game_over,
         current_turn=turn_num,
     )
-    # logger_obs.debug(f"## OBS CREATE ## Created observation: {obs}")
     return obs
 
 
 def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObservation:
     """Creates a player-specific view of the observation, masking private info."""
-    logger_filt = logging.getLogger(__name__)  # Get logger instance for this helper
     filtered_obs = copy.copy(obs)
 
     is_public_reveal = isinstance(obs.action, (ActionDiscard, ActionReplace))
     if obs.drawn_card and obs.acting_player != observer_id and not is_public_reveal:
-        # logger_filt.debug(f"## OBS FILTER ## P{observer_id} filtering drawn_card from P{obs.acting_player}'s action {type(obs.action).__name__}")
         filtered_obs.drawn_card = None
-    # else: logger_filt.debug(f"## OBS FILTER ## P{observer_id} keeps drawn_card (Actor:{obs.acting_player==observer_id}, PublicReveal:{is_public_reveal})")
 
     if obs.peeked_cards:
         is_observer_peek_action = (
@@ -793,12 +778,9 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
             )
         )
         if not is_observer_peek_action:
-            # logger_filt.debug(f"## OBS FILTER ## P{observer_id} filtering peeked_cards from P{obs.acting_player}'s action {type(obs.action).__name__}")
             filtered_obs.peeked_cards = None
-        # else: logger_filt.debug(f"## OBS FILTER ## P{observer_id} keeps peeked_cards.")
     else:
         filtered_obs.peeked_cards = None
 
     filtered_obs.snap_results = obs.snap_results
-    # logger_filt.debug(f"## OBS FILTER ## Filtered for P{observer_id}: {filtered_obs}")
     return filtered_obs

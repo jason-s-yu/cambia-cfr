@@ -53,7 +53,7 @@ logging:
   log_dir: "logs"               # Directory to store log files
   log_file_prefix: "cambia"     # Prefix for log files within the run directory
   log_max_bytes: "10MB"        # Max size before rotation for an individual log file (e.g., worker_N_001.log)
-  log_backup_count: 20         # Max number of backup (rotated) log files to keep *per worker*
+  log_backup_count: 999         # Max number of backup (rotated) log files to keep *per worker*
 
   #worker_config:
     #default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
@@ -63,7 +63,7 @@ logging:
 
   # Log Archiving Settings (for worker logs)
   log_archive_enabled: true                # Enable archiving of worker logs
-  log_compress_after_bytes: "50MB"        # If total size of a worker's *rotated* logs exceeds this, archive them
+  log_compress_after_bytes: "30MB"        # If total size of a worker's *rotated* logs exceeds this, archive them
   log_archive_max_archives: 0              # Max number of archive files (tar.gz) to keep per worker; <=0 is unlimited
   log_archive_dir: ""                      # Subdirectory within the run's log dir for storing archives; empty str is same dir
                                            # e.g. logs/cambia_run_YYYYMMDD_HHMMSS/archives/w0/
