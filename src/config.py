@@ -1,6 +1,6 @@
 """src/config.py"""
 
-from typing import List, Dict, TypeVar, Optional, Union, Callable
+from typing import List, Dict, TypeVar, Optional, Union
 from dataclasses import dataclass, field
 import os
 import logging
@@ -172,7 +172,6 @@ class LoggingConfig:
     worker_config: Optional[WorkerLoggingConfig] = None
     # Archiving settings
     log_archive_enabled: bool = False
-    log_compress_after_bytes: int = 1 * 1024**3  # Default: 1GB, can be string like "1GB"
     log_archive_max_archives: int = (
         10  # Max number of tar.gz archives to keep per worker type
     )
@@ -354,13 +353,6 @@ def load_config(
                     config_dict,
                     ["logging", "log_archive_enabled"],
                     LoggingConfig.log_archive_enabled,
-                ),
-                log_compress_after_bytes=parse_human_readable_size(
-                    get_nested(
-                        config_dict,
-                        ["logging", "log_compress_after_bytes"],
-                        LoggingConfig.log_compress_after_bytes,
-                    )
                 ),
                 log_archive_max_archives=get_nested(
                     config_dict,

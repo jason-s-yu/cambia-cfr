@@ -6,8 +6,10 @@ Main CFR Trainer class, composing functionality from mixins.
 
 import logging
 import threading
+import queue
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
+
 
 import numpy as np
 
@@ -38,6 +40,9 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
         shutdown_event: Optional[threading.Event] = None,
         progress_queue: Optional[ProgressQueue] = None,
         live_display_manager: Optional[LiveDisplayManager] = None,
+        archive_queue: Optional[
+            Union[queue.Queue, "multiprocessing.Queue"]
+        ] = None,
     ):
         """
         Initializes the CFRTrainer.
@@ -49,11 +54,13 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
             shutdown_event: Threading event to signal graceful shutdown.
             progress_queue: Multiprocessing queue for worker progress updates.
             live_display_manager: Manager for the Rich live display.
+            archive_queue: Queue for log files to be archived.
         """
         self.config = config
         self.num_players = NUM_PLAYERS
         self.progress_queue = progress_queue
         self.live_display_manager = live_display_manager
+        self.archive_queue = archive_queue
 
         # Initialize data structures (managed primarily by CFRDataManagerMixin)
         self.regret_sum: PolicyDict = defaultdict(lambda: np.array([], dtype=np.float64))
@@ -82,6 +89,10 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
         # Shutdown handling
         self.shutdown_event = shutdown_event or threading.Event()
 
+        # Initialize CFRTrainingLoopMixin parts that might need config/run_log_dir early
+        # (LogArchiver init is handled in CFRTrainingLoopMixin itself or main_train now)
+        CFRTrainingLoopMixin.__init__(self)
+
         logger.info("CFRTrainer initialized with %d players.", self.num_players)
         logger.debug("Config loaded: %s", self.config)
         logger.debug("Run Log Directory: %s", self.run_log_dir)
@@ -90,3 +101,4 @@ class CFRTrainer(CFRDataManagerMixin, CFRRecursionMixin, CFRTrainingLoopMixin):
             "Live Display Manager: %s",
             "Provided" if self.live_display_manager else "None",
         )
+        logger.debug("Archive Queue: %s", "Provided" if self.archive_queue else "None")

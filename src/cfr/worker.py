@@ -1,4 +1,3 @@
-# src/cfr/worker.py
 """src/cfr/worker.py"""
 
 import copy
@@ -7,7 +6,8 @@ import os
 import queue
 import sys
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, TypeAlias
+from typing import Dict, List, Optional, Tuple, TypeAlias, Union
+
 
 import numpy as np
 
@@ -42,7 +42,12 @@ from ..utils import (
 )
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
-ProgressQueue: TypeAlias = queue.Queue
+ProgressQueueWorker: TypeAlias = (
+    queue.Queue
+)  # Standard queue for progress from worker to main via MP Manager
+ArchiveQueueWorker: TypeAlias = Union[
+    queue.Queue, "multiprocessing.Queue"
+]  # Can be MP or threading
 
 
 PROGRESS_UPDATE_NODE_INTERVAL = 1000  # Send update every N nodes
@@ -63,7 +68,7 @@ def _traverse_game_for_worker(
     local_reach_prob_updates: LocalReachProbUpdateDict,
     depth: int,
     worker_stats: WorkerStats,
-    progress_queue: Optional[ProgressQueue],
+    progress_queue: Optional[ProgressQueueWorker],
     worker_id: int,
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
@@ -74,7 +79,7 @@ def _traverse_game_for_worker(
     worker_stats.nodes_visited += 1
     worker_stats.max_depth = max(worker_stats.max_depth, depth)
 
-    # --- Send Progress Update Periodically ---
+    # Send Progress Update Periodically
     if progress_queue and (
         worker_stats.nodes_visited % PROGRESS_UPDATE_NODE_INTERVAL == 0
     ):
@@ -112,8 +117,7 @@ def _traverse_game_for_worker(
         worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
-    # --- Determine Context, Acting Player, Infoset Key ---
-    # Determine Context (ensure logger calls work)
+    # Determine Context, Acting Player, Infoset Key
     if game_state.snap_phase_active:
         current_context = DecisionContext.SNAP_DECISION
     elif game_state.pending_action:
@@ -349,7 +353,7 @@ def _traverse_game_for_worker(
             action,
             game_state,
             player,
-            game_state.snap_results_log,
+            game_state.snap_results_log,  # Pass current snap results from game state
             drawn_card_this_step,
         )
         next_agent_states = []
@@ -487,7 +491,8 @@ def run_cfr_simulation_worker(
         int,  # iteration
         Config,
         RegretSnapshotDict,
-        Optional[ProgressQueue],  # progress_queue
+        Optional[ProgressQueueWorker],  # progress_queue
+        Optional[ArchiveQueueWorker],  # archive_queue
         int,  # worker_id
         str,  # run_log_dir
         str,  # run_timestamp
@@ -501,16 +506,21 @@ def run_cfr_simulation_worker(
         config,
         regret_sum_snapshot,
         progress_queue,
+        archive_queue,  # Unpack archive_queue
         worker_id,
         run_log_dir,
         run_timestamp,
     ) = worker_args
 
     try:
-        # --- Per-Worker Logging Setup ---
-        worker_root_logger = logging.getLogger()
-        for handler in worker_root_logger.handlers[:]:
+        # Per-Worker Logging Setup
+        worker_root_logger = logging.getLogger()  # Get root logger for this process
+        for handler in worker_root_logger.handlers[
+            :
+        ]:  # Remove any handlers inherited from parent
             worker_root_logger.removeHandler(handler)
+            if hasattr(handler, "close"):
+                handler.close()
 
         try:
             worker_log_dir = os.path.join(run_log_dir, f"w{worker_id}")
@@ -527,6 +537,8 @@ def run_cfr_simulation_worker(
                 maxBytes=config.logging.log_max_bytes,
                 backupCount=config.logging.log_backup_count,
                 encoding="utf-8",
+                archive_queue=archive_queue,  # Pass archive_queue to handler
+                logging_config_snapshot=config.logging,  # Pass logging config
             )
             worker_log_level_str = config.logging.get_worker_log_level(
                 worker_id, config.cfr_training.num_workers
@@ -535,8 +547,12 @@ def run_cfr_simulation_worker(
             file_handler.setLevel(file_log_level)
             file_handler.setFormatter(formatter)
             worker_root_logger.addHandler(file_handler)
-            worker_root_logger.setLevel(logging.DEBUG)
-            logger_instance = logging.getLogger(__name__)
+            worker_root_logger.setLevel(
+                logging.DEBUG
+            )  # Set worker's root logger to DEBUG
+            logger_instance = logging.getLogger(
+                __name__
+            )  # Get a logger for this module within worker
             logger_instance.info(
                 "Worker %d logging initialized to directory %s with level %s",
                 worker_id,
@@ -549,7 +565,9 @@ def run_cfr_simulation_worker(
                 file=sys.stderr,
             )
             worker_stats.error_count += 1
-            if not worker_root_logger.hasHandlers():
+            if (
+                not worker_root_logger.hasHandlers()
+            ):  # Ensure there's at least a NullHandler
                 worker_root_logger.addHandler(logging.NullHandler())
             logger_instance = logging.getLogger(
                 __name__
@@ -560,6 +578,7 @@ def run_cfr_simulation_worker(
             game_state = CambiaGameState(house_rules=config.cambia_rules)
             initial_agent_states = []
             if not game_state.is_terminal():
+                # Pass empty list for snap_results during initial observation creation
                 initial_obs = _create_observation(None, None, game_state, -1, [], None)
                 initial_hands_for_log = [list(p.hand) for p in game_state.players]
                 initial_peeks_for_log = [
@@ -778,9 +797,35 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
             )
         )
         if not is_observer_peek_action:
-            filtered_obs.peeked_cards = None
+            # If observer is not the one peeking, they don't see the peeked cards.
+            # However, if the peeked_cards dict contains info *about the observer*, they should see that.
+            # This case is subtle: KingLook reveals both. PeekOwn reveals self. PeekOther reveals other.
+            # The current logic in AgentState.update correctly processes based on player_id.
+            # For filtering, we should only nullify if the entire peeked_cards dict is irrelevant.
+            # A simpler approach: if the observer is not the actor of a peek, they see nothing.
+            # If they are the actor, they see what the action dictates.
+            # This means if actor == observer, they see the full peeked_cards.
+            # If actor != observer, they see None. This is already handled by AgentState.update using obs.peeked_cards.
+            # The critical part is AgentState.update will only *use* the peeked_cards info if it's relevant.
+            # So, for filtering, if observer is not the actor of a PEEK/LOOK action, clear peeked_cards.
+            if not (
+                obs.acting_player == observer_id
+                and (
+                    isinstance(
+                        obs.action,
+                        (
+                            ActionAbilityPeekOwnSelect,
+                            ActionAbilityPeekOtherSelect,
+                            ActionAbilityKingLookSelect,
+                        ),
+                    )
+                )
+            ):
+                filtered_obs.peeked_cards = None
+            # If it IS the observer's peek action, they get the full dict (as created by _create_observation)
+            # and their AgentState.update will use the relevant parts.
     else:
         filtered_obs.peeked_cards = None
 
-    filtered_obs.snap_results = obs.snap_results
+    filtered_obs.snap_results = obs.snap_results  # Snap results are public
     return filtered_obs

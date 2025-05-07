@@ -234,7 +234,7 @@ Configuration for logging messages generated during training.
   * Default: `9437184` (approx. 9MB)
   * Example: `10485760` (10MB), `"500MB"`, `"2GB"`
 * **`log_backup_count`**:
-  * Description: The maximum number of backup (rotated) log files to keep for each log stream (e.g., per worker).
+  * Description: The maximum number of backup (rotated) log files to keep **uncompressed** for each log stream (e.g., per worker, or for the main process log). When `SerialRotatingFileHandler` rotates and would normally delete the oldest log file to maintain this count, if `log_archive_enabled` is true, these files that are "falling off" this window are queued for archiving instead of being deleted.
   * Type: `integer`
   * Default: `999`
   * Example: `10`
@@ -294,24 +294,21 @@ Configuration for logging messages generated during training.
               level: "ERROR"
         ```
 * **`log_archive_enabled`**:
-  * Description: If `true`, enables archiving of worker log files. The main process log and summary log are exempt.
+  * Description: If `true`, enables archiving of rotated log files (both main process and worker logs). When a log file is rotated out due to `log_backup_count`, it will be queued for compression into a `.tar.gz` archive.
   * Type: `boolean`
   * Default: `false`
   * Example: `true`
-* **`log_compress_after_bytes`**:
-  * Description: For each worker, if the total size of its *non-active* log files exceeds this threshold, they will be considered for archiving. Can be an integer (bytes) or a human-readable string (e.g., "1GB", "500MB"). The currently active log file (latest serial) is not compressed.
-  * Type: `integer` or `string`
-  * Default: `1073741824` (1GB)
-  * Example: `"500MB"`, `2147483648` (2GB)
 * **`log_archive_max_archives`**:
-  * Description: The maximum number of `tar.gz` archive files to keep per worker within its designated archive location. If new archives are created exceeding this limit, the oldest ones for that worker will be deleted. **A value of 0 or less means unlimited archives.**
+  * Description: The maximum number of `tar.gz` archive files to keep per log owner (e.g., "w0", "w1", "main") within its designated archive location. If new archives are created exceeding this limit, the oldest ones for that owner will be deleted. **A value of 0 or less means unlimited archives.**
   * Type: `integer`
   * Default: `10`
   * Example: `5`, `0` (unlimited)
 * **`log_archive_dir`**:
-  * Description: The name of the subdirectory *within each worker's log directory* where `tar.gz` archives will be stored. **If left empty or unspecified, archives will be stored directly in the worker's log directory itself** (e.g., `logs/<run_id>/w0/archive.tar.gz`). If specified (e.g., "archives"), they will be stored in `logs/<run_id>/w0/archives/archive.tar.gz`.
+  * Description: The name of the subdirectory *within each log file's parent directory* where its `tar.gz` archives will be stored.
+    * If left as an empty string (`""`), archives will be stored directly in the same directory as the log files (e.g., `logs/<run_id>/w0/archive.tar.gz` or `logs/<run_id>/main_archive.tar.gz`).
+    * If specified (e.g., `"archives"`), they will be stored in a subdirectory (e.g., `logs/<run_id>/w0/archives/archive.tar.gz`).
   * Type: `string`
-  * Default: `""` (empty string, meaning archive in the worker's root log dir)
+  * Default: `""` (empty string)
   * Example: `"archives"`, `"old_logs"`
 
 ---
@@ -325,7 +322,7 @@ logging:
   log_dir: "logs"
   log_file_prefix: "cambia_expC"
   log_max_bytes: "10MB"         # For individual file rotation
-  log_backup_count: 50
+  log_backup_count: 50          # Keep 50 uncompressed logs before archiving
 
   worker_config:
     default_level: "INFO"
@@ -336,8 +333,5 @@ logging:
         level: "WARNING"
 
   log_archive_enabled: true
-  log_compress_after_bytes: "200MB" # Archive worker logs when their rotated files exceed 200MB
-  log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker
-  log_archive_dir: ""               # Store archives directly in worker dirs (e.g., logs/run_xxx/w0/)
-                                    # Alternatively: log_archive_dir: "archives"
-```
+  log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker/main log stream
+  log_archive_dir: "archives"       # Store archives in a subdirectory named "archives"

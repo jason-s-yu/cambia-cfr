@@ -1,7 +1,6 @@
 """src/main_train.py"""
 
 import logging
-import logging.handlers
 import argparse
 import os
 import datetime
@@ -9,21 +8,22 @@ import sys
 import signal
 import threading
 import multiprocessing
+import queue
 
-# Rich imports
 from rich.console import Console
 
-# from rich.logging import RichHandler # Using custom handler
+from typing import List, Optional, Tuple, Union
 
-from typing import List, Optional, Tuple
 
 from .serial_rotating_handler import SerialRotatingFileHandler
-from .config import load_config
+from .config import Config, load_config
 from .cfr.trainer import CFRTrainer
 from .utils import LogQueue as ProgressQueue
 from .cfr.exceptions import GracefulShutdownException
 from .live_display import LiveDisplayManager
 from .live_log_handler import LiveLogHandler
+from .log_archiver import LogArchiver
+
 
 # Global logger instance
 logger = logging.getLogger(__name__)
@@ -32,11 +32,15 @@ logger = logging.getLogger(__name__)
 shutdown_event = threading.Event()
 # Global reference to LiveDisplayManager for SIGINT handler
 live_display_manager_global: Optional[LiveDisplayManager] = None
+# Global reference to LogArchiver
+log_archiver_global: Optional[LogArchiver] = None
+# Global reference to archive queue
+archive_queue_global: Optional[Union[queue.Queue, multiprocessing.Queue]] = None
 
 
 def handle_sigint(sig, frame):
     """Signal handler for SIGINT (Ctrl+C)."""
-    global live_display_manager_global
+    global live_display_manager_global, log_archiver_global
     if not shutdown_event.is_set():
         print("\nSIGINT received. Requesting graceful shutdown...", file=sys.stderr)
         # Immediately stop the Rich display to prevent CPU churn
@@ -46,7 +50,13 @@ def handle_sigint(sig, frame):
                 live_display_manager_global.stop()
             except Exception as e:
                 print(f"Error stopping Rich Live display in SIGINT: {e}", file=sys.stderr)
-        shutdown_event.set()
+
+        # Signal LogArchiver to stop
+        if log_archiver_global:
+            print("Signaling LogArchiver to stop...", file=sys.stderr)
+            # log_archiver_global.stop() # stop() will be called in finally block of main
+
+        shutdown_event.set()  # Set the main shutdown event for trainer and other components
     else:
         print(
             "\nMultiple SIGINT received. Shutdown already in progress.", file=sys.stderr
@@ -54,9 +64,12 @@ def handle_sigint(sig, frame):
 
 
 def setup_logging(
-    config, verbose: bool, live_display_manager: LiveDisplayManager
+    config: Config,
+    verbose: bool,
+    live_display_manager: LiveDisplayManager,
+    archive_q: Optional[Union[queue.Queue, multiprocessing.Queue]],
 ) -> Optional[Tuple[str, str]]:
-    """Configures logging, integrating with the LiveDisplayManager."""
+    """Configures logging, integrating with the LiveDisplayManager and archive queue."""
     log_level_file_str = config.logging.log_level_file.upper()
     log_level_console_str = config.logging.log_level_console.upper()
 
@@ -71,7 +84,7 @@ def setup_logging(
         print(f"ERROR: Invalid log directory '{main_log_dir}'. Logging disabled.")
         return None
 
-    # --- Create Run Directory ---
+    # Create Run Directory
     try:
         run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
         run_log_dir = os.path.join(main_log_dir, f"{log_prefix}_run_{run_timestamp}")
@@ -82,7 +95,7 @@ def setup_logging(
         )
         return None
 
-    # --- Create Handlers ---
+    # Create Handlers
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)-8s - [%(processName)-20s] - %(name)-25s - %(message)s"
     )
@@ -98,12 +111,16 @@ def setup_logging(
             run_log_dir, f"{log_prefix}_run_{run_timestamp}-main"
         )
         max_bytes = config.logging.log_max_bytes
+        # backup_count for main log is directly from config.logging
         backup_count = config.logging.log_backup_count
+
         fh = SerialRotatingFileHandler(
             main_log_pattern,
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",
+            archive_queue=archive_q,
+            logging_config_snapshot=config.logging,  # Pass the logging part of config
         )
         fh.setLevel(file_log_level)
         fh.setFormatter(formatter)
@@ -113,15 +130,17 @@ def setup_logging(
         print(f"ERROR: Could not set up main process file logging: {e}")
         main_log_file = "File logging disabled"
 
-    # --- Configure Root Logger ---
+    # Configure Root Logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    for handler in root_logger.handlers[:]:
+    root_logger.setLevel(logging.DEBUG)  # Set root logger to lowest level
+    for handler in root_logger.handlers[:]:  # Remove any existing handlers
         root_logger.removeHandler(handler)
+        if hasattr(handler, "close"):
+            handler.close()
     for handler in handlers:
         root_logger.addHandler(handler)
 
-    # --- Initial Log Messages ---
+    # Initial Log Messages
     initial_logger = logging.getLogger(__name__)  # Use __name__ logger
     initial_logger.info("-" * 50)
     initial_logger.info("Logging initialized for run: %s", run_timestamp)
@@ -138,7 +157,7 @@ def setup_logging(
     initial_logger.info("Command: %s", " ".join(sys.argv))
     initial_logger.info("-" * 50)
 
-    # --- Update latest_run link ---
+    # Update latest_run link
     latest_log_link_path = os.path.join(main_log_dir, "latest_run")
     try:
         absolute_run_log_dir = os.path.abspath(run_log_dir)
@@ -168,7 +187,7 @@ def setup_logging(
 
 
 def main():
-    global live_display_manager_global
+    global live_display_manager_global, log_archiver_global, archive_queue_global
 
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(
@@ -217,35 +236,56 @@ def main():
 
     exit_code = 0
     manager: Optional[multiprocessing.managers.SyncManager] = None
-    progress_queue: Optional[ProgressQueue] = None
+    progress_queue: Optional[ProgressQueue] = None  # For CFR progress
     trainer: Optional[CFRTrainer] = None
-    # Define target_iterations_in_config here for access in finally block
     target_iterations_in_config = config.cfr_training.num_iterations
-    if args.iterations is not None:  # Override if CLI arg is present
+    if args.iterations is not None:
         target_iterations_in_config = args.iterations
+
+    # Determine if multiprocessing.Manager is needed for archive_queue
+    # If num_workers > 1, we need a Manager queue for workers.
+    # If num_workers == 1, a threading.Queue is fine for main process log handler + archiver.
+    needs_mp_manager_for_archive = config.cfr_training.num_workers > 1
 
     try:
         if config.cfr_training.num_workers > 1:
             manager = multiprocessing.Manager()
             progress_queue = manager.Queue(-1)
+            if needs_mp_manager_for_archive:
+                archive_queue_global = manager.Queue(-1)
+            else:
+                archive_queue_global = queue.Queue(-1)
         else:
             manager = None
             progress_queue = None
+            archive_queue_global = queue.Queue(-1)
 
-        setup_result = setup_logging(config, args.verbose, live_display_manager_global)
+        if config.logging.log_archive_enabled:
+            # Corrected LogArchiver instantiation
+            log_archiver_global = LogArchiver(
+                config, archive_queue_global, ""
+            )  # run_log_dir set later
+            log_archiver_global.start()
+
+        setup_result = setup_logging(
+            config, args.verbose, live_display_manager_global, archive_queue_global
+        )
         if not setup_result:
             print("ERROR: Failed to set up logging. Exiting.")
             exit_code = 1
             raise SystemExit(exit_code)
         run_log_dir, run_timestamp = setup_result
 
+        # Update LogArchiver with the actual run_log_dir
+        if log_archiver_global:
+            log_archiver_global.run_log_dir = run_log_dir
+            logger.info("LogArchiver run_log_dir updated to: %s", run_log_dir)
+
         logger.info("--- Starting Cambia CFR+ Training ---")
         logger.info("Configuration loaded from: %s", args.config)
 
         if args.iterations is not None:
-            config.cfr_training.num_iterations = (
-                args.iterations
-            )  # This updates the config object
+            config.cfr_training.num_iterations = args.iterations
             logger.info("Overriding iterations from command line: %d", args.iterations)
         if args.save_path is not None:
             config.persistence.agent_data_save_path = args.save_path
@@ -265,6 +305,7 @@ def main():
                 shutdown_event=shutdown_event,
                 progress_queue=progress_queue,
                 live_display_manager=live_display_manager_global,
+                archive_queue=archive_queue_global,  # Pass archive queue to trainer
             )
         except Exception as trainer_init_e:
             print(
@@ -309,14 +350,14 @@ def main():
                 type(e).__name__,
             )
             if not shutdown_event.is_set():
-                shutdown_event.set()
+                shutdown_event.set()  # Ensure it's set for trainer's emergency save logic
         except Exception as train_exc:
             logger.exception("An unexpected error occurred during training:")
             exit_code = 1
 
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
-        if logging.getLogger().hasHandlers():
+        if logging.getLogger().hasHandlers():  # Check if logger is still valid
             logger.error("System exit called with code %s.", exit_code)
     except Exception as e:
         rich_console.print(f"[bold red]FATAL ERROR during setup:[/bold red] {e}")
@@ -336,9 +377,33 @@ def main():
                     f"[red]Error stopping Rich display in finally: {e}[/red]"
                 )
 
+        if trainer:
+            training_fully_completed = (
+                trainer.current_iteration >= target_iterations_in_config
+            )
+            if not training_fully_completed or shutdown_event.is_set():
+                if hasattr(trainer, "_write_run_summary") and callable(
+                    trainer._write_run_summary
+                ):
+                    rich_console.print(
+                        "Writing run summary (main_train.py finally block)..."
+                    )
+                    trainer._write_run_summary()  # This should happen AFTER trainer's own emergency save
+
+        else:
+            rich_console.print(
+                "Trainer object not initialized. Cannot write summary from main_train.py."
+            )
+
+        # Stop LogArchiver before manager shutdown (if manager holds the queue)
+        if log_archiver_global:
+            rich_console.print("Stopping LogArchiver...")
+            log_archiver_global.stop(timeout=10.0)  # Give it time to process queue
+            rich_console.print("LogArchiver stopped.")
+
         if manager:
             rich_console.print(
-                "Shutting down multiprocessing manager (for progress queue)..."
+                "Shutting down multiprocessing manager (for progress/archive queues)..."
             )
             try:
                 manager.shutdown()
@@ -347,39 +412,19 @@ def main():
             else:
                 rich_console.print("Manager shut down.")
 
-        if trainer:
-            # Check if training completed its full course or was interrupted.
-            # trainer.train() now handles its own summary writing on normal completion or SIGINT.
-            # This call is a fallback if trainer.train() exited very early due to an exception
-            # before it could write its own summary.
-            # If trainer.current_iteration reached the target, train() should have written summary.
-            # The main reason for this check is if trainer.train() itself failed to complete its try-finally.
-            training_fully_completed = (
-                trainer.current_iteration >= target_iterations_in_config
-            )
-
-            if not training_fully_completed or shutdown_event.is_set():
-                # If interrupted or did not complete all target iterations, ensure summary is attempted.
-                # trainer.train()'s _perform_emergency_save or normal completion's _write_run_summary should ideally cover this.
-                # This is a safeguard.
-                if hasattr(trainer, "_write_run_summary") and callable(
-                    trainer._write_run_summary
-                ):
-                    rich_console.print(
-                        "Writing run summary (main_train.py finally block)..."
-                    )
-                    trainer._write_run_summary()
-                else:
-                    rich_console.print(
-                        "Trainer object or summary writer not available in main_train.py finally."
-                    )
-        else:
-            # If trainer itself failed to initialize
-            rich_console.print(
-                "Trainer object not initialized. Cannot write summary from main_train.py."
-            )
-
         rich_console.print("--- Cambia CFR+ Training Finished ---")
+        # Ensure all handlers are closed before logging.shutdown()
+        root_logger_main = logging.getLogger()
+        for handler_main in root_logger_main.handlers[:]:
+            if hasattr(handler_main, "close"):
+                try:
+                    handler_main.close()
+                except Exception as hc_e:
+                    print(
+                        f"Error closing handler {handler_main}: {hc_e}", file=sys.stderr
+                    )
+            root_logger_main.removeHandler(handler_main)
+
         logging.shutdown()
         sys.exit(exit_code)
 
@@ -396,22 +441,17 @@ if __name__ == "__main__":
             if force_set or current_method != preferred_method:
                 multiprocessing.set_start_method(preferred_method, force=force_set)
                 start_method_set = True
-                # print(f"INFO: Set multiprocessing start method to '{preferred_method}'")
         elif "spawn" in available_methods:
             if force_set or current_method != "spawn":
                 multiprocessing.set_start_method("spawn", force=force_set)
                 start_method_set = True
-                # print(f"INFO: Preferred method '{preferred_method}' not available, using 'spawn'")
         elif current_method is None:
             print(
                 "ERROR: Neither 'forkserver' nor 'spawn' start methods available and none set!"
             )
-    except RuntimeError:
+    except RuntimeError:  # Can happen if context already set
         pass
     except Exception as e:
         print(f"ERROR: Error setting multiprocessing start method: {e}")
-
-    # effective_method = multiprocessing.get_start_method(allow_none=True)
-    # print(f"INFO: Effective multiprocessing start method: {effective_method}")
 
     main()
