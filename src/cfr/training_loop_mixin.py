@@ -79,8 +79,7 @@ class CFRTrainingLoopMixin:
             logger.info("Terminating worker pool...")
             try:
                 pool.terminate()
-                # Allow some time for termination signals to be processed
-                pool.join(timeout=POOL_TERMINATE_TIMEOUT_SECONDS)
+                pool.join()  # Join AFTER terminate, no timeout needed
                 logger.info("Worker pool terminated and joined.")
             except ValueError:
                 logger.warning("Attempted to terminate/join an already closed pool.")
@@ -983,22 +982,50 @@ class CFRTrainingLoopMixin:
                         status_line = f"Worker {i}: "
                         if isinstance(status_info, WorkerStats):  # Use imported type
                             # ... formatting code ...
-                            status_line += f"Completed (MaxD:{status_info.max_depth}, ...)"  # Shortened for brevity
-                            # ... accumulate stats ...
+                            status_line += f"Completed (MaxD:{status_info.max_depth}, Nodes:{status_info.nodes_visited:,}, MinDBT:{status_info.min_depth_after_bottom_out}, Warn:{status_info.warning_count}, Err:{status_info.error_count})"
+                            total_nodes += status_info.nodes_visited
+                            max_depth_overall = max(
+                                max_depth_overall, status_info.max_depth
+                            )
+                            if status_info.min_depth_after_bottom_out > 0:
+                                min_depth_bt_overall = min(
+                                    min_depth_bt_overall,
+                                    status_info.min_depth_after_bottom_out,
+                                )
+                            total_warnings += status_info.warning_count
+                            total_errors += status_info.error_count
+                            if status_info.error_count == 0:
+                                completed_workers_with_stats += 1
+                            else:
+                                failed_workers_marked += 1
                         elif isinstance(status_info, str):
                             status_line += status_info
-                            # ... count failed ...
+                            if "Error" in status_info or "Fail" in status_info:
+                                failed_workers_marked += 1
                         elif isinstance(status_info, tuple) and len(status_info) == 5:
-                            status_line += f"Stopped (...)"
-                            # ... count failed ...
+                            state, cur_d, max_d, nodes, min_d_bt = status_info
+                            status_line += f"Stopped (State:{state}, CurD:{cur_d}, MaxD:{max_d}, Nodes:{nodes:,}, MinDBT:{min_d_bt})"
+                            failed_workers_marked += 1  # Assume stopped is failed
                         else:
                             status_line += (
                                 f"Unknown Final State ({type(status_info).__name__})"
                             )
-                            # ... count failed ...
+                            failed_workers_marked += 1
                         f.write(status_line + "\n")
+
                     f.write("\n--- Aggregated Worker Stats ---\n")
-                    # ... write aggregated stats ...
+                    f.write(f"Successful Workers: {completed_workers_with_stats}\n")
+                    f.write(f"Failed/Stopped Workers: {failed_workers_marked}\n")
+                    f.write(f"Total Nodes Visited (Successful): {total_nodes:,}\n")
+                    f.write(f"Overall Max Depth Reached: {max_depth_overall}\n")
+                    min_dbt_str = (
+                        str(int(min_depth_bt_overall))
+                        if min_depth_bt_overall != float("inf")
+                        else "N/A"
+                    )
+                    f.write(f"Overall Min Depth After Bottom Out: {min_dbt_str}\n")
+                    f.write(f"Total Warnings (Successful): {total_warnings}\n")
+                    f.write(f"Total Errors (Successful): {total_errors}\n")
                 else:
                     f.write(
                         "Worker status information not available or 0 workers configured.\n"

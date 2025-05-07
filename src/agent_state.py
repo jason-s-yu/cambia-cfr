@@ -1,9 +1,9 @@
 """src/agent_state.py"""
 
-from typing import List, Tuple, Optional, Dict, Any, Set, Union
+from typing import List, Tuple, Optional, Dict, Any, Set, Union, TYPE_CHECKING
 from dataclasses import dataclass, field
 import logging
-import copy  # For cloning
+import copy
 
 from .constants import (
     CardBucket,
@@ -17,8 +17,12 @@ from .constants import (
     ActionAbilityBlindSwapSelect,
     ActionAbilityKingLookSelect,
     ActionAbilityKingSwapDecision,
-    CardObject,
 )
+
+# Use TYPE_CHECKING guard if Card is imported directly
+if TYPE_CHECKING:
+    from .card import Card
+# Import Card only if needed for isinstance checks etc. within methods
 from .card import Card
 from .config import Config
 from .abstraction import get_card_bucket, decay_bucket
@@ -32,7 +36,8 @@ class KnownCardInfo:
 
     bucket: CardBucket
     last_seen_turn: int = 0
-    card: Optional[CardObject] = None  # Store actual card for level 0 / debugging
+    # Use the 'Card' type hint directly here since Card is imported
+    card: Optional[Card] = None
 
     def __post_init__(self):
         if not isinstance(self.bucket, CardBucket):
@@ -49,11 +54,14 @@ class AgentObservation:
 
     acting_player: int
     action: Optional[GameAction]
-    discard_top_card: Optional[CardObject]
+    # Use Card type hint here
+    discard_top_card: Optional[Card]
     player_hand_sizes: List[int]
     stockpile_size: int
-    drawn_card: Optional[CardObject] = None
-    peeked_cards: Optional[Dict[Tuple[int, int], CardObject]] = None
+    # Use Card type hint here
+    drawn_card: Optional[Card] = None
+    # Use Card type hint here
+    peeked_cards: Optional[Dict[Tuple[int, int], Card]] = None
     snap_results: List[Dict[str, Any]] = field(default_factory=list)
     did_cambia_get_called: bool = False
     who_called_cambia: Optional[int] = None
@@ -95,7 +103,8 @@ class AgentState:
     def initialize(
         self,
         initial_observation: AgentObservation,
-        initial_hand: List[CardObject],
+        # Use Card type hint here
+        initial_hand: List[Card],
         initial_peek_indices: Tuple[int, ...],
     ):
         """Initialize belief state at the very start of the game."""

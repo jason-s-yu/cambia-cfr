@@ -1,6 +1,19 @@
-# src/constants.py
+"""
+src/constants.py
+
+Defines core constants, enumerations, and action types for the Cambia game and CFR agent.
+
+Includes card ranks/suits, abstraction buckets, game state estimates, and structured
+definitions for all possible game actions.
+"""
+
 import enum
-from typing import NamedTuple, Any, Union
+from typing import NamedTuple, Union, TypeAlias, TYPE_CHECKING
+
+# Use TYPE_CHECKING to allow importing Card only for type hints
+if TYPE_CHECKING:
+    from .card import Card
+
 
 # Card Ranks (String representation)
 ACE = "A"
@@ -12,11 +25,15 @@ SIX = "6"
 SEVEN = "7"
 EIGHT = "8"
 NINE = "9"
-TEN = "T"  # Represents 10
+
+"""T represents ten"""
+TEN = "T"
 JACK = "J"
 QUEEN = "Q"
 KING = "K"
-JOKER_RANK_STR = "R"  # Use 'R' for Joker consistently internally
+
+"""Joker is represented by the R string"""
+JOKER_RANK_STR = "R"
 
 NUMERIC_RANKS_STR = [TWO, THREE, FOUR, FIVE, SIX, SEVEN, EIGHT, NINE, TEN]
 FACE_RANKS_STR = [JACK, QUEEN, KING]
@@ -34,6 +51,13 @@ ALL_SUITS = [SPADES, HEARTS, DIAMONDS, CLUBS]
 
 # --- Card Buckets Enum (Abstraction) ---
 class CardBucket(enum.Enum):
+    """
+    Represents abstract categories (buckets) that cards are mapped into.
+
+    Used for information set abstraction in the CFR agent's belief state.
+    Buckets group cards by value and/or ability for simplification.
+    """
+
     ZERO = 0  # Joker (Value: 0)
     NEG_KING = 1  # Red King (Value: -1, Ability: Look & Swap)
     ACE = 2  # Ace (Value: 1)
@@ -48,13 +72,27 @@ class CardBucket(enum.Enum):
 
 # --- Memory Decay Categories ---
 class DecayCategory(enum.Enum):
+    """
+    Represents broader categories used when an agent's knowledge decays.
+
+    If memory_level >= 1, specific CardBucket knowledge about an opponent's card
+    can decay into one of these categories based on game events or time.
+    """
+
     LIKELY_LOW = 100  # ZERO, NEG_KING, ACE, LOW_NUM
     LIKELY_MID = 101  # MID_NUM, PEEK_SELF
     LIKELY_HIGH = 102  # PEEK_OTHER, SWAP_BLIND, HIGH_KING
-    UNKNOWN = CardBucket.UNKNOWN  # Re-use UNKNOWN state
+    UNKNOWN = CardBucket.UNKNOWN.value  # Re-use UNKNOWN state value for consistency
 
 
 class DecisionContext(enum.Enum):
+    """
+    Enumerates the different contexts in which an agent needs to make a decision.
+
+    Used as part of the InfosetKey to distinguish between similar game states
+    that require different actions or strategies.
+    """
+
     START_TURN = 0  # Choosing Draw Stockpile / Draw Discard / Call Cambia
     POST_DRAW = 1  # Choosing Discard (Ability/No) / Replace
     SNAP_DECISION = 2  # Choosing Pass Snap / Snap Own / Snap Opponent
@@ -65,7 +103,13 @@ class DecisionContext(enum.Enum):
 
 # --- Game Phases / State Estimates ---
 class GamePhase(enum.Enum):
-    # Simplified phases based on stockpile for now
+    """
+    Abstract representation of the current phase of the game.
+
+    Used as part of the InfosetKey for state abstraction, typically based on
+    factors like stockpile size or whether Cambia has been called.
+    """
+
     START = 0  # Technically pre-first turn, maybe unused in infoset
     EARLY = 1  # Stockpile HIGH
     MID = 2  # Stockpile MEDIUM
@@ -75,6 +119,8 @@ class GamePhase(enum.Enum):
 
 
 class StockpileEstimate(enum.Enum):
+    """Abstract representation of the remaining stockpile size."""
+
     HIGH = 0
     MEDIUM = 1
     LOW = 2
@@ -83,85 +129,106 @@ class StockpileEstimate(enum.Enum):
 
 # --- Game Constants ---
 INITIAL_HAND_SIZE = 4
-NUM_PLAYERS = 2  # Fixed for 1v1
+"""Initial number of cards dealt to each player."""
 
-# Avoid circular import with card.py
-# Forward declare Card type hint if necessary or import lazily
-CardObject = Any  # Use Any temporarily, replace with 'card.Card' if possible
+NUM_PLAYERS = 2
+"""Number of players in the game (fixed for 1v1 head-to-head)."""
+
+# Define CardObject alias using a string forward reference
+# This avoids importing the Card class directly here.
+CardObject: TypeAlias = "Card"
+"""Type alias for the Card class, used for clarity in type hints."""
+
 
 # --- Structured Action Definitions ---
 # Using NamedTuple for clarity, hashability, and type checking
 
 
 class ActionDrawStockpile(NamedTuple):
+    """Action: Draw a card from the top of the stockpile."""
+
     pass  # No extra data needed
 
 
 class ActionDrawDiscard(NamedTuple):
-    pass  # No extra data needed (if implemented)
+    """Action: Draw the top card from the discard pile (if allowed by rules)."""
+
+    pass  # No extra data needed
 
 
 class ActionCallCambia(NamedTuple):
+    """Action: Call "Cambia" to initiate the end-game sequence."""
+
     pass  # No extra data needed
 
 
 class ActionDiscard(NamedTuple):
-    # Card discarded is implicit (the one held from Draw)
-    use_ability: bool  # Does the player *intend* to use the ability?
+    """Action: Discard the card just drawn from stockpile/discard."""
+
+    use_ability: bool  # Does the player intend to use the card's ability?
 
 
 class ActionReplace(NamedTuple):
-    # Card used to replace is implicit (the one held from Draw)
-    target_hand_index: int
+    """Action: Replace a card in hand with the card just drawn."""
+
+    target_hand_index: int  # Index of the card in hand to replace
 
 
 # --- Ability-related Actions (Sub-steps) ---
 class ActionAbilityPeekOwnSelect(NamedTuple):
-    target_hand_index: int
+    """Action: Select own card to peek (resolves 7/8 ability)."""
+
+    target_hand_index: int  # Index of own card to peek
 
 
 class ActionAbilityPeekOtherSelect(NamedTuple):
-    target_opponent_hand_index: int
+    """Action: Select opponent's card to peek (resolves 9/T ability)."""
+
+    target_opponent_hand_index: int  # Index of opponent's card to peek
 
 
 class ActionAbilityBlindSwapSelect(NamedTuple):
-    own_hand_index: int
-    opponent_hand_index: int
+    """Action: Select own and opponent's cards for blind swap (resolves J/Q ability)."""
+
+    own_hand_index: int  # Index of own card to swap
+    opponent_hand_index: int  # Index of opponent's card to swap
 
 
 class ActionAbilityKingLookSelect(NamedTuple):
-    # Choose one card from own hand and one from opponent's hand
-    own_hand_index: int
-    opponent_hand_index: int
+    """Action: Select own and opponent's cards to look at (first part of K ability)."""
+
+    own_hand_index: int  # Index of own card to look at
+    opponent_hand_index: int  # Index of opponent's card to look at
 
 
 class ActionAbilityKingSwapDecision(NamedTuple):
-    # Decision after looking
-    perform_swap: bool
+    """Action: Decide whether to perform swap after looking (second part of K ability)."""
+
+    perform_swap: bool  # True to swap the looked-at cards, False otherwise
 
 
 # --- Snap Actions ---
 # Represents the *attempt* to snap. Engine verifies and applies penalty/success.
 class ActionPassSnap(NamedTuple):
-    """Action to explicitly pass the opportunity to snap."""
+    """Action: Explicitly pass the opportunity to snap."""
 
 
 class ActionSnapOwn(NamedTuple):
-    # Player attempting snap is implicit (current player in snap phase)
-    own_card_hand_index: int  # Which card in hand matches the discard
+    """Action: Attempt to snap by discarding a matching card from own hand."""
+
+    own_card_hand_index: int  # Index of own card that matches the discard pile top
 
 
 class ActionSnapOpponent(NamedTuple):
-    # Player attempting snap is implicit
-    # This requires the snapper to know/guess the opponent's matching card index
+    """Action: Attempt to snap by targeting a matching card in opponent's hand."""
+
     opponent_target_hand_index: (
-        int  # Which of *opponent's* cards to snap (must match rank)
+        int  # Index of *opponent's* card believed to match discard pile top
     )
-    # Decision on which card to move comes *after* successful snap
 
 
-class ActionSnapOpponentMove(NamedTuple):  #
-    """Action taken after a successful opponent snap to move own card."""
+class ActionSnapOpponentMove(NamedTuple):
+    """Action: Choose which own card to move to opponent's empty slot after successful opponent snap."""
 
     own_card_to_move_hand_index: int  # Index of own card to move
     target_empty_slot_index: int  # Index where opponent's card was removed
@@ -182,5 +249,6 @@ GameAction = Union[
     ActionPassSnap,
     ActionSnapOwn,
     ActionSnapOpponent,
-    ActionSnapOpponentMove,  # Updated Union
+    ActionSnapOpponentMove,
 ]
+"""A type alias representing any possible action a player can take in the game."""

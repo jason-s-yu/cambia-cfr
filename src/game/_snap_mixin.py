@@ -8,7 +8,6 @@ import logging
 import copy
 from typing import Set, Optional, Deque, Tuple
 
-# Use relative imports
 from .types import StateDelta
 from .helpers import serialize_card
 from ..card import Card

@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import multiprocessing
 import os
 import queue
 import sys
@@ -12,6 +13,9 @@ import numpy as np
 
 from ..agent_state import AgentObservation, AgentState
 from ..config import Config
+
+# Import Card class directly here for runtime checks
+from ..card import Card
 from ..constants import (
     NUM_PLAYERS,
     ActionAbilityBlindSwapSelect,
@@ -22,7 +26,7 @@ from ..constants import (
     ActionDiscard,
     ActionReplace,
     ActionSnapOpponentMove,
-    CardObject,
+    # CardObject, # No longer need CardObject alias here
     DecisionContext,
     GameAction,
 )
@@ -38,7 +42,7 @@ from ..utils import (
     WorkerStats,
     get_rm_plus_strategy,
 )
-from ..game.helpers import serialize_card  # For serializing action in history
+from ..game.helpers import serialize_card
 
 RegretSnapshotDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 ProgressQueueWorker: TypeAlias = queue.Queue
@@ -55,17 +59,21 @@ def _serialize_action_for_history(action: GameAction) -> Any:
         action_dict = action._asdict()
         serialized_dict = {}
         for k, v in action_dict.items():
-            if isinstance(v, CardObject):
+            # Use the imported Card class directly for the check
+            if isinstance(v, Card):
                 serialized_dict[k] = serialize_card(v)
             else:
                 serialized_dict[k] = v
         return {type(action).__name__: serialized_dict}  # Include type name
-    elif isinstance(action, CardObject):  # Handle if action itself is somehow a card
+    elif isinstance(action, Card):  # Check against Card directly
         return serialize_card(action)
     elif action is None:
         return None
     else:  # Fallback for simple actions or unexpected types
         return type(action).__name__
+
+
+# --- The rest of the file remains the same ---
 
 
 def _traverse_game_for_worker(
@@ -331,7 +339,7 @@ def _traverse_game_for_worker(
         if action_prob < 1e-9:
             continue
 
-        explicit_drawn_card_for_obs: Optional[CardObject] = None
+        explicit_drawn_card_for_obs: Optional[Card] = None  # Use Card type hint now
         # Backlog 13: Determine card for observation before applying action
         if isinstance(action, (ActionReplace, ActionDiscard)):
             if game_state.pending_action_data:
@@ -843,7 +851,7 @@ def _create_observation(
     next_state: CambiaGameState,
     acting_player: int,
     snap_results: List[Dict],
-    explicit_drawn_card: Optional[CardObject] = None,
+    explicit_drawn_card: Optional[Card] = None,  # Use Card type hint
 ) -> AgentObservation:
     """Creates the AgentObservation object based on the state *after* the action."""
     logger_obs = logging.getLogger(__name__)
