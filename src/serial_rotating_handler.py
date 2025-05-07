@@ -16,6 +16,8 @@ try:
 except ImportError:
     LoggingConfig = None  # type: ignore
 
+logger = logging.getLogger(__name__)
+
 
 class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
     """
@@ -209,28 +211,28 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                         if archive_enabled and self.archive_queue:
                             try:
                                 self.archive_queue.put_nowait(file_to_process)  # type: ignore
-                                # Use print for direct feedback from handler if logger not configured yet/failsafe
-                                print(
-                                    f"INFO: SerialRotatingFileHandler: Queued {file_to_process} for archiving."
-                                )
+                                logger.info("Queued %s for archiving.", file_to_process)
                             except queue.Full:
-                                print(
-                                    f"WARNING: SerialRotatingFileHandler: Archive queue full. Could not queue {file_to_process}. Deleting instead."
+                                logger.warning(
+                                    "Archive queue full. Could not queue %s. Deleting instead.",
+                                    file_to_process,
                                 )
                                 os.remove(file_to_process)
                             except Exception as q_err:
-                                print(
-                                    f"ERROR: SerialRotatingFileHandler: Failed to queue {file_to_process} for archiving: {q_err}. Deleting instead."
+                                logger.error(
+                                    "Failed to queue %s for archiving: %s. Deleting instead.",
+                                    file_to_process,
+                                    q_err,
                                 )
                                 os.remove(file_to_process)
                         else:
-                            # print(f"DEBUG: SerialRotatingFileHandler: Removing old log file {file_to_process} (Archiving disabled or no queue).")
+                            # logger.debug("Removing old log file %s (Archiving disabled or no queue).", file_to_process)
                             os.remove(file_to_process)
                     except IndexError:  # Should not happen if logic is correct
                         break
                     except OSError as e:
-                        print(
-                            f"ERROR: SerialRotatingFileHandler: Error processing old log file {file_to_process}: {e}"
+                        logger.error(
+                            "Error processing old log file %s: %s", file_to_process, e
                         )
 
         if not self.delay:

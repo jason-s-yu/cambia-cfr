@@ -1,4 +1,3 @@
-# src/utils.py
 """src/utils.py"""
 
 import multiprocessing
@@ -47,6 +46,9 @@ class WorkerStats:
     nodes_visited: int = 0
     warning_count: int = 0
     error_count: int = 0
+    min_depth_after_bottom_out: float = float(
+        "inf"
+    )  # Min depth reached during backtracking
     # Add other stats as needed (e.g., time taken, specific events)
 
 

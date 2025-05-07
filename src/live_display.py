@@ -27,8 +27,10 @@ from .utils import WorkerStats, format_large_number
 
 # Define worker status type alias used internally by the display
 WorkerDisplayStatus = Union[
-    str, WorkerStats, Tuple[str, int, int, int, int]
-]  # state, cur_d, max_d, nodes, min_d
+    str,
+    WorkerStats,
+    Tuple[str, int, int, int, int],  # state, cur_d, max_d, nodes, min_d_backtrack
+]
 
 
 class LiveDisplayManager:
@@ -120,7 +122,10 @@ class LiveDisplayManager:
         table.add_column(
             "Status", style="cyan", justify="left", no_wrap=True, min_width=9
         )
-        table.add_column("Depth (Min)", style="green", width=13, justify="right")
+        table.add_column("Cur/Max Depth", style="green", width=13, justify="right")
+        table.add_column(
+            "Min Depth (Dist)", style="purple", width=14, justify="right"
+        )  # New column
         table.add_column("Nodes", style="blue", width=10, justify="right")
         table.add_column("Warn", style="yellow", width=5, justify="right")
         table.add_column("Err", style="red", width=5, justify="right")
@@ -134,6 +139,7 @@ class LiveDisplayManager:
                 "0",
                 "0",
             )
+            min_depth_backtrack_str = "N/A"
 
             if isinstance(status_info, WorkerStats):
                 if status_info.error_count > 0:
@@ -142,16 +148,25 @@ class LiveDisplayManager:
                     status_str = "[yellow]Warn[/yellow]"
                 else:
                     status_str = "[green]Done[/green]"
-                # For completed workers, min_depth is just their max_depth for that run
-                depth_str = f"({status_info.max_depth}) {status_info.max_depth}"
+                depth_str = f"{status_info.max_depth}/{status_info.max_depth}"
                 nodes_str = format_large_number(status_info.nodes_visited)
                 warn_str = str(status_info.warning_count)
                 err_str = str(status_info.error_count)
+                min_depth_backtrack_str = (
+                    str(int(status_info.min_depth_after_bottom_out))
+                    if status_info.min_depth_after_bottom_out != float("inf")
+                    else "N/A"
+                )
+
             elif isinstance(status_info, tuple) and len(status_info) == 5:
-                state, cur_d, max_d, nodes, min_d_for_worker = status_info
+                state, cur_d, max_d, nodes, min_d_bt = (
+                    status_info  # min_d_bt is the new field
+                )
                 status_str = state if state else "Running"
-                # Use min_d_for_worker (min depth for this segment) in parentheses
-                depth_str = f"({min_d_for_worker}) {cur_d}/{max_d}"
+                depth_str = f"{cur_d}/{max_d}"
+                min_depth_backtrack_str = (
+                    str(min_d_bt) if min_d_bt != float("inf") else "N/A"
+                )
                 nodes_str = format_large_number(nodes)
                 warn_str, err_str = "-", "-"
             elif isinstance(status_info, str):
@@ -170,8 +185,17 @@ class LiveDisplayManager:
                 else:
                     status_str = status_info
                 depth_str, nodes_str, warn_str, err_str = "N/A", "-", "-", "-"
+                min_depth_backtrack_str = "N/A"
 
-            table.add_row(str(i), status_str, depth_str, nodes_str, warn_str, err_str)
+            table.add_row(
+                str(i),
+                status_str,
+                depth_str,
+                min_depth_backtrack_str,
+                nodes_str,
+                warn_str,
+                err_str,
+            )
         return table
 
     def _generate_log_panel_content_str(self) -> str:
@@ -186,13 +210,6 @@ class LiveDisplayManager:
             console=self.console,
         )
         for record in list(self._log_records):
-            if (
-                record.name == "src.serial_rotating_handler"
-                and "Queued" in record.getMessage()
-                and "for archiving" in record.getMessage()
-            ):
-                continue
-
             if record.levelno >= handler.level:
                 try:
                     render_result = handler.render_message(
@@ -220,13 +237,6 @@ class LiveDisplayManager:
             console=self.console,
         )
         for record in list(self._log_records):
-            if (
-                record.name == "src.serial_rotating_handler"
-                and "Queued" in record.getMessage()
-                and "for archiving" in record.getMessage()
-            ):
-                continue
-
             if record.levelno >= handler.level:
                 try:
                     render_result = handler.render_message(
@@ -338,6 +348,13 @@ class LiveDisplayManager:
 
     def add_log_record(self, record: logging.LogRecord):
         """Adds a log record to the display queue and refreshes."""
+        if (
+            record.name == "src.serial_rotating_handler"
+            and "Queued" in record.getMessage()
+            and "for archiving" in record.getMessage()
+        ):
+            return  # Skip these specific messages for live display
+
         self._log_records.append(record)
         self.refresh()
 
@@ -362,8 +379,10 @@ class LiveDisplayManager:
                 if isinstance(s_info, WorkerStats):
                     current_worker_nodes = s_info.nodes_visited
                     found_any_stats = True
-                elif isinstance(s_info, tuple) and len(s_info) == 5:
-                    current_worker_nodes = s_info[3]
+                elif (
+                    isinstance(s_info, tuple) and len(s_info) == 5
+                ):  # Matches new tuple structure
+                    current_worker_nodes = s_info[3]  # nodes_visited is at index 3
                     found_any_stats = True
 
                 if current_worker_nodes != float("inf"):

@@ -185,10 +185,10 @@ class CFRTrainingLoopMixin:
                     for i in range(num_workers):
                         status_to_set: WorkerDisplayStatus = (
                             "Queued" if num_workers > 1 else "Starting",
-                            0,
-                            0,
-                            0,
-                            0,  # state, cur_d, max_d, nodes, min_d
+                            0,  # cur_d
+                            0,  # max_d
+                            0,  # nodes
+                            0,  # min_d_backtrack (initially 0 or N/A)
                         )
                         self._worker_statuses[i] = status_to_set
                         display.update_worker_status(i, self._worker_statuses[i])
@@ -205,7 +205,7 @@ class CFRTrainingLoopMixin:
                         infosets=self._total_infosets_str,
                         exploitability=self._last_exploit_str,
                     )
-                else:
+                else:  # No display
                     for i in range(num_workers):
                         status_to_set_no_disp: WorkerDisplayStatus = (
                             "Queued" if num_workers > 1 else "Starting",
@@ -241,7 +241,13 @@ class CFRTrainingLoopMixin:
                 successful_sim_count = 0
 
                 if num_workers == 1:
-                    running_status_tuple: WorkerDisplayStatus = ("Running", 0, 0, 0, 0)
+                    running_status_tuple: WorkerDisplayStatus = (
+                        "Running",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )  # state, cur_d, max_d, nodes, min_d_bt
                     if display:
                         display.update_worker_status(0, running_status_tuple)
                     self._worker_statuses[0] = running_status_tuple
@@ -285,13 +291,13 @@ class CFRTrainingLoopMixin:
                     finally:
                         if progress_q_local:
                             try:
-                                while True:
+                                while True:  # Drain queue
                                     (
                                         prog_w_id,
                                         prog_cur_d,
                                         prog_max_d,
                                         prog_n,
-                                        prog_min_d,
+                                        prog_min_d_bt,  # New: min_depth_backtrack
                                     ) = progress_q_local.get_nowait()
                                     if prog_w_id == 0:
                                         new_status_tuple_seq: WorkerDisplayStatus = (
@@ -299,11 +305,11 @@ class CFRTrainingLoopMixin:
                                             prog_cur_d,
                                             prog_max_d,
                                             prog_n,
-                                            prog_min_d,  # Use min depth
+                                            prog_min_d_bt,
                                         )
-                                        # Min nodes overall comes from completed stats later
                                         if isinstance(
-                                            self._worker_statuses.get(0), tuple
+                                            self._worker_statuses.get(0),
+                                            tuple,  # Check if still a running tuple
                                         ):
                                             self._worker_statuses[0] = (
                                                 new_status_tuple_seq
@@ -320,7 +326,11 @@ class CFRTrainingLoopMixin:
                                     prog_e,
                                 )
                         if display and isinstance(
-                            self._worker_statuses.get(0), (str, WorkerStats)
+                            self._worker_statuses.get(0),
+                            (
+                                str,
+                                WorkerStats,
+                            ),  # Final status could be string or WorkerStats
                         ):
                             display.update_worker_status(0, self._worker_statuses[0])
                 else:  # Parallel
@@ -337,7 +347,13 @@ class CFRTrainingLoopMixin:
                             async_results_map[worker_id] = pool.apply_async(
                                 run_cfr_simulation_worker, (args_for_worker,)
                             )
-                            status_disp_par: WorkerDisplayStatus = ("Running", 0, 0, 0, 0)
+                            status_disp_par: WorkerDisplayStatus = (
+                                "Running",
+                                0,
+                                0,
+                                0,
+                                0,
+                            )  # cur_d, max_d, nodes, min_d_bt
                             self._worker_statuses[worker_id] = status_disp_par
                             if display:
                                 display.update_worker_status(worker_id, status_disp_par)
@@ -356,21 +372,22 @@ class CFRTrainingLoopMixin:
 
                             if progress_q_local:
                                 try:
-                                    while not progress_q_local.empty():
+                                    while not progress_q_local.empty():  # Drain queue
                                         (
                                             prog_w_id,
                                             prog_cur_d,
                                             prog_max_d,
                                             prog_n,
-                                            prog_min_d,
+                                            prog_min_d_bt,  # New: min_depth_backtrack
                                         ) = progress_q_local.get_nowait()
                                         current_internal_status = (
                                             self._worker_statuses.get(prog_w_id)
                                         )
+                                        # Check if the worker is still in a 'running' state tuple
                                         is_still_running_tuple = isinstance(
                                             current_internal_status, tuple
                                         ) and (
-                                            current_internal_status[0]
+                                            current_internal_status[0]  # state string
                                             in ["Running", "Queued", "Starting"]
                                         )
 
@@ -380,12 +397,11 @@ class CFRTrainingLoopMixin:
                                                 prog_cur_d,
                                                 prog_max_d,
                                                 prog_n,
-                                                prog_min_d,  # Use min depth
+                                                prog_min_d_bt,
                                             )
                                             self._worker_statuses[prog_w_id] = (
                                                 new_prog_status
                                             )
-                                            # Min nodes overall comes from completed stats later
                                             if display:
                                                 display.update_worker_status(
                                                     prog_w_id, new_prog_status
@@ -434,14 +450,14 @@ class CFRTrainingLoopMixin:
                                             )
 
                                     except multiprocessing.TimeoutError:
-                                        continue
+                                        continue  # Not ready yet
                                     except Exception as pool_e:
                                         logger.error(
                                             "Error fetching result worker %d iter %d: %s",
                                             worker_id_done,
                                             t,
                                             pool_e,
-                                            exc_info=False,
+                                            exc_info=False,  # Keep log concise
                                         )
                                         results[worker_id_done] = None
                                         sim_failed_count += 1
@@ -458,7 +474,7 @@ class CFRTrainingLoopMixin:
                                     finally:
                                         active_workers_for_iteration -= 1
                                         async_results_map.pop(worker_id_done, None)
-                            time.sleep(0.05)
+                            time.sleep(0.05)  # Short sleep to avoid busy-waiting
                     except GracefulShutdownException:
                         logger.warning("Graceful shutdown initiated for iter %d pool.", t)
                         self._shutdown_pool(pool)
@@ -467,13 +483,17 @@ class CFRTrainingLoopMixin:
                         logger.exception(
                             "Error during parallel pool management iter %d.", t
                         )
-                        sim_failed_count = num_workers
+                        sim_failed_count = (
+                            num_workers  # Assume all failed if pool mgmt error
+                        )
                         self._shutdown_pool(pool)
-                        if display:
+                        if (
+                            display
+                        ):  # Update display for all workers to error if not already set
                             for i_err in range(num_workers):
                                 if i_err not in self._worker_statuses or not isinstance(
                                     self._worker_statuses[i_err], (WorkerStats, str)
-                                ):
+                                ):  # If status is still a tuple or uninitialized
                                     status_pool_mgmt_err: WorkerDisplayStatus = (
                                         "Error (Pool Mgmt)"
                                     )
@@ -481,12 +501,13 @@ class CFRTrainingLoopMixin:
                                     display.update_worker_status(
                                         i_err, status_pool_mgmt_err
                                     )
-                    finally:
+                    finally:  # Ensure pool is shut down if it was created and not already handled
                         if (
                             pool
-                            and not self.shutdown_event.is_set()
-                            and hasattr(pool, "_state")
-                            and pool._state != multiprocessing.pool.TERMINATE
+                            and not self.shutdown_event.is_set()  # Don't interfere if already shutting down
+                            and hasattr(pool, "_state")  # Check if pool object is valid
+                            and pool._state
+                            != multiprocessing.pool.TERMINATE  # Check if not already terminated
                         ):
                             self._shutdown_pool(pool)
 
@@ -549,7 +570,7 @@ class CFRTrainingLoopMixin:
                             exploitability="Merge FAILED",
                             last_iter_time=time.time() - iter_start_time,
                         )
-                    continue
+                    continue  # Skip to next iteration on merge failure
 
                 iter_time = time.time() - iter_start_time
                 self._total_infosets_str = format_infoset_count(len(self.regret_sum))
@@ -585,7 +606,9 @@ class CFRTrainingLoopMixin:
                         exploitability=self._last_exploit_str,
                         last_iter_time=iter_time,
                     )
-                    for i_disp in range(num_workers):
+                    for i_disp in range(
+                        num_workers
+                    ):  # Update all worker displays with their final status for iter
                         final_status_iter_end = self._worker_statuses.get(i_disp)
                         if final_status_iter_end:
                             display.update_worker_status(i_disp, final_status_iter_end)
@@ -605,10 +628,10 @@ class CFRTrainingLoopMixin:
             if not self.shutdown_event.is_set():
                 self.shutdown_event.set()
             self._perform_emergency_save(
-                last_completed_iteration,
+                last_completed_iteration,  # Pass the iteration count *before* this run started
                 start_iter_num,
                 exception_type,
-                pool_to_shutdown=pool,
+                pool_to_shutdown=pool,  # Pass the pool if it exists
             )
             raise GracefulShutdownException(
                 f"{exception_type} processed in train loop"
@@ -624,7 +647,8 @@ class CFRTrainingLoopMixin:
             )
             raise
 
-        if not self.shutdown_event.is_set():
+        # --- Normal completion of the training loop ---
+        if not self.shutdown_event.is_set():  # Only if not already shutting down
             end_time = time.time()
             total_completed_in_run = self.current_iteration - last_completed_iteration
             logger.info("Training loop finished %d iterations.", total_completed_in_run)
@@ -660,7 +684,7 @@ class CFRTrainingLoopMixin:
                     iteration=self.current_iteration,
                     infosets=self._total_infosets_str,
                     exploitability=self._last_exploit_str,
-                    last_iter_time=None,
+                    last_iter_time=None,  # No "last iter time" for final summary
                 )
                 for i_final_disp in range(num_workers):
                     final_status = self._worker_statuses.get(i_final_disp, "Finished")
@@ -679,9 +703,9 @@ class CFRTrainingLoopMixin:
                     self.live_display_manager.update_log_summary_display(
                         current_size, archived_size
                     )
-                    if self.live_display_manager.live:
+                    if self.live_display_manager.live:  # Only refresh if still active
                         self.live_display_manager.refresh()
-                except AttributeError:
+                except AttributeError:  # log_archiver_global_ref might not be set
                     pass
                 except Exception as final_log_size_e:
                     logger.error(
@@ -704,18 +728,31 @@ class CFRTrainingLoopMixin:
         if pool_to_shutdown:
             self._shutdown_pool(pool_to_shutdown)
 
+        # Determine the iteration number to save based on current progress
+        # If current_iteration is >= start_iter_num, it means at least one iter started
+        # In this case, save up to current_iteration - 1 (the last fully completed one within this run)
+        # Otherwise, save the iteration count as it was when loaded/before this run.
         iter_to_save_as_completed = self.current_iteration
-        if iter_to_save_as_completed >= start_iter_num_this_run:
-            iter_to_save_as_completed = self.current_iteration - 1
-        else:
+        if (
+            iter_to_save_as_completed >= start_iter_num_this_run
+        ):  # If we started new iterations
+            iter_to_save_as_completed = (
+                self.current_iteration - 1
+            )  # Save the one *before* the interrupted one
+        else:  # If interrupted before the first new iteration even completed its setup
             iter_to_save_as_completed = last_completed_iteration_before_run
 
+        # Ensure we don't save a negative iteration or an iteration less than what was loaded
         if iter_to_save_as_completed < last_completed_iteration_before_run:
             iter_to_save_as_completed = last_completed_iteration_before_run
 
         if iter_to_save_as_completed >= 0:
-            original_current_iter_val_for_save = self.current_iteration
-            self.current_iteration = iter_to_save_as_completed
+            original_current_iter_val_for_save = (
+                self.current_iteration
+            )  # Store for restore
+            self.current_iteration = (
+                iter_to_save_as_completed  # Temporarily set for save_data
+            )
             logger.info(
                 "Saving data for last fully completed iteration: %d",
                 self.current_iteration,
@@ -725,6 +762,7 @@ class CFRTrainingLoopMixin:
             except Exception as save_e:
                 logger.error("Emergency save failed: %s", save_e, exc_info=True)
             finally:
+                # Restore current_iteration to its actual value reflecting the interrupted state for summary
                 self.current_iteration = original_current_iter_val_for_save
         else:
             logger.warning(
@@ -777,6 +815,7 @@ class CFRTrainingLoopMixin:
                 if num_workers > 0 and self._worker_statuses:
                     total_nodes = 0
                     max_depth_overall = 0
+                    min_depth_bt_overall = float("inf")
                     total_warnings = 0
                     total_errors = 0
                     completed_workers_with_stats = 0
@@ -787,8 +826,14 @@ class CFRTrainingLoopMixin:
                         status_line = f"Worker {i}: "
                         if isinstance(status_info, WorkerStats):
                             nodes_fmt = format_large_number(status_info.nodes_visited)
+                            min_d_bt_fmt = (
+                                str(int(status_info.min_depth_after_bottom_out))
+                                if status_info.min_depth_after_bottom_out != float("inf")
+                                else "N/A"
+                            )
                             status_line += (
                                 f"Completed (Max Depth: {status_info.max_depth}, "
+                                f"Min Depth (Dist): {min_d_bt_fmt}, "
                                 f"Nodes Visited: {nodes_fmt}, "
                                 f"Warnings: {status_info.warning_count}, "
                                 f"Errors: {status_info.error_count})"
@@ -797,6 +842,11 @@ class CFRTrainingLoopMixin:
                             max_depth_overall = max(
                                 max_depth_overall, status_info.max_depth
                             )
+                            if status_info.min_depth_after_bottom_out != float("inf"):
+                                min_depth_bt_overall = min(
+                                    min_depth_bt_overall,
+                                    status_info.min_depth_after_bottom_out,
+                                )
                             total_warnings += status_info.warning_count
                             total_errors += status_info.error_count
                             completed_workers_with_stats += 1
@@ -804,12 +854,20 @@ class CFRTrainingLoopMixin:
                             status_line += status_info
                             if "Fail" in status_info or "Error" in status_info:
                                 failed_workers_marked += 1
-                        elif isinstance(status_info, tuple) and len(status_info) == 5:
-                            state, cur_d, max_d, nodes_val, min_depth_val = status_info
+                        elif (
+                            isinstance(status_info, tuple) and len(status_info) == 5
+                        ):  # state, cur_d, max_d, nodes, min_d_bt
+                            state, cur_d, max_d, nodes_val, min_depth_val_bt = status_info
                             nodes_fmt_tuple = format_large_number(nodes_val)
-                            # Min depth is now correct in the tuple
-                            status_line += f"Stopped ({state}, D:({min_depth_val}){cur_d}/{max_d}, N:{nodes_fmt_tuple})"
-                            failed_workers_marked += 1
+                            min_d_bt_tuple_fmt = (
+                                str(min_depth_val_bt)
+                                if min_depth_val_bt != float("inf")
+                                else "N/A"
+                            )
+                            status_line += f"Stopped ({state}, D:{cur_d}/{max_d}, MinD(BT):{min_d_bt_tuple_fmt}, N:{nodes_fmt_tuple})"
+                            failed_workers_marked += (
+                                1  # Assume stopped implies not fully completed
+                            )
                         else:
                             status_line += (
                                 f"Unknown Final State ({type(status_info).__name__})"
@@ -830,6 +888,14 @@ class CFRTrainingLoopMixin:
                     f.write(
                         f"Max Depth Reached (Overall from WorkerStats): {max_depth_overall}\n"
                     )
+                    min_d_bt_overall_fmt = (
+                        str(int(min_depth_bt_overall))
+                        if min_depth_bt_overall != float("inf")
+                        else "N/A"
+                    )
+                    f.write(
+                        f"Min Depth (Backtrack) (Overall from WorkerStats): {min_d_bt_overall_fmt}\n"
+                    )
                     f.write(
                         f"Total Warnings Reported (Sum from WorkerStats): {total_warnings}\n"
                     )
@@ -837,13 +903,19 @@ class CFRTrainingLoopMixin:
                         f"Total Errors Reported (Sum from WorkerStats): {total_errors}\n"
                     )
 
-                elif num_workers == 1 and self._worker_statuses:
+                elif num_workers == 1 and self._worker_statuses:  # Sequential
                     f.write("Sequential execution (1 worker).\n")
                     status_info_seq = self._worker_statuses.get(0)
                     if isinstance(status_info_seq, WorkerStats):
                         nodes_fmt_seq = format_large_number(status_info_seq.nodes_visited)
+                        min_d_bt_seq_fmt = (
+                            str(int(status_info_seq.min_depth_after_bottom_out))
+                            if status_info_seq.min_depth_after_bottom_out != float("inf")
+                            else "N/A"
+                        )
                         f.write("  Final Status: Completed (Returned Stats)\n")
                         f.write(f"  Max Depth: {status_info_seq.max_depth}\n")
+                        f.write(f"  Min Depth (Dist): {min_d_bt_seq_fmt}\n")
                         f.write(
                             f"  Nodes Visited: {nodes_fmt_seq} ({status_info_seq.nodes_visited:,})\n"
                         )

@@ -64,15 +64,22 @@ def _traverse_game_for_worker(
     worker_stats: WorkerStats,
     progress_queue: Optional[ProgressQueueWorker],
     worker_id: int,
-    min_depth_for_segment: List[int],  # Pass as a list to modify in place
+    # min_depth_for_segment: List[int],  # Pass as a list to modify in place
+    # New: Pass min_depth_after_bottom_out as a list to modify in place
+    min_depth_after_bottom_out_tracker: List[float],
+    has_bottomed_out_tracker: List[bool],
 ) -> np.ndarray:
     """Recursive traversal logic adapted for worker process."""
     logger = logging.getLogger(__name__)
 
     worker_stats.nodes_visited += 1
-    # Update the minimum depth encountered in this specific traversal segment
-    min_depth_for_segment[0] = min(min_depth_for_segment[0], depth)
     worker_stats.max_depth = max(worker_stats.max_depth, depth)
+
+    # If we have bottomed out, update the minimum depth reached during backtracking
+    if has_bottomed_out_tracker[0]:
+        min_depth_after_bottom_out_tracker[0] = min(
+            min_depth_after_bottom_out_tracker[0], float(depth)
+        )
 
     if progress_queue and (
         worker_stats.nodes_visited % PROGRESS_UPDATE_NODE_INTERVAL == 0
@@ -83,7 +90,12 @@ def _traverse_game_for_worker(
                 depth,
                 worker_stats.max_depth,
                 worker_stats.nodes_visited,
-                min_depth_for_segment[0],  # Send current min depth for this segment
+                # Send the current min_depth_after_bottom_out
+                (
+                    int(min_depth_after_bottom_out_tracker[0])
+                    if min_depth_after_bottom_out_tracker[0] != float("inf")
+                    else 0
+                ),  # Send 0 if not yet bottomed or no backtrack
             )
             progress_queue.put_nowait(progress_update)
         except queue.Full:
@@ -97,6 +109,10 @@ def _traverse_game_for_worker(
             worker_stats.error_count += 1
 
     if game_state.is_terminal():
+        has_bottomed_out_tracker[0] = True  # Mark that we've hit a terminal state
+        min_depth_after_bottom_out_tracker[0] = min(
+            min_depth_after_bottom_out_tracker[0], float(depth)
+        )
         return np.array(
             [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
         )
@@ -104,6 +120,10 @@ def _traverse_game_for_worker(
     if depth >= config.system.recursion_limit:
         logger.error(
             "Worker %d: Max recursion depth (%d) reached. Returning 0.", worker_id, depth
+        )
+        has_bottomed_out_tracker[0] = True  # Mark as bottomed out due to depth limit
+        min_depth_after_bottom_out_tracker[0] = min(
+            min_depth_after_bottom_out_tracker[0], float(depth)
         )
         worker_stats.error_count += 1
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
@@ -224,7 +244,11 @@ def _traverse_game_for_worker(
             )
             worker_stats.error_count += 1
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
-        else:
+        else:  # Terminal due to no legal actions (e.g. stalemate handled by engine)
+            has_bottomed_out_tracker[0] = True
+            min_depth_after_bottom_out_tracker[0] = min(
+                min_depth_after_bottom_out_tracker[0], float(depth)
+            )
             return np.array(
                 [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
             )
@@ -382,9 +406,6 @@ def _traverse_game_for_worker(
         temp_reach_probs = reach_probs.copy()
         temp_reach_probs[player] *= action_prob
 
-        # Pass a new tracker for the sub-branch, initialized to infinity
-        recursive_min_depth_tracker = [float("inf")]
-
         try:
             recursive_utilities = _traverse_game_for_worker(
                 game_state,
@@ -402,7 +423,8 @@ def _traverse_game_for_worker(
                 worker_stats,
                 progress_queue,
                 worker_id,
-                recursive_min_depth_tracker,
+                min_depth_after_bottom_out_tracker,  # Pass tracker
+                has_bottomed_out_tracker,  # Pass tracker
             )
             action_utilities[i] = recursive_utilities
         except Exception as recursive_err:
@@ -486,7 +508,7 @@ def run_cfr_simulation_worker(
 ) -> Optional[WorkerResult]:
     """Top-level function executed by each worker process. Sets up per-worker logging."""
     logger_instance = None
-    worker_stats = WorkerStats()
+    worker_stats = WorkerStats()  # Initial min_depth_after_bottom_out is float('inf')
     (
         iteration,
         config,
@@ -603,8 +625,8 @@ def run_cfr_simulation_worker(
             )
             local_reach_prob_updates: LocalReachProbUpdateDict = defaultdict(float)
 
-            # Initialize min_depth for this worker's simulation segment
-            min_depth_for_this_simulation_segment = [float("inf")]
+            min_depth_after_bottom_out_tracker = [float("inf")]
+            has_bottomed_out_tracker = [False]
 
             _traverse_game_for_worker(
                 game_state=game_state,
@@ -622,7 +644,14 @@ def run_cfr_simulation_worker(
                 worker_stats=worker_stats,
                 progress_queue=progress_queue,
                 worker_id=worker_id,
-                min_depth_for_segment=min_depth_for_this_simulation_segment,
+                min_depth_after_bottom_out_tracker=min_depth_after_bottom_out_tracker,
+                has_bottomed_out_tracker=has_bottomed_out_tracker,
+            )
+            # Set the final min_depth_after_bottom_out on worker_stats
+            worker_stats.min_depth_after_bottom_out = (
+                int(min_depth_after_bottom_out_tracker[0])
+                if min_depth_after_bottom_out_tracker[0] != float("inf")
+                else 0  # If it never bottomed out or only hit depth 0, report 0
             )
 
             return WorkerResult(
