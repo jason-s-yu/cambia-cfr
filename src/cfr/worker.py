@@ -293,7 +293,8 @@ def _traverse_game_for_worker(
                 chosen_action="STALLED_NO_LEGAL_ACTIONS",
                 state_delta=[],
             )
-            simulation_nodes.append(stall_node)
+            if config.logging.log_simulation_traces:
+                simulation_nodes.append(stall_node)
             return np.zeros(NUM_PLAYERS, dtype=np.float64)
         else:  # Terminal due to no legal actions
             has_bottomed_out_tracker[0] = True
@@ -434,6 +435,8 @@ def _traverse_game_for_worker(
         # Calculate reach probability for the next state (pass unchanged reach probs down)
         next_reach_probs = reach_probs.copy()
 
+        # REMOVED: Logic to determine card drawn THIS step
+
         # Apply action and recurse
         state_delta: Optional[StateDelta] = None
         undo_info: Optional[UndoInfo] = None
@@ -449,6 +452,9 @@ def _traverse_game_for_worker(
                     and simulation_nodes[-1] is node_data
                 ):
                     node_data["state_delta"] = [list(d) for d in state_delta]
+
+                # REMOVED: Extraction of card_drawn_this_step
+
             else:
                 logger_traverse.error(
                     "W%d D%d P%d: apply_action for sampled %s returned invalid undo_info. State:%s",
@@ -481,65 +487,72 @@ def _traverse_game_for_worker(
                 node_data["state_delta"] = [("apply_error", str(apply_err))]
 
         if apply_success:
-            # Determine if an explicit card draw needs to be passed for observation creation
-            explicit_drawn_card_for_obs: Optional[Card] = None
-            if isinstance(chosen_action, (ActionReplace, ActionDiscard)):
-                # Peek into pending data *before* recursion clears it, if possible
-                # This assumes pending data exists correctly at this point.
-                try:
-                    explicit_drawn_card_for_obs = (
-                        game_state.pending_action_data.get("drawn_card")
-                        if game_state.pending_action_data
-                        else None
-                    )
-                except AttributeError:  # pending_action_data might not exist
-                    explicit_drawn_card_for_obs = None
-
+            # Create observation: No longer need to pass explicit card drawn
             observation = _create_observation(
                 None,
                 chosen_action,
                 game_state,
                 player,
-                game_state.snap_results_log,
-                explicit_drawn_card_for_obs,
+                game_state.snap_results_log,  # Pass CURRENT snap log
             )
             next_agent_states = []
             agent_update_failed = False
             player_specific_obs_for_log = None
-            try:
-                for agent_idx, agent_state in enumerate(agent_states):
-                    cloned_agent = agent_state.clone()
-                    player_specific_obs = _filter_observation(observation, agent_idx)
-                    if agent_idx == player:
-                        player_specific_obs_for_log = player_specific_obs
-                    cloned_agent.update(player_specific_obs)
-                    next_agent_states.append(cloned_agent)
-            except Exception as e_update:
+            if observation is None:  # Check if observation creation failed
                 logger_traverse.error(
-                    "W%d D%d: Error updating agent P%d after action %s: %s. State(post-action):%s FilteredObs:%s",
+                    "W%d D%d: Failed to create observation after action %s.",
                     worker_id,
                     depth,
-                    agent_idx,
                     chosen_action,
-                    e_update,
-                    game_state,
-                    player_specific_obs_for_log,
-                    exc_info=True,
                 )
+                agent_update_failed = True  # Mark as failed to prevent recursion
                 worker_stats.error_count += 1
-                agent_update_failed = True
                 if undo_info:
                     try:
                         undo_info()
                     except Exception as undo_e:
                         logger_traverse.error(
-                            "W%d D%d: Error undoing after agent update fail: %s",
+                            "W%d D%d: Error undoing after obs create fail: %s",
                             worker_id,
                             depth,
                             undo_e,
-                            exc_info=True,
                         )
-                        worker_stats.error_count += 1
+            else:
+                try:
+                    for agent_idx, agent_state in enumerate(agent_states):
+                        cloned_agent = agent_state.clone()
+                        player_specific_obs = _filter_observation(observation, agent_idx)
+                        if agent_idx == player:
+                            player_specific_obs_for_log = player_specific_obs
+                        cloned_agent.update(player_specific_obs)
+                        next_agent_states.append(cloned_agent)
+                except Exception as e_update:
+                    failed_agent_idx = agent_idx  # Capture index where failure occurred
+                    logger_traverse.error(
+                        "W%d D%d: Error updating agent P%d after action %s: %s. State(post-action):%s FilteredObs:%s",
+                        worker_id,
+                        depth,
+                        failed_agent_idx,
+                        chosen_action,
+                        e_update,
+                        game_state,
+                        player_specific_obs_for_log,  # May be None if error happened before P0 update
+                        exc_info=True,
+                    )
+                    worker_stats.error_count += 1
+                    agent_update_failed = True
+                    if undo_info:
+                        try:
+                            undo_info()
+                        except Exception as undo_e:
+                            logger_traverse.error(
+                                "W%d D%d: Error undoing after agent update fail: %s",
+                                worker_id,
+                                depth,
+                                undo_e,
+                                exc_info=True,
+                            )
+                            worker_stats.error_count += 1
 
             if not agent_update_failed:
                 try:
@@ -778,7 +791,9 @@ def run_cfr_simulation_worker(
         if not game_state.is_terminal():
             try:
                 # Create observation needed for AgentState initialization
-                initial_obs = _create_observation(None, None, game_state, -1, [], None)
+                initial_obs = _create_observation(
+                    None, None, game_state, -1, []
+                )  # No explicit card needed
                 if initial_obs is None:
                     raise ValueError("Failed to create initial observation.")
 
@@ -973,7 +988,7 @@ def _create_observation(
     next_state: CambiaGameState,
     acting_player: int,
     snap_results: List[Dict],
-    explicit_drawn_card: Optional[Card] = None,
+    # REMOVED explicit_drawn_card
 ) -> Optional[AgentObservation]:
     """Creates the AgentObservation object based on the state *after* the action."""
     logger_obs = logging.getLogger(__name__)  # Use module logger
@@ -986,22 +1001,32 @@ def _create_observation(
         game_over = next_state.is_terminal()
         turn_num = next_state.get_turn_number()
 
+        # Determine drawn card based on action and NEXT state
         drawn_card_for_obs = None
-        # Drawn card included if explicitly passed OR if action reveals it publicly
-        if explicit_drawn_card:
-            drawn_card_for_obs = explicit_drawn_card
-        elif isinstance(action, (ActionDiscard, ActionReplace)):
-            # Try to get it from pending_action_data if not passed explicitly
-            # This might be fragile if pending_action_data was cleared too early.
-            try:
-                drawn_card_for_obs = next_state.pending_action_data.get("drawn_card")
-            except AttributeError:
-                # Fallback: check discard pile if action was discard
-                if isinstance(action, ActionDiscard):
-                    drawn_card_for_obs = (
-                        discard_top  # Assumes it's the card just discarded
-                    )
-                # Cannot reliably get drawn card for Replace if not passed explicitly
+        if isinstance(action, ActionDiscard):
+            # The card just discarded *was* the drawn card. It's now the top of discard.
+            drawn_card_for_obs = next_state.get_discard_top()
+            if drawn_card_for_obs is None:
+                logger_obs.error("Create Obs: ActionDiscard but discard pile empty?")
+        elif isinstance(action, ActionReplace):
+            # The card just placed into the hand *was* the drawn card.
+            if acting_player != -1 and action.target_hand_index < len(
+                next_state.players[acting_player].hand
+            ):
+                drawn_card_for_obs = next_state.players[acting_player].hand[
+                    action.target_hand_index
+                ]
+            else:
+                logger_obs.error(
+                    "Create Obs: ActionReplace index %d invalid for actor %d hand size %d",
+                    action.target_hand_index if action else -1,
+                    acting_player,
+                    (
+                        len(next_state.players[acting_player].hand)
+                        if acting_player != -1
+                        else -1
+                    ),
+                )
 
         # Populate peeked cards *only* if the action caused a peek
         peeked_cards_dict = None
@@ -1063,7 +1088,7 @@ def _create_observation(
             discard_top_card=discard_top,
             player_hand_sizes=hand_sizes,
             stockpile_size=stock_size,
-            drawn_card=drawn_card_for_obs,
+            drawn_card=drawn_card_for_obs,  # Determined from next_state based on action
             peeked_cards=peeked_cards_dict,
             snap_results=final_snap_results,
             did_cambia_get_called=cambia_called,
@@ -1071,6 +1096,7 @@ def _create_observation(
             is_game_over=game_over,
             current_turn=turn_num,
         )
+        logger_obs.debug("Created observation: %s", obs)
         return obs
     except Exception as e:
         logger_obs.error("Error creating observation: %s", e, exc_info=True)
@@ -1082,14 +1108,13 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
     # Shallow copy is usually sufficient as AgentState doesn't modify observation fields
     filtered_obs = copy.copy(obs)
 
-    # Mask drawn card unless observer is the actor OR it was publicly revealed
-    is_public_reveal_action = isinstance(obs.action, (ActionDiscard, ActionReplace))
-    if (
-        obs.drawn_card
-        and obs.acting_player != observer_id
-        and not is_public_reveal_action
-    ):
+    # Mask drawn card unless observer is the actor AND the action requires the drawn card info
+    if obs.drawn_card and obs.acting_player != observer_id:
         filtered_obs.drawn_card = None
+    elif obs.drawn_card and obs.acting_player == observer_id:
+        # Keep drawn_card only if the action is Discard or Replace (when agent needs it)
+        if not isinstance(obs.action, (ActionDiscard, ActionReplace)):
+            filtered_obs.drawn_card = None
 
     # Filter peeked cards - only pass if observer was the actor performing the peek/look
     if obs.peeked_cards:

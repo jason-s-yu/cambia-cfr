@@ -15,7 +15,7 @@ cfr_training:
   save_interval: 1                        # Save progress every N iterations
   pruning_enabled: true                   # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6               # Regrets below this considered zero for pruning
-  exploitability_interval: 1              # Calculate exploitability every N iterations (higher priority than time)
+  exploitability_interval: 100            # Calculate exploitability every N iterations (higher priority than time)
   exploitability_interval_seconds: 7200   # Calculate exploitability if X seconds pass (e.g., 4 hours), lower priority
   num_workers: 23                         # Number of parallel workers for simulations (1 for sequential)
 
@@ -54,8 +54,8 @@ agents:
 
 # Logging Configuration
 logging:
-  log_level_file: "INFO"            # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
-  log_level_console: "WARNING"      # Logging level for the console
+  log_level_file: "DEBUG"            # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
+  log_level_console: "DEBUG"      # Logging level for the console
   log_dir: "logs"                   # Directory to store log files
   log_file_prefix: "cambia"         # Prefix for log files within the run directory
   log_max_bytes: "10MB"             # Max size before rotation for an individual log file (e.g., worker_N_001.log)
