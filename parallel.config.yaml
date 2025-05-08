@@ -16,7 +16,7 @@ cfr_training:
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
   exploitability_interval: 1    # Calculate exploitability every N iterations (0 to disable)
-  num_workers: 23               # Number of parallel workers for simulations (1 for sequential)
+  num_workers: 16               # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
@@ -44,7 +44,7 @@ cambia_rules:
 # Persistence Settings
 persistence:
   # Path relative to execution directory where agent data is saved/loaded
-  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.7.21-l1-p16-archlog.joblib"
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.8.1-l1-p16-archlog.joblib"
 
 agents:
   greedy_agent:
