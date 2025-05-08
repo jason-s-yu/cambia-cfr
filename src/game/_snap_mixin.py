@@ -71,6 +71,8 @@ class SnapLogicMixin:
                 acting_player,
                 snapper_hand,
             )
+            # Still allow PassSnap even with invalid hand? Yes.
+            legal_actions.add(ActionPassSnap())
             return legal_actions
 
         # Always possible to pass
@@ -190,7 +192,12 @@ class SnapLogicMixin:
                 self.snap_results_log.append(details_dict)
 
             def undo():
-                self.snap_results_log = original_log
+                # Check if the last item is indeed the one we added
+                assert (
+                    self.snap_results_log and self.snap_results_log[-1] == details_dict
+                ), f"Undo snap log mismatch. Expected last item {details_dict}, log is {self.snap_results_log}"
+                self.snap_results_log.pop()
+                assert self.snap_results_log == original_log, "Undo snap log failed"
 
             self._add_change(
                 change, undo, ("snap_log_append", details_dict), undo_stack, delta_list
@@ -205,6 +212,9 @@ class SnapLogicMixin:
             elif isinstance(action, ActionSnapOwn):
                 snap_idx = action.own_card_hand_index
                 hand = self.players[acting_player].hand
+                original_hand_state = list(hand)  # Capture for undo check
+                original_discard_len = len(self.discard_pile)
+                original_discard_top = self.get_discard_top()
 
                 if not (0 <= snap_idx < len(hand)):
                     logger.warning(
@@ -229,59 +239,51 @@ class SnapLogicMixin:
                     elif attempted_card.rank == target_rank:
                         card_to_remove = attempted_card
                         card_to_log = card_to_remove  # Log the card being snapped
-                        original_discard = list(self.discard_pile)  # For undo
 
                         def change_snap_own():
-                            # Double check index before popping
-                            if 0 <= snap_idx < len(self.players[acting_player].hand):
+                            # Check index and card identity before popping
+                            if (
+                                0 <= snap_idx < len(self.players[acting_player].hand)
+                                and self.players[acting_player].hand[snap_idx]
+                                is card_to_remove
+                            ):
                                 removed = self.players[acting_player].hand.pop(snap_idx)
-                                # Check identity
-                                if removed is card_to_remove:
-                                    self.discard_pile.append(removed)
-                                else:
-                                    logger.error(
-                                        "SnapOwn change error: Card identity mismatch! Expected %s, got %s.",
-                                        card_to_remove,
-                                        removed,
-                                    )
-                                    # Attempt to put it back? Risky. Log error.
-                                    self.players[acting_player].hand.insert(
-                                        snap_idx, removed
-                                    )  # Put back incorrect card?
+                                self.discard_pile.append(removed)
                             else:
                                 logger.error(
-                                    "SnapOwn change error: Index %d OOB (Hand size %d).",
+                                    "SnapOwn change error: Index %d OOB or card mismatch (Hand size %d). Expected %s, Got %s",
                                     snap_idx,
                                     len(self.players[acting_player].hand),
+                                    card_to_remove,
+                                    (
+                                        self.players[acting_player].hand[snap_idx]
+                                        if 0
+                                        <= snap_idx
+                                        < len(self.players[acting_player].hand)
+                                        else "OOB"
+                                    ),
                                 )
+                                # Avoid state modification if precondition fails
 
                         def undo_snap_own():
-                            if (
+                            # Assert preconditions
+                            assert (
                                 self.discard_pile
                                 and self.discard_pile[-1] is card_to_remove
-                            ):
-                                popped = self.discard_pile.pop()
-                                # Check index validity before inserting back
-                                if 0 <= snap_idx <= len(self.players[acting_player].hand):
-                                    self.players[acting_player].hand.insert(
-                                        snap_idx, popped
-                                    )
-                                else:
-                                    logger.warning(
-                                        "Undo SnapOwn failed: Insert index %d invalid for hand size %d.",
-                                        snap_idx,
-                                        len(self.players[acting_player].hand),
-                                    )
-                            else:
-                                logger.warning(
-                                    "Undo SnapOwn mismatch: discard top is %s, expected %s",
-                                    (
-                                        self.discard_pile[-1]
-                                        if self.discard_pile
-                                        else "Empty"
-                                    ),
-                                    card_to_remove,
-                                )
+                            ), f"Undo SnapOwn: Discard top mismatch (Expected {card_to_remove}, Got {self.discard_pile[-1] if self.discard_pile else 'Empty'})"
+
+                            popped = self.discard_pile.pop()
+
+                            assert (
+                                0 <= snap_idx <= len(self.players[acting_player].hand)
+                            ), f"Undo SnapOwn: Insert index {snap_idx} invalid for hand size {len(self.players[acting_player].hand)}"
+                            self.players[acting_player].hand.insert(snap_idx, popped)
+                            # Assert postconditions
+                            assert len(self.discard_pile) == original_discard_len
+                            assert self.get_discard_top() is original_discard_top
+                            assert (
+                                self.players[acting_player].hand == original_hand_state
+                            ), f"Undo SnapOwn: Hand state mismatch! Expected {original_hand_state}, Got {self.players[acting_player].hand}"
 
                         delta_snap_own = (
                             "snap_own_success",
@@ -298,7 +300,7 @@ class SnapLogicMixin:
                         )
                         snap_success = True
                         logger.info(
-                            "P%d snaps own %s (Rank %s) from index %d. Hand size: %d",
+                            "P%d snaps own %s (Rank %s) from index %d. New Hand size: %d",
                             acting_player,
                             card_to_remove,
                             target_rank,
@@ -342,6 +344,7 @@ class SnapLogicMixin:
                         attempted_card_str = f"Invalid Opponent {opp_idx}"
                     else:
                         opp_hand = self.players[opp_idx].hand
+                        original_opp_hand_state = list(opp_hand)  # Capture for undo check
                         target_opp_hand_idx = action.opponent_target_hand_index
                         if not (0 <= target_opp_hand_idx < len(opp_hand)):
                             logger.warning(
@@ -369,48 +372,53 @@ class SnapLogicMixin:
                                 card_to_log = card_to_remove  # Log card being removed
 
                                 def change_snap_opp_remove():
-                                    # Check index validity before popping
+                                    # Check index validity and card identity before popping
                                     if (
                                         0
                                         <= target_opp_hand_idx
                                         < len(self.players[opp_idx].hand)
+                                        and self.players[opp_idx].hand[
+                                            target_opp_hand_idx
+                                        ]
+                                        is card_to_remove
                                     ):
                                         removed = self.players[opp_idx].hand.pop(
                                             target_opp_hand_idx
                                         )
-                                        if removed is not card_to_remove:
-                                            logger.error(
-                                                "SnapOpponent change error: Card identity mismatch! Expected %s, got %s.",
-                                                card_to_remove,
-                                                removed,
-                                            )
-                                            # Put back? Risky.
-                                            self.players[opp_idx].hand.insert(
-                                                target_opp_hand_idx, removed
-                                            )
                                     else:
                                         logger.error(
-                                            "SnapOpponent change error: Index %d OOB (Opp Hand size %d).",
+                                            "SnapOpponent change error: Index %d OOB or card mismatch (Opp Hand size %d). Expected %s, Got %s",
                                             target_opp_hand_idx,
                                             len(self.players[opp_idx].hand),
+                                            card_to_remove,
+                                            (
+                                                self.players[opp_idx].hand[
+                                                    target_opp_hand_idx
+                                                ]
+                                                if 0
+                                                <= target_opp_hand_idx
+                                                < len(self.players[opp_idx].hand)
+                                                else "OOB"
+                                            ),
                                         )
+                                        # Avoid state change on error
 
                                 def undo_snap_opp_remove():
-                                    # Check index validity before inserting back
-                                    if (
+                                    # Assert preconditions (optional, but good practice)
+                                    assert (
                                         0
                                         <= target_opp_hand_idx
                                         <= len(self.players[opp_idx].hand)
-                                    ):
-                                        self.players[opp_idx].hand.insert(
-                                            target_opp_hand_idx, card_to_remove
-                                        )
-                                    else:
-                                        logger.warning(
-                                            "Undo SnapOpponentRemove failed: insert index %d invalid for opp hand size %d",
-                                            target_opp_hand_idx,
-                                            len(self.players[opp_idx].hand),
-                                        )
+                                    ), f"Undo SnapOpponentRemove: Insert index {target_opp_hand_idx} invalid for opp hand size {len(self.players[opp_idx].hand)}"
+
+                                    self.players[opp_idx].hand.insert(
+                                        target_opp_hand_idx, card_to_remove
+                                    )
+                                    # Assert postconditions
+                                    assert (
+                                        self.players[opp_idx].hand
+                                        == original_opp_hand_state
+                                    ), f"Undo SnapOpponentRemove: Hand state mismatch! Expected {original_opp_hand_state}, Got {self.players[opp_idx].hand}"
 
                                 delta_snap_opp_remove = (
                                     "snap_opponent_remove",
@@ -445,8 +453,8 @@ class SnapLogicMixin:
                                     self.snap_phase_active
                                 )  # Should be True
                                 next_pending_action_type = ActionSnapOpponentMove(
-                                    own_card_to_move_hand_index=-1,
-                                    target_empty_slot_index=-1,
+                                    own_card_to_move_hand_index=-1,  # Placeholder
+                                    target_empty_slot_index=target_opp_hand_idx,  # Set correct target
                                 )
                                 new_pending_data = {
                                     "target_empty_slot_index": target_opp_hand_idx
@@ -461,6 +469,10 @@ class SnapLogicMixin:
                                     )
 
                                 def undo_pending_move():
+                                    # Assert preconditions (optional)
+                                    assert self.pending_action is next_pending_action_type
+                                    assert self.pending_action_player == acting_player
+                                    # Restore previous state
                                     (
                                         self.pending_action,
                                         self.pending_action_player,
@@ -479,7 +491,7 @@ class SnapLogicMixin:
                                 }
                                 serialized_new_data = {
                                     "target_empty_slot_index": target_opp_hand_idx
-                                }  # Data for pending state change delta
+                                }
 
                                 delta_pending = (
                                     "set_pending_action",
@@ -578,6 +590,8 @@ class SnapLogicMixin:
                     self.snap_current_snapper_idx = next_snap_idx
 
                 def undo_snap_idx():
+                    # Assert precondition
+                    assert self.snap_current_snapper_idx == next_snap_idx
                     self.snap_current_snapper_idx = original_snap_idx_local
 
                 self._add_change(
@@ -622,7 +636,18 @@ class SnapLogicMixin:
         target_rank = discarded_card.rank
         # Player whose action led to this discard (need to get this from engine context if not passed)
         # Assuming self.current_player_index holds the player who just finished their *main* action (discard/replace)
-        discarder_player = self.current_player_index
+        # Need to determine who discarded based on pending action context or last action?
+        # Let's assume for now the discarder is the *opponent* of the current turn player if turn advanced,
+        # or the current player if turn didn't advance (e.g., just finished discard).
+        # THIS IS AMBIGUOUS - Assume self.current_player_index is the one whose turn *will be next*.
+        discarder_player = (
+            self.current_player_index - 1 + self.num_players
+        ) % self.num_players
+        logger.debug(
+            "Initiating snap check. Card: %s, Discarder (Assumed Prev Player): P%d",
+            discarded_card,
+            discarder_player,
+        )
 
         for p_idx in range(self.num_players):
             if p_idx == self.cambia_caller_id:
@@ -646,26 +671,29 @@ class SnapLogicMixin:
             if (
                 self.house_rules.allowOpponentSnapping and len(hand) > 0
             ):  # Must have card to move
-                opp_idx = self.get_opponent_index(p_idx)
-                if opp_idx != self.cambia_caller_id:
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
+                opp_snap_check_idx = self.get_opponent_index(p_idx)
+                # Opponent cannot snap if they are the Cambia caller
+                if opp_snap_check_idx != self.cambia_caller_id:
+                    if 0 <= opp_snap_check_idx < len(self.players) and hasattr(
+                        self.players[opp_snap_check_idx], "hand"
                     ):
-                        opp_hand = self.players[opp_idx].hand
-                        if not all(isinstance(card, Card) for card in opp_hand):
+                        opp_hand_snap_check = self.players[opp_snap_check_idx].hand
+                        if not all(
+                            isinstance(card, Card) for card in opp_hand_snap_check
+                        ):
                             logger.error(
                                 "Initiate Snap Check: Opponent P%d hand invalid. Skipping snap-opp for P%d.",
-                                opp_idx,
+                                opp_snap_check_idx,
                                 p_idx,
                             )
                         else:
                             can_snap_opponent = any(
-                                card.rank == target_rank for card in opp_hand
+                                card.rank == target_rank for card in opp_hand_snap_check
                             )
                     else:
                         logger.warning(
                             "Initiate Snap Check: Opponent P%d invalid for P%d checking SnapOpponent.",
-                            opp_idx,
+                            opp_snap_check_idx,
                             p_idx,
                         )
 
@@ -682,14 +710,15 @@ class SnapLogicMixin:
 
         # Determine snap order: Start from player *after* the discarder.
         ordered_snappers = []
-        for i in range(1, self.num_players):
-            check_p_idx = (discarder_player + i) % self.num_players
-            if check_p_idx in potential_indices:
-                ordered_snappers.append(check_p_idx)
-        # Discarder snaps last (if eligible and not Cambia caller)
+        # Check player after discarder first
+        start_check_idx = (discarder_player + 1) % self.num_players
+        if start_check_idx in potential_indices:
+            ordered_snappers.append(start_check_idx)
+        # Check discarder last (if eligible and not Cambia caller)
         if (
             discarder_player in potential_indices
             and discarder_player != self.cambia_caller_id
+            and discarder_player != start_check_idx  # Avoid adding twice in 2p game
         ):
             ordered_snappers.append(discarder_player)
 
@@ -716,9 +745,13 @@ class SnapLogicMixin:
             self.snap_discarded_card = discarded_card
             self.snap_potential_snappers = ordered_snappers
             self.snap_current_snapper_idx = 0
-            self.snap_results_log = []
+            self.snap_results_log = []  # Clear log for new snap phase
 
         def undo_snap_start():
+            # Assert preconditions
+            assert self.snap_phase_active is True
+            assert self.snap_discarded_card is discarded_card
+            # Restore previous state
             self.snap_phase_active = original_snap_phase
             self.snap_discarded_card = original_snap_card
             self.snap_potential_snappers = original_snap_potentials
@@ -757,6 +790,9 @@ class SnapLogicMixin:
             self.snap_current_snapper_idx = 0
 
         def undo_snap_end():
+            # Assert preconditions
+            assert self.snap_phase_active is False
+            # Restore previous state
             self.snap_phase_active = original_snap_phase
             self.snap_discarded_card = original_snap_card
             self.snap_potential_snappers = original_snap_potentials
@@ -770,6 +806,7 @@ class SnapLogicMixin:
 
         # Crucially, the turn advances *after* the snap phase concludes.
         if hasattr(self, "_advance_turn") and callable(self._advance_turn):
+            logger.debug("Snap phase ended, advancing main game turn...")
             self._advance_turn(undo_stack, delta_list)
         else:
             logger.error(

@@ -1,12 +1,9 @@
 """
 src/cfr/worker.py
 
-Implements the worker process logic for CFR+ training.
+Implements the worker process logic for CFR+ training using External Sampling Monte Carlo CFR (ESMCFR).
 Each worker simulates games based on a strategy snapshot provided by the main process,
-accumulates local updates, and returns them.
-
-NOTE: This version implements Parallel Vanilla CFR+, not ESMCFR.
-It performs full recursive traversals within each worker simulation.
+accumulates local updates, and returns them. Uses Outcome Sampling for action selection.
 """
 
 import copy
@@ -49,6 +46,7 @@ from ..utils import (
     WorkerResult,
     WorkerStats,
     get_rm_plus_strategy,
+    normalize_probabilities,
     SimulationNodeData,
 )
 from ..game.helpers import serialize_card
@@ -109,8 +107,9 @@ def _traverse_game_for_worker(
     simulation_nodes: List[SimulationNodeData],
 ) -> np.ndarray:
     """
-    Recursive traversal logic for Vanilla CFR+ executed within a worker process.
-    Performs a full traversal from the current node.
+    Recursive traversal logic for ESMCFR using Outcome Sampling.
+    Samples a single action based on the current strategy and recurses.
+    Applies importance-weighted regret updates.
     """
     # Use the module-level logger
     logger_traverse = logging.getLogger(__name__)
@@ -255,6 +254,7 @@ def _traverse_game_for_worker(
 
     try:
         legal_actions_set = game_state.get_legal_actions()
+        # Sort actions for deterministic mapping between strategy index and action
         legal_actions = sorted(list(legal_actions_set), key=repr)
     except Exception as e_legal:
         logger_traverse.error(
@@ -324,30 +324,31 @@ def _traverse_game_for_worker(
         # Initialize local updates if key is new or has wrong dimension
         if (
             infoset_key not in local_regret_updates
-            or len(local_regret_updates.get(infoset_key, [])) != num_actions
+            or len(local_regret_updates.get(infoset_key, np.array([])))
+            != num_actions  # Check against np.array([])
         ):
             local_regret_updates[infoset_key] = np.zeros(num_actions, dtype=np.float64)
         if (
             infoset_key not in local_strategy_sum_updates
-            or len(local_strategy_sum_updates.get(infoset_key, [])) != num_actions
+            or len(local_strategy_sum_updates.get(infoset_key, np.array([])))
+            != num_actions  # Check against np.array([])
         ):
             local_strategy_sum_updates[infoset_key] = np.zeros(
                 num_actions, dtype=np.float64
             )
 
-    # --- Strategy Sum Update ---
+    # --- Strategy Sum Update (Common to all CFR variants) ---
     player_reach = reach_probs[player]
     if weight > 0 and player_reach > 1e-9:
         if len(strategy) == num_actions:
+            # Ensure local update entry exists and has correct dimension
             if (
-                infoset_key not in local_strategy_sum_updates
-                or len(local_strategy_sum_updates[infoset_key]) != num_actions
+                len(local_strategy_sum_updates.get(infoset_key, np.array([])))
+                != num_actions
             ):
-                # Re-initialize if dimension mismatch occurred (defensive)
                 local_strategy_sum_updates[infoset_key] = np.zeros(
                     num_actions, dtype=np.float64
                 )
-            # Update strategy sum weighted by player reach
             local_strategy_sum_updates[infoset_key] += weight * player_reach * strategy
             local_reach_prob_updates[infoset_key] += weight * player_reach
         else:
@@ -361,106 +362,142 @@ def _traverse_game_for_worker(
             )
             worker_stats.error_count += 1
 
-    # --- Vanilla CFR: Iterate through all actions and recurse ---
-    action_utilities = np.zeros((num_actions, NUM_PLAYERS), dtype=np.float64)
+    # --- Outcome Sampling: Sample one action and recurse ---
+    node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
+    chosen_action_index: Optional[int] = None
+    chosen_action: Optional[GameAction] = None
+    sampling_prob_chosen = 0.0
 
-    # Log the decision node before iterating actions
-    node_data = SimulationNodeData(
-        depth=depth,
-        player=player,
-        infoset_key=infoset_key_tuple,
-        context=current_context.name,
-        strategy=strategy.tolist() if strategy.size > 0 else [],
-        chosen_action=None,  # Will be set inside loop if trace enabled
-        state_delta=[],  # Will be set inside loop if trace enabled
-    )
-    # If tracing is enabled, add node now, potentially update action/delta later
-    if config.logging.log_simulation_traces:
-        simulation_nodes.append(node_data)
+    if num_actions > 0 and len(strategy) == num_actions and np.sum(strategy) > 1e-9:
+        # Normalize strategy before sampling just in case
+        if not np.isclose(np.sum(strategy), 1.0):
+            strategy = normalize_probabilities(strategy)
 
-    for i, action in enumerate(legal_actions):
-        if i >= len(strategy):  # Should not happen if logic above is correct
+        try:
+            chosen_action_index = np.random.choice(num_actions, p=strategy)
+            chosen_action = legal_actions[chosen_action_index]
+            sampling_prob_chosen = strategy[chosen_action_index]
+        except (
+            ValueError
+        ) as e_choice:  # Catch potential errors from invalid probabilities
             logger_traverse.error(
-                "W%d D%d: Action index %d >= strategy length %d. Skipping action %s.",
+                "W%d D%d P%d: Error sampling action with strategy %s: %s. Using uniform.",
                 worker_id,
                 depth,
-                i,
-                len(strategy),
-                action,
+                player,
+                strategy,
+                e_choice,
             )
             worker_stats.error_count += 1
-            continue
+            if num_actions > 0:
+                chosen_action_index = np.random.choice(num_actions)
+                chosen_action = legal_actions[chosen_action_index]
+                sampling_prob_chosen = 1.0 / num_actions
+            else:  # Should not happen if num_actions > 0
+                chosen_action_index = None
+                chosen_action = None
+                sampling_prob_chosen = 0.0
 
-        # Calculate reach probability for the next state after this action
+    elif num_actions > 0:  # Strategy was invalid (e.g., all zeros or length mismatch)
+        logger_traverse.warning(
+            "W%d D%d P%d: Invalid strategy %s for %d actions. Sampling uniformly.",
+            worker_id,
+            depth,
+            player,
+            strategy,
+            num_actions,
+        )
+        worker_stats.warning_count += 1
+        chosen_action_index = np.random.choice(num_actions)
+        chosen_action = legal_actions[chosen_action_index]
+        sampling_prob_chosen = 1.0 / num_actions
+        # Use uniform strategy for regret update as well
+        strategy = np.ones(num_actions) / num_actions if num_actions > 0 else np.array([])
+
+    # If an action was chosen (either via strategy or fallback uniform)
+    if chosen_action is not None and chosen_action_index is not None:
+        # Log the decision node (including the sampled action)
+        node_data = SimulationNodeData(
+            depth=depth,
+            player=player,
+            infoset_key=infoset_key_tuple,
+            context=current_context.name,
+            strategy=strategy.tolist() if strategy.size > 0 else [],
+            chosen_action=_serialize_action_for_history(
+                chosen_action
+            ),  # Log sampled action
+            state_delta=[],  # Will be set after apply_action
+        )
+        if config.logging.log_simulation_traces:
+            simulation_nodes.append(node_data)
+
+        # Calculate reach probability for the next state (pass unchanged reach probs down)
         next_reach_probs = reach_probs.copy()
-        next_reach_probs[player] *= strategy[i]
 
         # Apply action and recurse
         state_delta: Optional[StateDelta] = None
         undo_info: Optional[UndoInfo] = None
         apply_success = False
         try:
-            state_delta, undo_info = game_state.apply_action(action)
+            state_delta, undo_info = game_state.apply_action(chosen_action)
             if callable(undo_info):
                 apply_success = True
-                # If tracing, update the last node added
+                # Update node_data with delta if tracing
                 if (
                     config.logging.log_simulation_traces
                     and simulation_nodes
                     and simulation_nodes[-1] is node_data
                 ):
-                    node_data["chosen_action"] = _serialize_action_for_history(action)
                     node_data["state_delta"] = [list(d) for d in state_delta]
             else:
                 logger_traverse.error(
-                    "W%d D%d P%d: apply_action for %s returned invalid undo_info. State:%s",
+                    "W%d D%d P%d: apply_action for sampled %s returned invalid undo_info. State:%s",
                     worker_id,
                     depth,
                     player,
-                    action,
+                    chosen_action,
                     game_state,
                 )
                 worker_stats.error_count += 1
-                # No utility calculated for this failed action path
         except Exception as apply_err:
             logger_traverse.error(
-                "W%d D%d P%d: Error applying action %s: %s. State:%s Context:%s",
+                "W%d D%d P%d: Error applying sampled action %s: %s. State:%s Context:%s",
                 worker_id,
                 depth,
                 player,
-                action,
+                chosen_action,
                 apply_err,
                 game_state,
                 current_context.name,
                 exc_info=True,
             )
             worker_stats.error_count += 1
-            # Log failed action attempt if tracing
-            if config.logging.log_simulation_traces:
-                fail_node = SimulationNodeData(
-                    depth=depth,
-                    player=player,
-                    infoset_key=infoset_key_tuple,
-                    context=current_context.name,
-                    strategy=strategy.tolist() if strategy.size > 0 else [],
-                    chosen_action=_serialize_action_for_history(action),
-                    state_delta=[("apply_error", str(apply_err))],
-                )
-                # Append separate node for the error, don't modify the original decision node entry
-                simulation_nodes.append(fail_node)
+            # Update node_data with error if tracing
+            if (
+                config.logging.log_simulation_traces
+                and simulation_nodes
+                and simulation_nodes[-1] is node_data
+            ):
+                node_data["state_delta"] = [("apply_error", str(apply_err))]
 
         if apply_success:
             # Determine if an explicit card draw needs to be passed for observation creation
             explicit_drawn_card_for_obs: Optional[Card] = None
-            if isinstance(action, (ActionReplace, ActionDiscard)):
-                if game_state.pending_action_data:
-                    explicit_drawn_card_for_obs = game_state.pending_action_data.get(
-                        "drawn_card"
+            if isinstance(chosen_action, (ActionReplace, ActionDiscard)):
+                # Peek into pending data *before* recursion clears it, if possible
+                # This assumes pending data exists correctly at this point.
+                try:
+                    explicit_drawn_card_for_obs = (
+                        game_state.pending_action_data.get("drawn_card")
+                        if game_state.pending_action_data
+                        else None
                     )
+                except AttributeError:  # pending_action_data might not exist
+                    explicit_drawn_card_for_obs = None
 
             observation = _create_observation(
                 None,
-                action,
+                chosen_action,
                 game_state,
                 player,
                 game_state.snap_results_log,
@@ -483,7 +520,7 @@ def _traverse_game_for_worker(
                     worker_id,
                     depth,
                     agent_idx,
-                    action,
+                    chosen_action,
                     e_update,
                     game_state,
                     player_specific_obs_for_log,
@@ -506,10 +543,11 @@ def _traverse_game_for_worker(
 
             if not agent_update_failed:
                 try:
-                    recursive_utilities = _traverse_game_for_worker(
+                    # Single recursive call for the sampled action
+                    node_value = _traverse_game_for_worker(
                         game_state,
                         next_agent_states,
-                        next_reach_probs,  # Use updated reach probs for this path
+                        next_reach_probs,  # Pass original reach probs down
                         iteration,
                         updating_player,
                         weight,
@@ -526,20 +564,21 @@ def _traverse_game_for_worker(
                         has_bottomed_out_tracker,
                         simulation_nodes,
                     )
-                    action_utilities[i] = recursive_utilities
                 except Exception as recursive_err:
                     logger_traverse.error(
                         "W%d D%d: Error in recursive call after action %s: %s. State:%s Context:%s",
                         worker_id,
                         depth,
-                        action,
+                        chosen_action,
                         recursive_err,
                         game_state,
                         current_context.name,
                         exc_info=True,
                     )
                     worker_stats.error_count += 1
-                    action_utilities[i] = np.zeros(NUM_PLAYERS, dtype=np.float64)
+                    node_value = np.zeros(
+                        NUM_PLAYERS, dtype=np.float64
+                    )  # Set to zero on error
                     if undo_info:
                         try:
                             undo_info()
@@ -563,50 +602,61 @@ def _traverse_game_for_worker(
                             worker_id,
                             depth,
                             player,
-                            action,
+                            chosen_action,
                             undo_e,
                             exc_info=True,
                         )
                         worker_stats.error_count += 1
                         return np.zeros(NUM_PLAYERS, dtype=np.float64)
-        # End loop over actions
 
-    # Calculate node value (expected utility under current strategy)
-    node_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
-    if num_actions > 0 and len(strategy) == num_actions:
-        strategy_col = strategy[:, np.newaxis]
-        node_value = np.sum(strategy_col * action_utilities, axis=0)
+    # --- Outcome Sampling Regret Update ---
+    if player == updating_player and chosen_action_index is not None:
+        if len(strategy) == num_actions:  # Check strategy validity
+            sampled_utility = node_value[player]
+            if sampling_prob_chosen > 1e-9:
+                utility_estimate = sampled_utility / sampling_prob_chosen
 
-    # --- Regret Update ---
-    if player == updating_player:
-        if (
-            infoset_key not in local_regret_updates
-            or len(local_regret_updates[infoset_key]) != num_actions
-        ):
-            # Re-initialize if needed (defensive)
-            local_regret_updates[infoset_key] = np.zeros(num_actions, dtype=np.float64)
+                instantaneous_regrets = np.zeros(num_actions, dtype=np.float64)
+                for a_idx in range(num_actions):
+                    action_value_estimate = (
+                        1.0 if a_idx == chosen_action_index else 0.0
+                    ) * utility_estimate
+                    instantaneous_regrets[a_idx] = (
+                        action_value_estimate - strategy[a_idx] * utility_estimate
+                    )
 
-        if num_actions > 0:
-            player_action_values = action_utilities[:, player]
-            player_node_value = node_value[player]
-            instantaneous_regret = player_action_values - player_node_value
-            opponent_reach = reach_probs[opponent]
-            update_weight = opponent_reach * weight  # Include iteration weight
+                # Ensure local regret update entry exists and has correct dimension
+                if (
+                    len(local_regret_updates.get(infoset_key, np.array([])))
+                    != num_actions
+                ):
+                    local_regret_updates[infoset_key] = np.zeros(
+                        num_actions, dtype=np.float64
+                    )
 
-            if len(instantaneous_regret) == len(local_regret_updates[infoset_key]):
-                local_regret_updates[infoset_key] += update_weight * instantaneous_regret
-            else:
-                logger_traverse.error(
-                    "W%d D%d: Regret update dim mismatch key %s. Local:%d, Calc:%d. Update skipped.",
+                opponent_reach = reach_probs[opponent]
+                update_weight = opponent_reach * weight  # Include iteration weight
+                local_regret_updates[infoset_key] += update_weight * instantaneous_regrets
+
+            else:  # Sampling probability near zero
+                logger_traverse.debug(
+                    "W%d D%d P%d: Sampling prob %.3e near zero for action %s at key %s. Skipping regret update.",
                     worker_id,
                     depth,
+                    player,
+                    sampling_prob_chosen,
+                    chosen_action,
                     infoset_key,
-                    len(local_regret_updates[infoset_key]),
-                    len(instantaneous_regret),
                 )
-                worker_stats.error_count += 1
+        else:  # Strategy was invalid when sampling occurred
+            logger_traverse.warning(
+                "W%d D%d P%d: Cannot perform regret update, strategy was invalid during sampling.",
+                worker_id,
+                depth,
+                player,
+            )
 
-    return node_value
+    return node_value  # Return the utility vector obtained from the single sampled path
 
 
 def run_cfr_simulation_worker(
@@ -810,8 +860,8 @@ def run_cfr_simulation_worker(
         min_depth_after_bottom_out_tracker = [float("inf")]
         has_bottomed_out_tracker = [False]
 
-        # Run the full traversal (Vanilla CFR+)
-        node_utility_at_root = _traverse_game_for_worker(
+        # Run the ESMCFR traversal (Outcome Sampling)
+        final_utility_value = _traverse_game_for_worker(
             game_state=game_state,
             agent_states=initial_agent_states,
             reach_probs=np.ones(NUM_PLAYERS, dtype=np.float64),
@@ -832,30 +882,17 @@ def run_cfr_simulation_worker(
             simulation_nodes=simulation_nodes_this_sim,
         )
 
-        # Capture final utility AFTER traversal completes
-        if game_state.is_terminal():
-            final_utility_value = np.array(
-                [game_state.get_utility(i) for i in range(NUM_PLAYERS)], dtype=np.float64
-            )
-        elif (
-            node_utility_at_root is not None and len(node_utility_at_root) == NUM_PLAYERS
-        ):
-            # If traversal finished but not terminal (e.g., recursion limit)
-            if logger_instance:
-                logger_instance.warning(
-                    "W%d Iter %d: Traversal finished but game not terminal. Using root node utility %s.",
-                    worker_id,
-                    iteration,
-                    node_utility_at_root,
-                )
-            final_utility_value = node_utility_at_root
-        else:
+        # Note: final_utility_value here is the return from the recursive call,
+        # which represents the utility obtained from the single sampled path.
+        if final_utility_value is None or len(final_utility_value) != NUM_PLAYERS:
             if logger_instance:
                 logger_instance.error(
-                    "W%d Iter %d: Could not determine final utility after traversal.",
+                    "W%d Iter %d: Traversal returned invalid utility: %s. Setting final to zero.",
                     worker_id,
                     iteration,
+                    final_utility_value,
                 )
+            worker_stats.error_count += 1
             final_utility_value = np.zeros(NUM_PLAYERS, dtype=np.float64)
 
         worker_stats.min_depth_after_bottom_out = (
@@ -927,8 +964,11 @@ def run_cfr_simulation_worker(
 
 
 # --- Observation Helpers ---
+# (Keep these helpers here as they are used by the worker's traversal logic)
 def _create_observation(
-    prev_state: Optional[CambiaGameState],  # Not currently used but kept for signature
+    prev_state: Optional[
+        CambiaGameState
+    ],  # Kept for signature consistency if needed elsewhere
     action: Optional[GameAction],
     next_state: CambiaGameState,
     acting_player: int,
@@ -947,12 +987,21 @@ def _create_observation(
         turn_num = next_state.get_turn_number()
 
         drawn_card_for_obs = None
-        # Determine if drawn card should be included based on action type
-        if isinstance(action, (ActionDiscard, ActionReplace)):
+        # Drawn card included if explicitly passed OR if action reveals it publicly
+        if explicit_drawn_card:
             drawn_card_for_obs = explicit_drawn_card
-        # Explicitly passed means it was just drawn (stockpile/discard)
-        elif explicit_drawn_card is not None:
-            drawn_card_for_obs = explicit_drawn_card
+        elif isinstance(action, (ActionDiscard, ActionReplace)):
+            # Try to get it from pending_action_data if not passed explicitly
+            # This might be fragile if pending_action_data was cleared too early.
+            try:
+                drawn_card_for_obs = next_state.pending_action_data.get("drawn_card")
+            except AttributeError:
+                # Fallback: check discard pile if action was discard
+                if isinstance(action, ActionDiscard):
+                    drawn_card_for_obs = (
+                        discard_top  # Assumes it's the card just discarded
+                    )
+                # Cannot reliably get drawn card for Replace if not passed explicitly
 
         # Populate peeked cards *only* if the action caused a peek
         peeked_cards_dict = None
@@ -966,7 +1015,7 @@ def _create_observation(
                 logger_obs.warning(
                     "Create Obs: PeekOwn index %d invalid for hand size %d.",
                     target_idx,
-                    len(hand),
+                    len(hand) if hand else 0,
                 )
         elif isinstance(action, ActionAbilityPeekOtherSelect) and acting_player != -1:
             opp_idx = next_state.get_opponent_index(acting_player)
@@ -977,11 +1026,12 @@ def _create_observation(
                 peeked_cards_dict = {(opp_idx, target_opp_idx): card}
             else:
                 logger_obs.warning(
-                    "Create Obs: PeekOther index %d invalid for opp hand %d.",
+                    "Create Obs: PeekOther index %d invalid for opp hand size %d.",
                     target_opp_idx,
-                    len(opp_hand),
+                    len(opp_hand) if opp_hand else 0,
                 )
         elif isinstance(action, ActionAbilityKingLookSelect) and acting_player != -1:
+            # Re-fetch cards looked at for the observation
             own_idx, opp_look_idx = action.own_hand_index, action.opponent_hand_index
             opp_real_idx = next_state.get_opponent_index(acting_player)
             own_hand = next_state.get_player_hand(acting_player)
@@ -1005,7 +1055,6 @@ def _create_observation(
                     len(opp_hand) if opp_hand else "N/A",
                 )
 
-        # Use the provided snap results for this specific step
         final_snap_results = snap_results if snap_results else []
 
         obs = AgentObservation(
@@ -1042,7 +1091,7 @@ def _filter_observation(obs: AgentObservation, observer_id: int) -> AgentObserva
     ):
         filtered_obs.drawn_card = None
 
-    # Filter peeked cards - only pass if observer was the actor performing the peek
+    # Filter peeked cards - only pass if observer was the actor performing the peek/look
     if obs.peeked_cards:
         is_observer_peek_action = (
             (

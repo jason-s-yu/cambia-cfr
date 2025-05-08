@@ -5,10 +5,11 @@ Represents an agent's subjective belief state in the game Cambia.
 Handles information abstraction, memory limitations, and state updates based on observations.
 """
 
-from typing import List, Tuple, Optional, Dict, Any, Set, Union, Type
+from typing import List, Tuple, Optional, Dict, Any, Set, Union
 from dataclasses import dataclass, field
 import logging
 import copy
+import traceback
 
 from .card import Card
 from .constants import (
@@ -24,8 +25,6 @@ from .constants import (
     ActionAbilityBlindSwapSelect,
     ActionAbilityKingLookSelect,
     ActionAbilityKingSwapDecision,
-    ActionSnapOwn,
-    ActionSnapOpponent,
 )
 from .config import Config
 from .abstraction import get_card_bucket, decay_bucket
@@ -128,6 +127,7 @@ class AgentState:
                 len(initial_hand),
             )
         for i in range(self.initial_hand_size):
+            # Handle case where initial_hand might be shorter than expected
             card = initial_hand[i] if i < len(initial_hand) else None
             known = i in initial_peek_indices
             bucket = get_card_bucket(card) if known and card else CardBucket.UNKNOWN
@@ -187,16 +187,19 @@ class AgentState:
             "Observation Action: %s by P%d", observation.action, observation.acting_player
         )
         logger.debug("Snap Results: %s", observation.snap_results)
+
+        observed_own_count = observation.player_hand_sizes[self.player_id]
+        observed_opp_count = observation.player_hand_sizes[self.opponent_id]
         logger.debug(
-            "Observed Counts: Own=%d, Opp=%d",
-            observation.player_hand_sizes[self.player_id],
-            observation.player_hand_sizes[self.opponent_id],
+            " Observed Counts: Own=%d, Opp=%d. Current Belief Counts: Own=%d, Opp=%d",
+            observed_own_count,
+            observed_opp_count,
+            len(self.own_hand),
+            self.opponent_card_count,
         )
 
         # --- 1. Update Public Knowledge & Counts ---
         self.known_discard_top_bucket = get_card_bucket(observation.discard_top_card)
-        observed_opp_count = observation.player_hand_sizes[self.opponent_id]
-        observed_own_count = observation.player_hand_sizes[self.player_id]
         self.stockpile_estimate = self._estimate_stockpile(observation.stockpile_size)
         if observation.did_cambia_get_called and self.cambia_caller is None:
             self.cambia_caller = observation.who_called_cambia
@@ -222,6 +225,7 @@ class AgentState:
         opponent_cards_added_count = 0
         num_penalty_cards = self.config.cambia_rules.penaltyDrawCount
 
+        # Store pre-snap state for potential rollback or debugging
         original_own_hand = copy.deepcopy(self.own_hand)
         original_opponent_belief = copy.deepcopy(self.opponent_belief)
         original_opponent_last_seen = copy.deepcopy(self.opponent_last_seen_turn)
@@ -237,14 +241,14 @@ class AgentState:
                     if snapper == self.player_id:
                         own_cards_added_count += num_penalty_cards
                         logger.debug(
-                            " -> P%d got penalty (%d cards)",
+                            " -> P%d got penalty (+%d cards)",
                             self.player_id,
                             num_penalty_cards,
                         )
                     elif snapper == self.opponent_id:
                         opponent_cards_added_count += num_penalty_cards
                         logger.debug(
-                            " -> P%d got penalty (%d cards)",
+                            " -> P%d got penalty (+%d cards)",
                             self.opponent_id,
                             num_penalty_cards,
                         )
@@ -270,21 +274,23 @@ class AgentState:
                     elif action_type == "ActionSnapOpponent":
                         removed_idx = snap_info.get("removed_opponent_index")
                         if removed_idx is not None:
-                            if snapper == self.player_id:  # We snapped opponent
+                            # Check who removed whose card
+                            # If we are the snapper, we removed opponent's card
+                            if snapper == self.player_id:
                                 opponent_indices_removed.add(removed_idx)
                                 logger.debug(
-                                    " -> P%d snapped opp idx %d",
+                                    " -> P%d snapped opp idx %d (will move)",
                                     self.player_id,
                                     removed_idx,
                                 )
-                            elif snapper == self.opponent_id:  # Opponent snapped us
+                            # If opponent is snapper, they removed our card
+                            elif snapper == self.opponent_id:
                                 own_indices_removed.add(removed_idx)
                                 logger.debug(
-                                    " -> P%d snapped our idx %d",
+                                    " -> P%d snapped our idx %d (will receive)",
                                     self.opponent_id,
                                     removed_idx,
                                 )
-
             except Exception as e_snap_proc:
                 logger.error(
                     "Agent %d: Error processing snap_info %s: %s",
@@ -293,8 +299,43 @@ class AgentState:
                     e_snap_proc,
                 )
 
+        # 2a. Handle card moves from SnapOpponentMove (if occurred *this turn*)
+        # This needs to happen *before* final reconciliation, as it affects counts and indices.
+        if isinstance(action, ActionSnapOpponentMove) and actor != -1:
+            # The action contains the indices involved in the *move* step
+            snapper_idx = actor  # The player who moved their card
+            own_card_idx_moved = action.own_card_to_move_hand_index
+            target_slot_idx = action.target_empty_slot_index
+
+            if snapper_idx == self.player_id:  # We moved our card to opponent
+                # Mark our card as removed *before* reconciliation
+                if (
+                    own_card_idx_moved in original_own_hand
+                ):  # Check against pre-snap state
+                    own_indices_removed.add(own_card_idx_moved)
+                    logger.debug(
+                        " -> P%d moved card from own idx %d (marked removed)",
+                        self.player_id,
+                        own_card_idx_moved,
+                    )
+                # Opponent count increases due to receiving card (handled by observed_opp_count later)
+                # Opponent belief at target_slot_idx becomes UNKNOWN (handled later)
+            elif snapper_idx == self.opponent_id:  # Opponent moved their card to us
+                # Mark opponent card as removed *before* reconciliation
+                if (
+                    own_card_idx_moved in original_opponent_belief
+                ):  # Check against pre-snap state
+                    opponent_indices_removed.add(own_card_idx_moved)
+                    logger.debug(
+                        " -> P%d moved card from their idx %d (marked removed)",
+                        self.opponent_id,
+                        own_card_idx_moved,
+                    )
+                # Our count increases due to receiving card (handled by observed_own_count later)
+                # Our hand at target_slot_idx becomes UNKNOWN (handled later)
+
         logger.debug(
-            " Indices Removed: Own=%s, Opp=%s",
+            " Indices Removed (Post-Move Check): Own=%s, Opp=%s",
             own_indices_removed,
             opponent_indices_removed,
         )
@@ -307,52 +348,90 @@ class AgentState:
         # --- 3. Reconcile Hand States ---
         try:
             logger.debug(
-                " Rebuilding Own Hand (Current Size: %d)... Expecting %d.",
-                len(self.own_hand),
+                " Rebuilding Own Hand (Start Size: %d, Removed: %s, Added: %d)... Expecting %d.",
+                len(original_own_hand),
+                own_indices_removed,
+                own_cards_added_count,
                 observed_own_count,
             )
-            self.own_hand = self._rebuild_hand_state(
+            rebuilt_own_hand = self._rebuild_hand_state_new(
                 original_dict=original_own_hand,
                 removed_indices=own_indices_removed,
-                expected_count=observed_own_count,
-                added_count=own_cards_added_count,  # Pass added count
-                is_own_hand=True,
+                expected_final_count=observed_own_count,
+                added_placeholder_count=own_cards_added_count,
+                placeholder_value=KnownCardInfo(
+                    bucket=CardBucket.UNKNOWN, last_seen_turn=self._current_game_turn
+                ),
             )
+            self.own_hand = rebuilt_own_hand  # Update directly if successful
+
             logger.debug(
-                " Rebuilding Opp Belief (Current Size: %d)... Expecting %d.",
-                self.opponent_card_count,
+                " Rebuilding Opp Belief (Start Size: %d, Removed: %s, Added: %d)... Expecting %d.",
+                len(original_opponent_belief),
+                opponent_indices_removed,
+                opponent_cards_added_count,
                 observed_opp_count,
             )
-            new_opponent_belief, self.opponent_last_seen_turn = (
-                self._rebuild_belief_state(
+            rebuilt_opponent_belief, rebuilt_opponent_last_seen = (
+                self._rebuild_belief_state_new(
                     original_belief_dict=original_opponent_belief,
                     original_last_seen_dict=original_opponent_last_seen,
                     removed_indices=opponent_indices_removed,
-                    expected_count=observed_opp_count,
-                    added_count=opponent_cards_added_count,  # Pass added count
+                    expected_final_count=observed_opp_count,
+                    added_placeholder_count=opponent_cards_added_count,
+                    placeholder_value=CardBucket.UNKNOWN,
                 )
             )
-            # Only update if rebuild didn't return None (indicating fatal error)
-            if new_opponent_belief is not None:
-                self.opponent_belief = new_opponent_belief
-                self.opponent_card_count = (
-                    observed_opp_count  # Update count *after* successful reconciliation
-                )
-                logger.debug(" Belief Reconciliation Successful.")
-            else:
-                logger.error(
-                    "Opponent belief rebuild failed, state potentially corrupted."
-                )
-                # Maintain previous count but log inconsistency
-                self.opponent_card_count = len(self.opponent_belief)
+            self.opponent_belief = rebuilt_opponent_belief
+            self.opponent_last_seen_turn = rebuilt_opponent_last_seen
+            self.opponent_card_count = (
+                observed_opp_count  # Update count *after* successful reconciliation
+            )
 
-        except Exception as e_reconcile:
-            logger.exception(
-                "Agent %d: Error during hand/belief reconciliation T%d: %s. State may be inconsistent.",
+            logger.debug(" Belief Reconciliation Successful.")
+
+        except AssertionError as e_reconcile:
+            logger.critical(
+                "FATAL: Agent %d: Reconciliation failed T%d: %s. State CORRUPTED. Stack:\n%s",
                 self.player_id,
                 self._current_game_turn,
                 e_reconcile,
+                traceback.format_exc(),  # Log stack trace
             )
+            # If reconciliation fails critically, we cannot trust the state.
+            # Options: raise error, reset state (difficult), try to patch?
+            # For now, log critical and proceed, subsequent steps might fail.
+            # Attempt to force counts to match observation to prevent index errors later.
+            self.own_hand = {
+                i: KnownCardInfo(
+                    bucket=CardBucket.UNKNOWN, last_seen_turn=self._current_game_turn
+                )
+                for i in range(observed_own_count)
+            }
+            self.opponent_belief = {
+                i: CardBucket.UNKNOWN for i in range(observed_opp_count)
+            }
+            self.opponent_last_seen_turn = {}
+            self.opponent_card_count = observed_opp_count
+
+        except Exception as e_reconcile_other:
+            logger.exception(
+                "Agent %d: Unexpected error during hand/belief reconciliation T%d: %s. State may be inconsistent.",
+                self.player_id,
+                self._current_game_turn,
+                e_reconcile_other,
+            )
+            # Attempt to force counts
+            self.own_hand = {
+                i: KnownCardInfo(
+                    bucket=CardBucket.UNKNOWN, last_seen_turn=self._current_game_turn
+                )
+                for i in range(observed_own_count)
+            }
+            self.opponent_belief = {
+                i: CardBucket.UNKNOWN for i in range(observed_opp_count)
+            }
+            self.opponent_last_seen_turn = {}
             self.opponent_card_count = observed_opp_count
 
         logger.debug(
@@ -389,7 +468,7 @@ class AgentState:
                                 )
                             else:
                                 logger.warning(
-                                    " Agent %d Replace target index %d not found after reconciliation (Current: %s). State inconsistent.",
+                                    " Agent %d Replace target index %d not found after reconciliation (Current: %s). State inconsistent?",
                                     self.player_id,
                                     target_idx,
                                     list(self.own_hand.keys()),
@@ -410,35 +489,58 @@ class AgentState:
                                     continue
                                 peeked_bucket = get_card_bucket(card)
                                 if p_idx == self.player_id and h_idx in self.own_hand:
-                                    self.own_hand[h_idx] = KnownCardInfo(
-                                        bucket=peeked_bucket,
-                                        last_seen_turn=self._current_game_turn,
-                                        card=card,
-                                    )
-                                    logger.debug(
-                                        " Agent %d (%s) updated own idx %d knowledge to %s (%s).",
-                                        self.player_id,
-                                        type(action).__name__,
-                                        h_idx,
-                                        peeked_bucket.name,
-                                        card,
-                                    )
+                                    # Check if info is new
+                                    if (
+                                        self.own_hand[h_idx].bucket == CardBucket.UNKNOWN
+                                        or self.own_hand[h_idx].card is None
+                                    ):
+                                        logger.debug(
+                                            " Agent %d (%s) updated own idx %d knowledge to %s (%s).",
+                                            self.player_id,
+                                            type(action).__name__,
+                                            h_idx,
+                                            peeked_bucket.name,
+                                            card,
+                                        )
+                                        self.own_hand[h_idx] = KnownCardInfo(
+                                            bucket=peeked_bucket,
+                                            last_seen_turn=self._current_game_turn,
+                                            card=card,
+                                        )
+                                    else:  # Already knew card, just update timestamp if needed
+                                        self.own_hand[h_idx].last_seen_turn = (
+                                            self._current_game_turn
+                                        )
                                 elif (
                                     p_idx == self.opponent_id
                                     and h_idx in self.opponent_belief
                                 ):
-                                    self.opponent_belief[h_idx] = peeked_bucket
-                                    self.opponent_last_seen_turn[h_idx] = (
-                                        self._current_game_turn
-                                    )
-                                    logger.debug(
-                                        " Agent %d (%s) updated opp idx %d belief to %s (%s).",
-                                        self.player_id,
-                                        type(action).__name__,
-                                        h_idx,
-                                        peeked_bucket.name,
-                                        card,
-                                    )
+                                    # Check if info is new
+                                    if self.opponent_belief[h_idx] != peeked_bucket:
+                                        logger.debug(
+                                            " Agent %d (%s) updated opp idx %d belief from %s to %s (%s).",
+                                            self.player_id,
+                                            type(action).__name__,
+                                            h_idx,
+                                            (
+                                                self.opponent_belief[h_idx].name
+                                                if isinstance(
+                                                    self.opponent_belief[h_idx],
+                                                    (CardBucket, DecayCategory),
+                                                )
+                                                else self.opponent_belief[h_idx]
+                                            ),
+                                            peeked_bucket.name,
+                                            card,
+                                        )
+                                        self.opponent_belief[h_idx] = peeked_bucket
+                                        self.opponent_last_seen_turn[h_idx] = (
+                                            self._current_game_turn
+                                        )
+                                    else:  # No change in belief, just update timestamp
+                                        self.opponent_last_seen_turn[h_idx] = (
+                                            self._current_game_turn
+                                        )
 
                     elif isinstance(action, ActionAbilityPeekOtherSelect):
                         if observation.peeked_cards:
@@ -450,23 +552,37 @@ class AgentState:
                                     and h_idx in self.opponent_belief
                                 ):
                                     peeked_bucket = get_card_bucket(card)
-                                    self.opponent_belief[h_idx] = peeked_bucket
-                                    self.opponent_last_seen_turn[h_idx] = (
-                                        self._current_game_turn
-                                    )
-                                    logger.debug(
-                                        " Agent %d (PeekOther) updated opp idx %d belief to %s (%s).",
-                                        self.player_id,
-                                        h_idx,
-                                        peeked_bucket.name,
-                                        card,
-                                    )
+                                    if self.opponent_belief[h_idx] != peeked_bucket:
+                                        logger.debug(
+                                            " Agent %d (PeekOther) updated opp idx %d belief from %s to %s (%s).",
+                                            self.player_id,
+                                            h_idx,
+                                            (
+                                                self.opponent_belief[h_idx].name
+                                                if isinstance(
+                                                    self.opponent_belief[h_idx],
+                                                    (CardBucket, DecayCategory),
+                                                )
+                                                else self.opponent_belief[h_idx]
+                                            ),
+                                            peeked_bucket.name,
+                                            card,
+                                        )
+                                        self.opponent_belief[h_idx] = peeked_bucket
+                                        self.opponent_last_seen_turn[h_idx] = (
+                                            self._current_game_turn
+                                        )
+                                    else:  # No change in belief, just update timestamp
+                                        self.opponent_last_seen_turn[h_idx] = (
+                                            self._current_game_turn
+                                        )
 
                     elif isinstance(action, ActionAbilityBlindSwapSelect):
                         own_idx, opp_idx_target = (
                             action.own_hand_index,
                             action.opponent_hand_index,
                         )
+                        # Our own card becomes unknown
                         if own_idx in self.own_hand:
                             self.own_hand[own_idx] = KnownCardInfo(
                                 bucket=CardBucket.UNKNOWN,
@@ -478,10 +594,10 @@ class AgentState:
                                 self.player_id,
                                 own_idx,
                             )
-                        # Decay opponent belief at target index
+                        # Opponent's card belief decays
                         self._trigger_event_decay(
                             target_index=opp_idx_target,
-                            trigger_event="swap (blind)",
+                            trigger_event="swap (blind, self initiated)",
                             current_turn=self._current_game_turn,
                         )
 
@@ -489,31 +605,20 @@ class AgentState:
                         isinstance(action, ActionAbilityKingSwapDecision)
                         and action.perform_swap
                     ):
-                        # We performed the swap. We don't know what we received unless we remember the peek.
-                        # The card we gave away is now gone.
-                        # We need the indices involved, which aren't in this action type. Assume they were stored/passed correctly?
-                        # Best effort: Set both potentially involved indices (if remembered) to UNKNOWN.
-                        # This relies on state consistency, which might be flawed.
-                        # For now, just log. Precise update is complex without more context.
+                        # We initiated the swap. Our card becomes unknown. Opponent card decays.
+                        # Requires indices from the Look step. Assume they might be accessible.
+                        # For now, just log, as indices aren't directly in this action type observation.
+                        # own_involved_idx = ... # Get from somewhere?
+                        # opp_involved_idx = ... # Get from somewhere?
+                        # if own_involved_idx in self.own_hand:
+                        #     self.own_hand[own_involved_idx] = KnownCardInfo(bucket=CardBucket.UNKNOWN, ...)
+                        # self._trigger_event_decay(opp_involved_idx, "swap (king, self initiated)", ...)
                         logger.debug(
-                            " Agent %d observed self perform King Swap. Setting involved own card to UNKNOWN if index available.",
+                            " Agent %d observed self perform King Swap. Indices not available in obs - state update omitted.",
                             self.player_id,
                         )
-                        # If we stored the peeked indices in pending_action_data for the Decision step, we could use them here.
-                        # Example: own_involved_idx = self.pending_action_data.get("own_idx")
-                        #          opp_involved_idx = self.pending_action_data.get("opp_idx")
-                        #          if own_involved_idx in self.own_hand: self.own_hand[own_involved_idx] = KnownCardInfo(...) # Set to Unknown
-                        #          self._trigger_event_decay(opp_involved_idx, ...)
 
-                    elif isinstance(action, ActionSnapOwn):
-                        # Handled by reconciliation
-                        pass
-                    elif isinstance(action, ActionSnapOpponent):
-                        # Handled by reconciliation (opponent card removal) and subsequent move action
-                        pass
-                    elif isinstance(action, ActionSnapOpponentMove):
-                        # Handled by reconciliation (own card removal)
-                        pass
+                    # Snap actions affecting self (SnapOwn, SnapOpponentMove) handled by reconciliation
 
                 elif actor == self.opponent_id:
                     # Observe opponent actions
@@ -533,45 +638,43 @@ class AgentState:
                         # Decay opponent belief at their index
                         self._trigger_event_decay(
                             target_index=opp_own_idx,
-                            trigger_event="swap (blind, opponent)",
+                            trigger_event="swap (blind, opponent initiated)",
                             current_turn=self._current_game_turn,
                         )
                         # Update our own card to unknown
                         if our_idx in self.own_hand:
+                            # Only log if it was previously known
+                            if self.own_hand[our_idx].bucket != CardBucket.UNKNOWN:
+                                logger.debug(
+                                    " Agent %d updating own idx %d to UNKNOWN due to opponent BlindSwap.",
+                                    self.player_id,
+                                    our_idx,
+                                )
                             self.own_hand[our_idx] = KnownCardInfo(
                                 bucket=CardBucket.UNKNOWN,
                                 last_seen_turn=self._current_game_turn,
                                 card=None,
-                            )
-                            logger.debug(
-                                " Agent %d updated own idx %d to UNKNOWN due to opponent BlindSwap.",
-                                self.player_id,
-                                our_idx,
                             )
 
                     elif (
                         isinstance(action, ActionAbilityKingSwapDecision)
                         and action.perform_swap
                     ):
-                        # Opponent performed swap. We don't know which of their cards unless we peeked.
-                        # We only know if *our* card was involved if it was part of the peek observation *for them*.
-                        # Without that info, we can only assume an opponent swap occurred.
+                        # Opponent performed swap. Decay their involved card belief.
+                        # Update our card to UNKNOWN *if* it was involved.
+                        # Again, indices aren't directly available here.
+                        # opp_involved_idx = ... # Get from somewhere?
+                        # our_involved_idx = ... # Get from somewhere?
+                        # self._trigger_event_decay(opp_involved_idx, "swap (king, opponent initiated)", ...)
+                        # if our_involved_idx in self.own_hand: self.own_hand[our_involved_idx] = KnownCardInfo(...)
                         logger.debug(
-                            " Agent %d observed opponent King Swap.", self.player_id
+                            " Agent %d observed opponent King Swap. Indices not available in obs - state update omitted.",
+                            self.player_id,
                         )
-                        # Decay triggered if our card was involved? Cannot know from this obs alone.
 
-                    elif isinstance(action, ActionSnapOwn):
-                        # Handled by reconciliation (opponent count change)
-                        pass
-                    elif isinstance(action, ActionSnapOpponent):
-                        # Handled by reconciliation (our count change) and move action
-                        pass
-                    elif isinstance(action, ActionSnapOpponentMove):
-                        # Handled by reconciliation (opponent count change)
-                        pass
+                    # Snap actions affecting opponent (SnapOwn, SnapOpponentMove) handled by reconciliation
 
-                    # Opponent discard/peek doesn't directly reveal info unless card known
+                    # Opponent discard/peek doesn't reveal info unless the card was already known to us.
 
             except Exception as e_action_proc:
                 logger.error(
@@ -587,198 +690,137 @@ class AgentState:
         if self.memory_level == 2:
             self._apply_time_decay(self._current_game_turn)
 
+        # --- 6. Final Sanity Check ---
+        # Ensure internal counts match observed counts after all updates
+        final_own_count = len(self.own_hand)
+        final_opp_count = len(self.opponent_belief)
+        if final_own_count != observed_own_count or final_opp_count != observed_opp_count:
+            logger.error(
+                "Agent %d T%d: FINAL STATE COUNT MISMATCH! Own: Expected %d, Got %d. Opp: Expected %d, Got %d. State likely corrupted.",
+                self.player_id,
+                self._current_game_turn,
+                observed_own_count,
+                final_own_count,
+                observed_opp_count,
+                final_opp_count,
+            )
+            # Attempt recovery? Reset counts? For now, log error.
+
         logger.debug(" Update Complete. State: %s", self)
 
-    def _rebuild_hand_state(
+    def _rebuild_hand_state_new(
         self,
-        original_dict: Dict[int, KnownCardInfo],
+        original_dict: Dict[int, Any],  # Can be KnownCardInfo or belief
         removed_indices: Set[int],
-        expected_count: int,
-        added_count: int,  # Number of new unknown cards added (e.g., penalty)
-        is_own_hand: bool,
-    ) -> Optional[Dict[int, KnownCardInfo]]:
-        """Rebuilds hand state ensuring contiguous indices 0..N-1, handling adds/removals."""
-        new_dict: Dict[int, KnownCardInfo] = {}
-        current_items = []
-        player_desc = "Own" if is_own_hand else "Opponent"  # Should always be Own
-
-        # Collect valid items from original dict, excluding removed ones
+        expected_final_count: int,
+        added_placeholder_count: int,
+        placeholder_value: Any,
+    ) -> Dict[int, Any]:
+        """
+        Rebuilds a state dictionary (own_hand or opponent_belief) ensuring
+        contiguous indices [0..N-1], handling removals and additions.
+        """
+        new_dict: Dict[int, Any] = {}
+        items_to_keep = []
         original_indices_sorted = sorted(original_dict.keys())
-        logger.debug(
-            "  Rebuild %s Hand - Original Indices: %s, Removing: %s",
-            player_desc,
-            original_indices_sorted,
-            removed_indices,
-        )
+
+        # 1. Collect items that are kept
         for idx in original_indices_sorted:
             if idx not in removed_indices:
-                current_items.append(original_dict[idx])
+                items_to_keep.append(original_dict[idx])
 
-        effective_expected_count = (
-            expected_count  # This is the final count after adds/removes
+        # 2. Add new placeholder items
+        items_to_keep.extend(
+            [copy.copy(placeholder_value) for _ in range(added_placeholder_count)]
         )
 
-        # Check consistency before adding penalty cards
-        expected_count_before_adds = len(original_dict) - len(removed_indices)
-        if len(current_items) != expected_count_before_adds:
-            logger.error(
-                "Rebuild %s Hand T%d: Inconsistency! Items after removal (%d) != expected before adds (%d). Removed: %s, Original Indices: %s",
-                player_desc,
-                self._current_game_turn,
-                len(current_items),
-                expected_count_before_adds,
-                removed_indices,
-                original_indices_sorted,
-            )
-            # Attempt to proceed, but state might be wrong
-
-        # Add placeholders for new cards (penalty) - append to the end conceptually
-        for _ in range(added_count):
-            current_items.append(
-                KnownCardInfo(
-                    bucket=CardBucket.UNKNOWN,
-                    last_seen_turn=self._current_game_turn,
-                    card=None,
-                )
-            )
-            logger.debug(" -> Added placeholder for penalty/new card.")
-
-        # Assign items to new contiguous indices up to the final expected count
-        final_item_count = len(current_items)
-        for i, item in enumerate(current_items):
-            if i < effective_expected_count:
-                new_dict[i] = item
+        # 3. Assign to new dictionary with contiguous indices
+        current_total_items = len(items_to_keep)
+        for new_idx, item in enumerate(items_to_keep):
+            # Only assign up to the expected final count
+            if new_idx < expected_final_count:
+                new_dict[new_idx] = item
             else:
-                # This error means adds+removes didn't match final expected count
-                logger.error(
-                    "Rebuild %s Hand T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra. Removed: %s, Added: %d, Original Indices: %s",
-                    player_desc,
+                # This indicates an inconsistency between removals/adds and expected count
+                logger.warning(
+                    "Rebuild state T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra item %s. Removed: %s, Added: %d, Original Indices: %s",
                     self._current_game_turn,
-                    final_item_count,
-                    effective_expected_count,
+                    current_total_items,
+                    expected_final_count,
+                    item,
                     removed_indices,
-                    added_count,
+                    added_placeholder_count,
                     original_indices_sorted,
                 )
                 break  # Stop adding extra items
 
-        # Final check - if dict size doesn't match expected count, something went wrong
-        if len(new_dict) != effective_expected_count:
-            logger.critical(
-                "FATAL: %s hand final rebuild T%d failed. Expected %d, got %d. Indices: %s. State likely corrupt!",
-                player_desc,
-                self._current_game_turn,
-                effective_expected_count,
-                len(new_dict),
-                sorted(new_dict.keys()),
-            )
-            # Return a default state to prevent downstream crashes? Difficult choice. Return None?
-            # For now, log critical error and return the potentially incorrect dict.
-            # Consider returning None or raising an exception in future if this proves too problematic.
-            # return None
-            # Fallback: create default dict of expected size
-            # return {i: KnownCardInfo(bucket=CardBucket.UNKNOWN, last_seen_turn=self._current_game_turn) for i in range(effective_expected_count)}
-
-        logger.debug(
-            "  Rebuild %s Hand - Final Indices: %s (Count: %d)",
-            player_desc,
-            sorted(new_dict.keys()),
-            len(new_dict),
+        # 4. Final assertion for consistency
+        final_count = len(new_dict)
+        assert final_count == expected_final_count, (
+            f"Rebuild state T{self._current_game_turn} failed! Expected final count {expected_final_count}, got {final_count}. "
+            f"Original indices: {original_indices_sorted}, Removed: {removed_indices}, Added: {added_placeholder_count}. Final keys: {sorted(new_dict.keys())}"
         )
+
         return new_dict
 
-    def _rebuild_belief_state(
+    def _rebuild_belief_state_new(
         self,
         original_belief_dict: Dict[int, Union[CardBucket, DecayCategory]],
         original_last_seen_dict: Dict[int, int],
         removed_indices: Set[int],
-        expected_count: int,
-        added_count: int,
-    ) -> Optional[Tuple[Dict[int, Union[CardBucket, DecayCategory]], Dict[int, int]]]:
-        """Rebuilds opponent_belief and opponent_last_seen_turn ensuring contiguous indices."""
-        new_belief_dict: Dict[int, Union[CardBucket, DecayCategory]] = {}
-        new_last_seen_dict: Dict[int, int] = {}
-        current_belief_items = []
-        current_last_seen_mapping = {}  # Maps OLD index -> last_seen
-
+        expected_final_count: int,
+        added_placeholder_count: int,
+        placeholder_value: Union[CardBucket, DecayCategory],
+    ) -> Tuple[Dict[int, Union[CardBucket, DecayCategory]], Dict[int, int]]:
+        """Rebuilds opponent_belief and preserves/transfers last_seen timestamps."""
+        new_belief: Dict[int, Union[CardBucket, DecayCategory]] = {}
+        new_last_seen: Dict[int, int] = {}
+        items_to_keep = []
         original_indices_sorted = sorted(original_belief_dict.keys())
-        logger.debug(
-            "  Rebuild Opp Belief - Original Indices: %s, Removing: %s",
-            original_indices_sorted,
-            removed_indices,
+
+        # 1. Collect kept beliefs and their original indices/timestamps
+        original_idx_map = {}  # Map: position in items_to_keep -> original_index
+        for i, idx in enumerate(original_indices_sorted):
+            if idx not in removed_indices:
+                items_to_keep.append(original_belief_dict[idx])
+                original_idx_map[len(items_to_keep) - 1] = idx  # Store original index
+
+        # 2. Add placeholders
+        items_to_keep.extend(
+            [copy.copy(placeholder_value) for _ in range(added_placeholder_count)]
         )
 
-        # Collect valid items and their original last_seen timestamps
-        for idx in original_indices_sorted:
-            if idx not in removed_indices:
-                current_belief_items.append(original_belief_dict[idx])
-                if idx in original_last_seen_dict:
-                    current_last_seen_mapping[idx] = original_last_seen_dict[idx]
-
-        # Add placeholders for new (penalty) cards
-        for _ in range(added_count):
-            current_belief_items.append(CardBucket.UNKNOWN)
-            logger.debug(" -> Added UNKNOWN placeholder for opponent penalty/new card.")
-
-        # Assign items to new contiguous indices
-        final_item_count = len(current_belief_items)
-        effective_expected_count = expected_count
-
-        # Map old indices that were kept to their corresponding item in current_belief_items
-        old_indices_kept = [
-            idx for idx in original_indices_sorted if idx not in removed_indices
-        ]
-
-        for i, belief in enumerate(current_belief_items):
-            if i < effective_expected_count:
-                new_belief_dict[i] = belief
-                # Restore last_seen timestamp ONLY if this belief came from the original dict
-                # New penalty cards (UNKNOWN) should not have a timestamp yet.
-                if i < len(
-                    old_indices_kept
-                ):  # Check if this index corresponds to an original kept item
-                    original_idx = old_indices_kept[i]
-                    if original_idx in current_last_seen_mapping:
-                        new_last_seen_dict[i] = current_last_seen_mapping[original_idx]
+        # 3. Assign to new dictionaries
+        current_total_items = len(items_to_keep)
+        for new_idx, item in enumerate(items_to_keep):
+            if new_idx < expected_final_count:
+                new_belief[new_idx] = item
+                # If this item came from the original dict, restore its timestamp
+                if new_idx in original_idx_map:
+                    original_idx = original_idx_map[new_idx]
+                    if original_idx in original_last_seen_dict:
+                        new_last_seen[new_idx] = original_last_seen_dict[original_idx]
             else:
-                logger.error(
-                    "Rebuild Opponent Belief T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra. Removed: %s, Added: %d, Original Indices: %s",
+                logger.warning(
+                    "Rebuild Opp Belief T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra item %s. Removed: %s, Added: %d, Original Indices: %s",
                     self._current_game_turn,
-                    final_item_count,
-                    effective_expected_count,
+                    current_total_items,
+                    expected_final_count,
+                    item,
                     removed_indices,
-                    added_count,
+                    added_placeholder_count,
                     original_indices_sorted,
                 )
                 break
 
-        # Final check
-        if len(new_belief_dict) != effective_expected_count:
-            logger.critical(
-                "FATAL: Opponent belief final rebuild T%d failed. Expected %d, got %d. Indices: %s. State likely corrupt!",
-                self._current_game_turn,
-                effective_expected_count,
-                len(new_belief_dict),
-                sorted(new_belief_dict.keys()),
-            )
-            # return None, None # Indicate failure
-            # Fallback:
-            new_belief_dict = {
-                i: CardBucket.UNKNOWN for i in range(effective_expected_count)
-            }
-            new_last_seen_dict = {}
-
-        logger.debug(
-            "  Rebuild Opp Belief - Final Indices: %s (Count: %d)",
-            sorted(new_belief_dict.keys()),
-            len(new_belief_dict),
+        # 4. Final assertion
+        final_count = len(new_belief)
+        assert final_count == expected_final_count, (
+            f"Rebuild Opp Belief T{self._current_game_turn} failed! Expected final count {expected_final_count}, got {final_count}. "
+            f"Original indices: {original_indices_sorted}, Removed: {removed_indices}, Added: {added_placeholder_count}. Final keys: {sorted(new_belief.keys())}"
         )
-        # Ensure last_seen only contains keys present in the final belief dict
-        valid_last_seen = {
-            k: v for k, v in new_last_seen_dict.items() if k in new_belief_dict
-        }
 
-        return new_belief_dict, valid_last_seen
+        return new_belief, new_last_seen
 
     def _estimate_stockpile(self, stock_size: int) -> StockpileEstimate:
         """Estimates stockpile category based on size."""
@@ -825,14 +867,25 @@ class AgentState:
         if self.memory_level == 0:
             return
 
-        if target_index in self.opponent_belief:
-            current_belief = self.opponent_belief[target_index]
-            # Only decay if current belief is specific (CardBucket, not UNKNOWN or DecayCategory)
-            if (
-                isinstance(current_belief, CardBucket)
-                and current_belief != CardBucket.UNKNOWN
-            ):
-                decayed_category = decay_bucket(current_belief)
+        # Ensure index exists before attempting decay
+        if target_index not in self.opponent_belief:
+            logger.debug(
+                " Agent %d Decay trigger skipped: Index %d not in opponent belief %s.",
+                self.player_id,
+                target_index,
+                list(self.opponent_belief.keys()),
+            )
+            return
+
+        current_belief = self.opponent_belief[target_index]
+        # Only decay if current belief is specific (CardBucket, not UNKNOWN or DecayCategory)
+        if (
+            isinstance(current_belief, CardBucket)
+            and current_belief != CardBucket.UNKNOWN
+        ):
+            decayed_category = decay_bucket(current_belief)
+            # Only update if decay actually changes the category
+            if decayed_category != current_belief:
                 self.opponent_belief[target_index] = decayed_category
                 self.opponent_last_seen_turn.pop(
                     target_index, None
@@ -845,8 +898,7 @@ class AgentState:
                     decayed_category.name,
                     trigger_event,
                 )
-            # else: logger.debug(" Decay trigger skipped for Opponent[%d]: Already %s.", target_index, current_belief.name) # Too noisy
-        # else: logger.debug(" Decay trigger skipped: Index %d not in opponent belief %s.", target_index, list(self.opponent_belief.keys()))
+        # else: logger.debug(" Decay trigger skipped for Opponent[%d]: Already %s.", target_index, current_belief.name) # Too noisy
 
     def _apply_time_decay(self, current_turn: int):
         """Applies time-based decay (Level 2 only)."""
@@ -860,37 +912,58 @@ class AgentState:
             and idx in self.opponent_belief  # Check if index still exists
             and isinstance(
                 self.opponent_belief[idx], CardBucket
-            )  # Check not already decayed
+            )  # Check not already decayed category
             and self.opponent_belief[idx] != CardBucket.UNKNOWN
         ]
 
         for idx in indices_to_decay:
             current_belief = self.opponent_belief[idx]
             decayed_category = decay_bucket(current_belief)
-            self.opponent_belief[idx] = decayed_category
-            self.opponent_last_seen_turn.pop(idx)  # Remove timestamp after decay
-            logger.debug(
-                " Agent %d applying time decay for Opponent[%d] from %s to %s.",
-                self.player_id,
-                idx,
-                current_belief.name,
-                decayed_category.name,
-            )
+            if decayed_category != current_belief:  # Only decay if it changes category
+                self.opponent_belief[idx] = decayed_category
+                self.opponent_last_seen_turn.pop(idx)  # Remove timestamp after decay
+                logger.debug(
+                    " Agent %d applying time decay for Opponent[%d] from %s to %s.",
+                    self.player_id,
+                    idx,
+                    current_belief.name,
+                    decayed_category.name,
+                )
 
     def get_infoset_key(self) -> Tuple:  # Return plain tuple for direct use
         """Constructs the canonical, hashable infoset key tuple from the current belief state."""
         try:
             # 1. Own Hand Buckets (Tuple sorted by index)
-            own_hand_items = sorted(self.own_hand.items())
-            own_hand_buckets = tuple(info.bucket.value for _, info in own_hand_items)
+            # Ensure own_hand indices are contiguous 0..N-1
+            own_hand_buckets = [CardBucket.UNKNOWN.value] * len(self.own_hand)
+            for i, info in self.own_hand.items():
+                if 0 <= i < len(own_hand_buckets):
+                    own_hand_buckets[i] = info.bucket.value
+                else:
+                    logger.error(
+                        "Infoset Key: Own hand index %d out of bounds (size %d)",
+                        i,
+                        len(self.own_hand),
+                    )
+            own_hand_tuple = tuple(own_hand_buckets)
 
             # 2. Opponent Beliefs (Tuple indexed 0..N-1)
-            opp_belief_values = []
-            for i in range(self.opponent_card_count):  # Use reconciled count
-                belief = self.opponent_belief.get(i, CardBucket.UNKNOWN)
-                opp_belief_values.append(
-                    belief.value if hasattr(belief, "value") else CardBucket.UNKNOWN.value
-                )
+            opp_belief_values = [
+                CardBucket.UNKNOWN.value
+            ] * self.opponent_card_count  # Use reconciled count
+            for i, belief in self.opponent_belief.items():
+                if 0 <= i < self.opponent_card_count:
+                    opp_belief_values[i] = (
+                        belief.value
+                        if hasattr(belief, "value")
+                        else CardBucket.UNKNOWN.value
+                    )
+                else:
+                    logger.error(
+                        "Infoset Key: Opponent belief index %d out of bounds (count %d)",
+                        i,
+                        self.opponent_card_count,
+                    )
             opp_belief_tuple = tuple(opp_belief_values)
 
             # 3. Other components
@@ -901,7 +974,7 @@ class AgentState:
             # DecisionContext is added externally by the calling function
 
             key_tuple = (
-                own_hand_buckets,
+                own_hand_tuple,
                 opp_belief_tuple,
                 opp_count,
                 discard_top_val,
@@ -911,10 +984,11 @@ class AgentState:
             return key_tuple
         except Exception as e_key:
             logger.exception(
-                "Agent %d: Error generating infoset key tuple T%d: %s",
+                "Agent %d: Error generating infoset key tuple T%d: %s. Current State: %s",
                 self.player_id,
                 self._current_game_turn,
                 e_key,
+                self,
             )
             # Return a default/error tuple
             return ((-99,), (-99,), -1, -1, -1, -1)
@@ -953,8 +1027,17 @@ class AgentState:
             )
             return []
 
-        for idx, belief in self.opponent_belief.items():
-            if belief == CardBucket.UNKNOWN or isinstance(belief, DecayCategory):
+        # Use the reconciled opponent_card_count
+        for idx in range(self.opponent_card_count):
+            belief = self.opponent_belief.get(idx)  # Use get() for safety
+            if belief is None:  # Should not happen if rebuild is correct
+                logger.warning(
+                    "Agent %d: Missing belief for opponent index %d.", self.player_id, idx
+                )
+                matching_indices.append(
+                    idx
+                )  # Assume could match if missing? Or error? Assume match for now.
+            elif belief == CardBucket.UNKNOWN or isinstance(belief, DecayCategory):
                 matching_indices.append(idx)  # Assume unknown/decayed *could* match
             elif isinstance(belief, CardBucket) and belief in target_buckets:
                 matching_indices.append(idx)
@@ -992,14 +1075,21 @@ class AgentState:
     def __str__(self) -> str:
         """Provides a concise string representation of the agent's belief state."""
         try:
-            own_hand_str = {k: v.bucket.name for k, v in sorted(self.own_hand.items())}
-            opp_belief_str = {
-                i: self.opponent_belief.get(i, CardBucket.UNKNOWN).name
-                for i in range(self.opponent_card_count)
-            }
+            own_hand_repr = {}
+            for i in range(len(self.own_hand)):  # Iterate based on size
+                info = self.own_hand.get(i)
+                own_hand_repr[i] = info.bucket.name if info else "MISSING"
+
+            opp_belief_repr = {}
+            for i in range(self.opponent_card_count):  # Iterate based on count
+                belief = self.opponent_belief.get(i, CardBucket.UNKNOWN)
+                opp_belief_repr[i] = (
+                    belief.name if hasattr(belief, "name") else repr(belief)
+                )
+
             return (
                 f"AgentState(P{self.player_id}, T:{self._current_game_turn}, Phase:{self.game_phase.name}, "
-                f"OH({len(self.own_hand)}):{own_hand_str}, OB({self.opponent_card_count}):{opp_belief_str}, "
+                f"OH({len(self.own_hand)}):{own_hand_repr}, OB({self.opponent_card_count}):{opp_belief_repr}, "
                 f"Disc:{self.known_discard_top_bucket.name}, Stock:{self.stockpile_estimate.name}, Cambia:{self.cambia_caller})"
             )
         except Exception as e_str:

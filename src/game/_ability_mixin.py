@@ -107,7 +107,26 @@ class AbilityMixin:
                 legal_actions.add(ActionDiscard(use_ability=False))
                 drawn_card = self.pending_action_data.get("drawn_card")
                 if drawn_card and card_has_discard_ability(drawn_card):
-                    legal_actions.add(ActionDiscard(use_ability=True))
+                    # Check if ability *can* be used (e.g., non-empty hands for swap/peek)
+                    rank = drawn_card.rank
+                    can_use = True
+                    if rank in [SEVEN, EIGHT] and player_hand_count == 0:
+                        can_use = False
+                    if rank in [NINE, TEN] and opponent_hand_count == 0:
+                        can_use = False
+                    if rank in [JACK, QUEEN, KING] and (
+                        player_hand_count == 0 or opponent_hand_count == 0
+                    ):
+                        can_use = False
+
+                    if can_use:
+                        legal_actions.add(ActionDiscard(use_ability=True))
+                    else:
+                        logger.debug(
+                            "Ability card %s drawn, but cannot use ability due to empty hand(s).",
+                            drawn_card,
+                        )
+
                 # Add Replace actions only if hand has cards
                 if player_hand_count > 0:
                     for i in range(player_hand_count):
@@ -121,6 +140,9 @@ class AbilityMixin:
                     logger.debug(
                         "Cannot generate PeekOwn actions: P%d has 0 cards.", player
                     )
+                    # If no actions possible, this pending state is stuck. Engine needs to handle?
+                    # Add a Pass action? No, ability should fizzle.
+                    pass
 
             elif isinstance(action_type, ActionAbilityPeekOtherSelect):  # 9/T Peek Choice
                 if opponent_hand_count > 0:
@@ -132,6 +154,7 @@ class AbilityMixin:
                     logger.debug(
                         "Cannot generate PeekOther actions: Opponent has 0 cards."
                     )
+                    # Ability fizzles
 
             elif isinstance(action_type, ActionAbilityBlindSwapSelect):  # J/Q Swap Choice
                 if player_hand_count > 0 and opponent_hand_count > 0:
@@ -149,6 +172,7 @@ class AbilityMixin:
                         player_hand_count,
                         opponent_hand_count,
                     )
+                    # Ability fizzles
 
             elif isinstance(action_type, ActionAbilityKingLookSelect):  # K Look Choice
                 if player_hand_count > 0 and opponent_hand_count > 0:
@@ -166,6 +190,7 @@ class AbilityMixin:
                         player_hand_count,
                         opponent_hand_count,
                     )
+                    # Ability fizzles
 
             elif isinstance(
                 action_type, ActionAbilityKingSwapDecision
@@ -181,6 +206,7 @@ class AbilityMixin:
                     logger.error(
                         "Missing/invalid target_empty_slot_index for legal SnapOpponentMove actions."
                     )
+                    # Ability fizzles / Snap state error
                 elif player_hand_count > 0:
                     for i in range(player_hand_count):
                         legal_actions.add(
@@ -194,6 +220,7 @@ class AbilityMixin:
                         "Cannot generate SnapMove actions: P%d has no cards to move.",
                         player,
                     )
+                    # Snap state error - player should have had cards to initiate snap
 
             else:
                 logger.error(
@@ -217,14 +244,14 @@ class AbilityMixin:
             )
 
         # If no actions generated (e.g. 0 cards for required action), handle gracefully
-        if not legal_actions:
+        if not legal_actions and self.pending_action:
             logger.warning(
-                "No legal actions generated for P%d in pending state %s (Likely 0 cards?).",
+                "No legal actions generated for P%d in pending state %s (Likely 0 cards?). Ability may fizzle.",
                 player,
                 type(action_type).__name__,
             )
-            # Depending on the specific pending action, maybe a default action (like 'do nothing' or 'pass') should exist?
-            # For now, returning empty set implies the game engine needs to handle this potentially stalled state.
+            # Return empty set - the caller (_handle_pending_action) should handle this
+            # by clearing the pending state (fizzling the ability).
 
         return legal_actions
 
@@ -277,6 +304,36 @@ class AbilityMixin:
         player = self.pending_action_player
         card_just_discarded_for_snap_check: Optional[Card] = None
 
+        # Check if action is legal for current pending state
+        legal_pending_actions = self._get_legal_pending_actions(acting_player)
+        if action not in legal_pending_actions:
+            # Handle cases where no legal actions exist (ability fizzles)
+            if not legal_pending_actions:
+                logger.warning(
+                    "Ability/Pending action for P%d (%s) has no legal actions. Fizzling.",
+                    player,
+                    type(pending_type).__name__,
+                )
+                # Return the card discarded that *triggered* this pending state, if available
+                # This allows snap checks even if the ability fizzles.
+                card_that_triggered = self.pending_action_data.get("ability_card")
+                if not isinstance(card_that_triggered, Card):
+                    card_that_triggered = self.get_discard_top()  # Last resort fallback
+
+                self._clear_pending_action(undo_stack, delta_list)
+                return (
+                    card_that_triggered  # Return card that triggered this for snap check
+                )
+            else:
+                logger.warning(
+                    "Invalid action %s for P%d pending state %s. Legal: %s. Waiting.",
+                    action,
+                    player,
+                    type(pending_type).__name__,
+                    legal_pending_actions,
+                )
+                return None  # Wait for a valid action
+
         try:
             # --- Handle Post-Draw Choices (Discard/Replace) ---
             if isinstance(pending_type, ActionDiscard):
@@ -299,19 +356,20 @@ class AbilityMixin:
                         action.use_ability,
                     )
                     original_discard_len = len(self.discard_pile)
+                    original_discard_top = self.get_discard_top()
 
                     def change_discard():
                         self.discard_pile.append(drawn_card)
 
                     def undo_discard():
-                        if self.discard_pile and self.discard_pile[-1] is drawn_card:
-                            self.discard_pile.pop()
-                        else:
-                            logger.warning(
-                                "Undo Discard mismatch/pile empty. Discard Top: %s, Expected: %s",
-                                self.discard_pile[-1] if self.discard_pile else "Empty",
-                                drawn_card,
-                            )
+                        # Assert preconditions for undo
+                        assert (
+                            self.discard_pile and self.discard_pile[-1] is drawn_card
+                        ), f"Undo Discard: Top card mismatch (Expected {drawn_card}, Got {self.discard_pile[-1] if self.discard_pile else 'Empty'})"
+                        self.discard_pile.pop()
+                        # Assert postconditions
+                        assert len(self.discard_pile) == original_discard_len
+                        assert self.get_discard_top() is original_discard_top
 
                     self._add_change(
                         change_discard,
@@ -341,95 +399,8 @@ class AbilityMixin:
                 elif isinstance(action, ActionReplace):
                     target_idx = action.target_hand_index
                     hand = self.players[player].hand
-                    if 0 <= target_idx < len(hand):
-                        replaced_card = hand[target_idx]
-                        if not isinstance(replaced_card, Card):
-                            logger.error(
-                                "Replace target index %d holds non-Card object: %s",
-                                target_idx,
-                                replaced_card,
-                            )
-                            self._clear_pending_action(undo_stack, delta_list)
-                            return None
-
-                        logger.debug(
-                            "P%d replaces card at index %d (%s) with drawn %s.",
-                            player,
-                            target_idx,
-                            replaced_card,
-                            drawn_card,
-                        )
-                        original_card_in_hand = hand[target_idx]
-                        original_discard_len = len(self.discard_pile)
-
-                        def change_replace():
-                            if (
-                                0 <= target_idx < len(self.players[player].hand)
-                                and self.players[player].hand[target_idx]
-                                is original_card_in_hand
-                            ):
-                                self.players[player].hand[target_idx] = drawn_card
-                                self.discard_pile.append(replaced_card)
-                            else:
-                                logger.error(
-                                    "Change Replace Error: Hand state changed unexpectedly before replace."
-                                )
-
-                        def undo_replace():
-                            if (
-                                self.discard_pile
-                                and self.discard_pile[-1] is replaced_card
-                            ):
-                                self.discard_pile.pop()
-                                if (
-                                    0 <= target_idx < len(self.players[player].hand)
-                                    and self.players[player].hand[target_idx]
-                                    is drawn_card
-                                ):
-                                    self.players[player].hand[
-                                        target_idx
-                                    ] = original_card_in_hand
-                                else:
-                                    logger.warning(
-                                        "Undo Replace hand restore mismatch. Hand[%d]: %s, Expected: %s",
-                                        target_idx,
-                                        (
-                                            self.players[player].hand[target_idx]
-                                            if 0
-                                            <= target_idx
-                                            < len(self.players[player].hand)
-                                            else "OOB"
-                                        ),
-                                        drawn_card,
-                                    )
-                            else:
-                                logger.warning(
-                                    "Undo Replace discard pop mismatch. Discard Top: %s, Expected: %s",
-                                    (
-                                        self.discard_pile[-1]
-                                        if self.discard_pile
-                                        else "Empty"
-                                    ),
-                                    replaced_card,
-                                )
-
-                        delta_replace = (
-                            "replace_discard",
-                            player,
-                            target_idx,
-                            serialize_card(drawn_card),
-                            serialize_card(replaced_card),
-                        )
-                        self._add_change(
-                            change_replace,
-                            undo_replace,
-                            delta_replace,
-                            undo_stack,
-                            delta_list,
-                        )
-                        card_just_discarded_for_snap_check = replaced_card
-                        self._clear_pending_action(undo_stack, delta_list)
-                    else:
+                    # Ensure hand and index are valid before proceeding
+                    if not (0 <= target_idx < len(hand)):
                         logger.error(
                             "Invalid REPLACE action index: %d for hand size %d",
                             target_idx,
@@ -437,20 +408,104 @@ class AbilityMixin:
                         )
                         return None  # Invalid choice
 
+                    replaced_card = hand[target_idx]
+                    if not isinstance(replaced_card, Card):
+                        logger.error(
+                            "Replace target index %d holds non-Card object: %s",
+                            target_idx,
+                            replaced_card,
+                        )
+                        self._clear_pending_action(undo_stack, delta_list)
+                        return None
+
+                    logger.debug(
+                        "P%d replaces card at index %d (%s) with drawn %s.",
+                        player,
+                        target_idx,
+                        replaced_card,
+                        drawn_card,
+                    )
+                    original_card_in_hand = hand[
+                        target_idx
+                    ]  # Capture original card *at the index*
+                    original_hand_state = list(
+                        hand
+                    )  # Capture full hand state for undo check
+                    original_discard_len = len(self.discard_pile)
+                    original_discard_top = self.get_discard_top()
+
+                    def change_replace():
+                        # Check index valid and card is still the same before modifying
+                        if (
+                            0 <= target_idx < len(self.players[player].hand)
+                            and self.players[player].hand[target_idx]
+                            is original_card_in_hand
+                        ):
+                            self.players[player].hand[target_idx] = drawn_card
+                            self.discard_pile.append(replaced_card)
+                        else:
+                            logger.error(
+                                "Change Replace Error: Hand state changed unexpectedly before replace. Hand[%d] is %s, expected %s",
+                                target_idx,
+                                (
+                                    self.players[player].hand[target_idx]
+                                    if 0 <= target_idx < len(self.players[player].hand)
+                                    else "OOB"
+                                ),
+                                original_card_in_hand,
+                            )
+                            # Avoid modifying state if precondition fails
+
+                    def undo_replace():
+                        # Assert preconditions for undo
+                        assert (
+                            self.discard_pile and self.discard_pile[-1] is replaced_card
+                        ), f"Undo Replace: Discard top mismatch (Expected {replaced_card}, Got {self.discard_pile[-1] if self.discard_pile else 'Empty'})"
+                        popped_discard = self.discard_pile.pop()
+
+                        assert (
+                            0 <= target_idx < len(self.players[player].hand)
+                            and self.players[player].hand[target_idx] is drawn_card
+                        ), f"Undo Replace: Hand content mismatch at index {target_idx} (Expected {drawn_card}, Got {self.players[player].hand[target_idx]})"
+                        self.players[player].hand[
+                            target_idx
+                        ] = original_card_in_hand  # Restore original card
+
+                        # Assert postconditions
+                        assert len(self.discard_pile) == original_discard_len
+                        assert self.get_discard_top() is original_discard_top
+                        assert (
+                            self.players[player].hand == original_hand_state
+                        ), f"Undo Replace: Hand state mismatch! Expected {original_hand_state}, Got {self.players[player].hand}"
+
+                    delta_replace = (
+                        "replace_discard",
+                        player,
+                        target_idx,
+                        serialize_card(drawn_card),
+                        serialize_card(replaced_card),
+                    )
+                    self._add_change(
+                        change_replace,
+                        undo_replace,
+                        delta_replace,
+                        undo_stack,
+                        delta_list,
+                    )
+                    card_just_discarded_for_snap_check = replaced_card
+                    self._clear_pending_action(undo_stack, delta_list)
+
                 else:
-                    logger.warning(
-                        "Received action %s while expecting post-draw Discard/Replace.",
+                    # This path is now unreachable due to the legal action check at the start
+                    logger.error(
+                        "INTERNAL ERROR: Reached unexpected action %s handling Post-Draw state.",
                         action,
                     )
                     return None
 
             # --- Handle Ability Selections ---
             elif isinstance(pending_type, ActionAbilityPeekOwnSelect):
-                if not isinstance(action, ActionAbilityPeekOwnSelect):
-                    logger.warning(
-                        "Expected PeekOwnSelect action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionAbilityPeekOwnSelect by initial check
                 target_idx = action.target_hand_index
                 hand = self.players[player].hand
                 peeked_card_str = "ERROR"
@@ -458,38 +513,34 @@ class AbilityMixin:
                     peeked_card = hand[target_idx]
                     if isinstance(peeked_card, Card):
                         peeked_card_str = serialize_card(peeked_card)
-                    else:
+                        logger.info(
+                            "P%d uses 7/8 ability, peeks own card %d: %s",
+                            player,
+                            target_idx,
+                            peeked_card_str,
+                        )
+                        delta_list.append(
+                            ("peek_own", player, target_idx, peeked_card_str)
+                        )
+                    else:  # Should not happen if hand state is correct
                         logger.error(
                             "Peek Own Error: Item at index %d is not Card: %s",
                             target_idx,
                             peeked_card,
                         )
-                    logger.info(
-                        "P%d uses 7/8 ability, peeks own card %d: %s",
-                        player,
-                        target_idx,
-                        peeked_card_str,
-                    )
-                    delta_list.append(("peek_own", player, target_idx, peeked_card_str))
-                else:
-                    # Log error but still clear pending state as ability fizzles
+                        delta_list.append(("peek_own_fail", player, target_idx))
+                else:  # Should not happen if legal actions generated correctly
                     logger.error(
                         "Invalid PEEK_OWN index %d for hand size %d",
                         target_idx,
                         len(hand),
                     )
-                    delta_list.append(
-                        ("peek_own_fail", player, target_idx)
-                    )  # Log failure
+                    delta_list.append(("peek_own_fail", player, target_idx))
                 card_just_discarded_for_snap_check = self.get_discard_top()
                 self._clear_pending_action(undo_stack, delta_list)
 
             elif isinstance(pending_type, ActionAbilityPeekOtherSelect):
-                if not isinstance(action, ActionAbilityPeekOtherSelect):
-                    logger.warning(
-                        "Expected PeekOtherSelect action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionAbilityPeekOtherSelect
                 opp_idx = self.get_opponent_index(player)
                 target_opp_idx = action.target_opponent_hand_index
                 peeked_card_str = "ERROR"
@@ -501,28 +552,31 @@ class AbilityMixin:
                         peeked_card = opp_hand[target_opp_idx]
                         if isinstance(peeked_card, Card):
                             peeked_card_str = serialize_card(peeked_card)
-                        else:
+                            logger.info(
+                                "P%d uses 9/T ability, peeks opponent card %d: %s",
+                                player,
+                                target_opp_idx,
+                                peeked_card_str,
+                            )
+                            delta_list.append(
+                                (
+                                    "peek_other",
+                                    player,
+                                    opp_idx,
+                                    target_opp_idx,
+                                    peeked_card_str,
+                                )
+                            )
+                        else:  # Should not happen
                             logger.error(
                                 "Peek Other Error: Item at opponent index %d is not Card: %s",
                                 target_opp_idx,
                                 peeked_card,
                             )
-                        logger.info(
-                            "P%d uses 9/T ability, peeks opponent card %d: %s",
-                            player,
-                            target_opp_idx,
-                            peeked_card_str,
-                        )
-                        delta_list.append(
-                            (
-                                "peek_other",
-                                player,
-                                opp_idx,
-                                target_opp_idx,
-                                peeked_card_str,
+                            delta_list.append(
+                                ("peek_other_fail", player, opp_idx, target_opp_idx)
                             )
-                        )
-                    else:
+                    else:  # Should not happen if legal actions OK
                         logger.error(
                             "Invalid PEEK_OTHER index %d for opponent hand size %d",
                             target_opp_idx,
@@ -531,7 +585,7 @@ class AbilityMixin:
                         delta_list.append(
                             ("peek_other_fail", player, opp_idx, target_opp_idx)
                         )
-                else:
+                else:  # Should not happen
                     logger.error(
                         "Peek Other Error: Opponent %d invalid or missing hand.", opp_idx
                     )
@@ -542,17 +596,18 @@ class AbilityMixin:
                 self._clear_pending_action(undo_stack, delta_list)
 
             elif isinstance(pending_type, ActionAbilityBlindSwapSelect):
-                if not isinstance(action, ActionAbilityBlindSwapSelect):
-                    logger.warning(
-                        "Expected BlindSwapSelect action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionAbilityBlindSwapSelect
                 own_h_idx, opp_h_idx = action.own_hand_index, action.opponent_hand_index
                 opp_idx = self.get_opponent_index(player)
                 hand = self.players[player].hand
                 swap_successful = False
                 original_own_card, original_opp_card = None, None
+                original_own_hand_state = list(hand)  # For undo check
+                original_opp_hand_state = list(
+                    self.players[opp_idx].hand
+                )  # For undo check
 
+                # Validation (should pass if action was legal)
                 if 0 <= opp_idx < len(self.players) and hasattr(
                     self.players[opp_idx], "hand"
                 ):
@@ -563,41 +618,67 @@ class AbilityMixin:
                         if isinstance(original_own_card, Card) and isinstance(
                             original_opp_card, Card
                         ):
-                            captured_own_card = original_own_card
+                            captured_own_card = original_own_card  # For closure
                             captured_opp_card = original_opp_card  # For closure
 
                             def change_blind_swap():
                                 # Check indices again before swap, state might have changed? No, rely on caller sync.
-                                if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(
-                                    opp_hand
-                                ):
-                                    hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                        captured_opp_card,
-                                        captured_own_card,
-                                    )
+                                if 0 <= own_h_idx < len(
+                                    self.players[player].hand
+                                ) and 0 <= opp_h_idx < len(self.players[opp_idx].hand):
+                                    # Check cards haven't changed unexpectedly
+                                    if (
+                                        self.players[player].hand[own_h_idx]
+                                        is captured_own_card
+                                        and self.players[opp_idx].hand[opp_h_idx]
+                                        is captured_opp_card
+                                    ):
+                                        (
+                                            self.players[player].hand[own_h_idx],
+                                            self.players[opp_idx].hand[opp_h_idx],
+                                        ) = (
+                                            captured_opp_card,
+                                            captured_own_card,
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Change BlindSwap error: Card identity mismatch at indices."
+                                        )
                                 else:
                                     logger.error("Change BlindSwap error: Index OOB.")
 
                             def undo_blind_swap():
-                                if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(
-                                    opp_hand
-                                ):
-                                    if (
-                                        hand[own_h_idx] is captured_opp_card
-                                        and opp_hand[opp_h_idx] is captured_own_card
-                                    ):
-                                        hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                            captured_own_card,
-                                            captured_opp_card,
-                                        )
-                                    else:
-                                        logger.warning(
-                                            "Undo BlindSwap mismatch: cards changed unexpectedly."
-                                        )
-                                else:
-                                    logger.warning(
-                                        "Undo BlindSwap failed: index out of bounds."
-                                    )
+                                # Assert preconditions
+                                assert (
+                                    0 <= own_h_idx < len(self.players[player].hand)
+                                ), f"Undo BlindSwap: Own index {own_h_idx} OOB"
+                                assert (
+                                    0 <= opp_h_idx < len(self.players[opp_idx].hand)
+                                ), f"Undo BlindSwap: Opp index {opp_h_idx} OOB"
+                                assert (
+                                    self.players[player].hand[own_h_idx]
+                                    is captured_opp_card
+                                ), f"Undo BlindSwap: Own card mismatch (Expected {captured_opp_card}, Got {self.players[player].hand[own_h_idx]})"
+                                assert (
+                                    self.players[opp_idx].hand[opp_h_idx]
+                                    is captured_own_card
+                                ), f"Undo BlindSwap: Opp card mismatch (Expected {captured_own_card}, Got {self.players[opp_idx].hand[opp_h_idx]})"
+
+                                # Perform undo
+                                (
+                                    self.players[player].hand[own_h_idx],
+                                    self.players[opp_idx].hand[opp_h_idx],
+                                ) = (
+                                    captured_own_card,
+                                    captured_opp_card,
+                                )
+                                # Assert postconditions
+                                assert (
+                                    self.players[player].hand == original_own_hand_state
+                                ), "Undo BlindSwap: Own hand mismatch post-undo"
+                                assert (
+                                    self.players[opp_idx].hand == original_opp_hand_state
+                                ), "Undo BlindSwap: Opp hand mismatch post-undo"
 
                             delta_blind_swap = (
                                 "swap_blind",
@@ -618,18 +699,10 @@ class AbilityMixin:
                             swap_successful = True
                         else:
                             logger.error(
-                                "Blind Swap Error: Cards involved not valid Card objects (%s, %s)",
-                                original_own_card,
-                                original_opp_card,
+                                "Blind Swap Error: Cards involved not valid Card objects"
                             )
                     else:
-                        logger.error(
-                            "Invalid BLIND_SWAP indices: own %d (max %d), opp %d (max %d)",
-                            own_h_idx,
-                            len(hand) - 1,
-                            opp_h_idx,
-                            len(opp_hand) - 1,
-                        )
+                        logger.error("Invalid BLIND_SWAP indices")
                 else:
                     logger.error(
                         "Blind Swap Error: Opponent %d invalid or missing hand.", opp_idx
@@ -650,11 +723,7 @@ class AbilityMixin:
                 )  # Clear state even if swap failed (ability fizzles)
 
             elif isinstance(pending_type, ActionAbilityKingLookSelect):
-                if not isinstance(action, ActionAbilityKingLookSelect):
-                    logger.warning(
-                        "Expected KingLookSelect action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionAbilityKingLookSelect
                 own_h_idx, opp_h_idx = action.own_hand_index, action.opponent_hand_index
                 opp_idx = self.get_opponent_index(player)
                 hand = self.players[player].hand
@@ -662,6 +731,7 @@ class AbilityMixin:
                 card1_str, card2_str = "ERROR", "ERROR"
                 card1, card2 = None, None
 
+                # Validation (should pass if action legal)
                 if 0 <= opp_idx < len(self.players) and hasattr(
                     self.players[opp_idx], "hand"
                 ):
@@ -675,18 +745,10 @@ class AbilityMixin:
                             can_proceed = True
                         else:
                             logger.error(
-                                "King Look Error: Cards involved not valid Card objects (%s, %s)",
-                                card1,
-                                card2,
+                                "King Look Error: Cards involved not valid Card objects"
                             )
                     else:
-                        logger.error(
-                            "Invalid KING_LOOK indices: own %d (max %d), opp %d (max %d)",
-                            own_h_idx,
-                            len(hand) - 1,
-                            opp_h_idx,
-                            len(opp_hand) - 1,
-                        )
+                        logger.error("Invalid KING_LOOK indices")
                 else:
                     logger.error(
                         "King Look Error: Opponent %s invalid or missing hand.", opp_idx
@@ -706,12 +768,16 @@ class AbilityMixin:
                         self.pending_action_player,
                         copy.deepcopy(self.pending_action_data),
                     )
+                    # Store actual cards and indices for decision phase
                     new_pending_data = {
                         "own_idx": own_h_idx,
                         "opp_idx": opp_h_idx,
                         "card1": card1,
                         "card2": card2,
-                    }  # Store actual cards for decision phase
+                        "ability_card": original_pending.get(
+                            "ability_card"
+                        ),  # Propagate original ability card
+                    }
                     next_pending_action_type = ActionAbilityKingSwapDecision(
                         perform_swap=False
                     )
@@ -722,6 +788,10 @@ class AbilityMixin:
                         self.pending_action_data = new_pending_data
 
                     def undo_king_pending():
+                        # Assert preconditions (optional, but good practice)
+                        assert self.pending_action is next_pending_action_type
+                        assert self.pending_action_player == player
+                        # Restore previous state
                         (
                             self.pending_action,
                             self.pending_action_player,
@@ -743,6 +813,9 @@ class AbilityMixin:
                         "opp_idx": opp_h_idx,
                         "card1": card1_str,
                         "card2": card2_str,
+                        "ability_card": serialize_card(
+                            original_pending.get("ability_card")
+                        ),
                     }
                     delta_king_pending = (
                         "set_pending_action",
@@ -772,18 +845,15 @@ class AbilityMixin:
                     )  # Clear pending state
 
             elif isinstance(pending_type, ActionAbilityKingSwapDecision):
-                if not isinstance(action, ActionAbilityKingSwapDecision):
-                    logger.warning(
-                        "Expected KingSwapDecision action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionAbilityKingSwapDecision
                 perform_swap = action.perform_swap
                 look_data = self.pending_action_data
-                own_h_idx, opp_h_idx = look_data.get("own_idx"), look_data.get("opp_idx")
-                card1, card2 = look_data.get("card1"), look_data.get(
-                    "card2"
-                )  # Get actual Card objects stored earlier
+                own_h_idx = look_data.get("own_idx")
+                opp_h_idx = look_data.get("opp_idx")
+                card1 = look_data.get("card1")  # Own card peeked
+                card2 = look_data.get("card2")  # Opp card peeked
 
+                # --- Pre-action Validation ---
                 if (
                     own_h_idx is None
                     or opp_h_idx is None
@@ -794,140 +864,148 @@ class AbilityMixin:
                         "Missing/invalid data for King Swap decision. Data: %s. Ability fizzles.",
                         look_data,
                     )
-                else:
-                    opp_idx = self.get_opponent_index(player)
-                    hand = self.players[player].hand
-                    # Check context validity before swapping
-                    context_valid = False
-                    reason = "Swap context invalid:"
-                    if 0 <= opp_idx < len(self.players) and hasattr(
-                        self.players[opp_idx], "hand"
-                    ):
-                        opp_hand = self.players[opp_idx].hand
-                        own_idx_valid = 0 <= own_h_idx < len(hand)
-                        opp_idx_valid = 0 <= opp_h_idx < len(opp_hand)
-                        card_at_own_idx = hand[own_h_idx] if own_idx_valid else None
-                        card_at_opp_idx = opp_hand[opp_h_idx] if opp_idx_valid else None
-                        own_card_match = own_idx_valid and (card_at_own_idx is card1)
-                        opp_card_match = opp_idx_valid and (card_at_opp_idx is card2)
-                        if own_card_match and opp_card_match:
-                            context_valid = True
-                        else:
-                            if not own_idx_valid:
-                                reason += (
-                                    f" Own idx {own_h_idx} invalid (size {len(hand)})."
+                    # Clear pending state even on error
+                    card_just_discarded_for_snap_check = (
+                        self.pending_action_data.get("ability_card")
+                        or self.get_discard_top()
+                    )
+                    self._clear_pending_action(undo_stack, delta_list)
+                    return card_just_discarded_for_snap_check  # Allow snap check
+
+                opp_idx = self.get_opponent_index(player)
+                hand = self.players[player].hand
+                opp_hand = self.players[opp_idx].hand  # Assume valid opponent index
+
+                # Check context validity (indices in bounds, cards still match)
+                own_idx_valid = 0 <= own_h_idx < len(hand)
+                opp_idx_valid = 0 <= opp_h_idx < len(opp_hand)
+                card_at_own_idx = hand[own_h_idx] if own_idx_valid else None
+                card_at_opp_idx = opp_hand[opp_h_idx] if opp_idx_valid else None
+                own_card_match = own_idx_valid and (card_at_own_idx is card1)
+                opp_card_match = opp_idx_valid and (card_at_opp_idx is card2)
+                context_valid = own_card_match and opp_card_match
+                # --- End Pre-action Validation ---
+
+                if context_valid:
+                    if perform_swap:
+                        captured_card1, captured_card2 = card1, card2  # For closure
+                        original_own_hand_state = list(hand)  # For undo check
+                        original_opp_hand_state = list(opp_hand)  # For undo check
+
+                        def change_king_swap():
+                            # Check context again just before swap? Maybe overkill if action application is atomic.
+                            if 0 <= own_h_idx < len(
+                                self.players[player].hand
+                            ) and 0 <= opp_h_idx < len(self.players[opp_idx].hand):
+                                (
+                                    self.players[player].hand[own_h_idx],
+                                    self.players[opp_idx].hand[opp_h_idx],
+                                ) = (
+                                    captured_card2,
+                                    captured_card1,
                                 )
-                            elif not own_card_match:
-                                reason += f" Own card changed (Expected {card1}, Found {card_at_own_idx})."
-                            if not opp_idx_valid:
-                                reason += f" Opp idx {opp_h_idx} invalid (size {len(opp_hand)})."
-                            elif not opp_card_match:
-                                reason += f" Opp card changed (Expected {card2}, Found {card_at_opp_idx})."
+                            else:
+                                logger.error("Change KingSwap error: Index OOB.")
+
+                        def undo_king_swap():
+                            # Assert preconditions
+                            assert (
+                                0 <= own_h_idx < len(self.players[player].hand)
+                            ), f"Undo KingSwap: Own index {own_h_idx} OOB"
+                            assert (
+                                0 <= opp_h_idx < len(self.players[opp_idx].hand)
+                            ), f"Undo KingSwap: Opp index {opp_h_idx} OOB"
+                            assert (
+                                self.players[player].hand[own_h_idx] is captured_card2
+                            ), f"Undo KingSwap: Own card mismatch (Expected {captured_card2}, Got {self.players[player].hand[own_h_idx]})"
+                            assert (
+                                self.players[opp_idx].hand[opp_h_idx] is captured_card1
+                            ), f"Undo KingSwap: Opp card mismatch (Expected {captured_card1}, Got {self.players[opp_idx].hand[opp_h_idx]})"
+
+                            # Perform undo
+                            (
+                                self.players[player].hand[own_h_idx],
+                                self.players[opp_idx].hand[opp_h_idx],
+                            ) = (
+                                captured_card1,
+                                captured_card2,
+                            )
+                            logger.debug("Undo King Swap successful.")
+                            # Assert postconditions
+                            assert (
+                                self.players[player].hand == original_own_hand_state
+                            ), "Undo KingSwap: Own hand mismatch post-undo"
+                            assert (
+                                self.players[opp_idx].hand == original_opp_hand_state
+                            ), "Undo KingSwap: Opp hand mismatch post-undo"
+
+                        delta_king_swap = (
+                            "swap_king",
+                            player,
+                            own_h_idx,
+                            opp_idx,
+                            opp_h_idx,
+                            serialize_card(card1),
+                            serialize_card(card2),
+                        )
+                        self._add_change(
+                            change_king_swap,
+                            undo_king_swap,
+                            delta_king_swap,
+                            undo_stack,
+                            delta_list,
+                        )
+                        logger.info(
+                            "P%d King ability: Swapped own %d (%s) with opp %d (%s).",
+                            player,
+                            own_h_idx,
+                            card1,
+                            opp_h_idx,
+                            card2,
+                        )
                     else:
-                        reason += f" Opponent P{opp_idx} invalid."
-
-                    if context_valid:
-                        if perform_swap:
-                            captured_card1, captured_card2 = card1, card2  # For closure
-
-                            def change_king_swap():
-                                if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(
-                                    opp_hand
-                                ):
-                                    hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                        captured_card2,
-                                        captured_card1,
-                                    )
-                                else:
-                                    logger.error("Change KingSwap error: Index OOB.")
-
-                            def undo_king_swap():
-                                if 0 <= own_h_idx < len(hand) and 0 <= opp_h_idx < len(
-                                    opp_hand
-                                ):
-                                    if (
-                                        hand[own_h_idx] is captured_card2
-                                        and opp_hand[opp_h_idx] is captured_card1
-                                    ):
-                                        hand[own_h_idx], opp_hand[opp_h_idx] = (
-                                            captured_card1,
-                                            captured_card2,
-                                        )
-                                        logger.debug("Undo King Swap successful.")
-                                    else:
-                                        logger.warning(
-                                            "Undo KingSwap mismatch: cards changed unexpectedly (%s vs %s, %s vs %s).",
-                                            hand[own_h_idx],
-                                            captured_card2,
-                                            opp_hand[opp_h_idx],
-                                            captured_card1,
-                                        )
-                                else:
-                                    logger.warning(
-                                        "Undo KingSwap failed: index out of bounds."
-                                    )
-
-                            delta_king_swap = (
-                                "swap_king",
+                        logger.info("P%d King ability: Chose not to swap cards.", player)
+                        delta_list.append(
+                            (
+                                "king_swap_decision",
                                 player,
                                 own_h_idx,
-                                opp_idx,
                                 opp_h_idx,
+                                False,
                                 serialize_card(card1),
                                 serialize_card(card2),
                             )
-                            self._add_change(
-                                change_king_swap,
-                                undo_king_swap,
-                                delta_king_swap,
-                                undo_stack,
-                                delta_list,
-                            )
-                            logger.info(
-                                "P%d King ability: Swapped own %d (%s) with opp %d (%s).",
-                                player,
-                                own_h_idx,
-                                card1,
-                                opp_h_idx,
-                                card2,
-                            )
-                        else:
-                            logger.info(
-                                "P%d King ability: Chose not to swap cards.", player
-                            )
-                            delta_list.append(
-                                (
-                                    "king_swap_decision",
-                                    player,
-                                    own_h_idx,
-                                    opp_h_idx,
-                                    False,
-                                    serialize_card(card1),
-                                    serialize_card(card2),
-                                )
-                            )
-                    else:
-                        logger.warning("King Swap Error: %s Ability fizzles.", reason)
+                        )
+                else:  # Context was invalid
+                    reason = f"King Swap Context Invalid: own_idx_ok={own_idx_valid}, opp_idx_ok={opp_idx_valid}, own_card_match={own_card_match}, opp_card_match={opp_card_match}"
+                    logger.warning("%s. Ability fizzles.", reason)
+                    delta_list.append(
+                        ("king_swap_fail", player, own_h_idx, opp_h_idx, reason)
+                    )
 
-                card_just_discarded_for_snap_check = self.get_discard_top()
+                # Ability sequence ends here, clear pending state
+                card_just_discarded_for_snap_check = (
+                    self.pending_action_data.get("ability_card") or self.get_discard_top()
+                )
                 self._clear_pending_action(undo_stack, delta_list)
+                return (
+                    card_just_discarded_for_snap_check  # Return original discarded King
+                )
 
             elif isinstance(pending_type, ActionSnapOpponentMove):
-                if not isinstance(action, ActionSnapOpponentMove):
-                    logger.warning(
-                        "Expected SnapOpponentMove action, got %s.", type(action).__name__
-                    )
-                    return None
+                # Action guaranteed to be ActionSnapOpponentMove
                 snapper_idx = player
                 own_card_idx = action.own_card_to_move_hand_index
                 target_slot_idx = self.pending_action_data.get("target_empty_slot_index")
 
+                # Pre-action validation
                 if target_slot_idx is None or not isinstance(target_slot_idx, int):
                     logger.error(
-                        "SnapOpponentMove Error: Missing/invalid target_empty_slot_index. Data: %s",
-                        self.pending_action_data,
+                        "SnapOpponentMove Error: Missing/invalid target_empty_slot_index."
                     )
-                    self._clear_pending_action(undo_stack, delta_list)
+                    self._clear_pending_action(
+                        undo_stack, delta_list
+                    )  # Clear broken state
                     return None
                 if action.target_empty_slot_index != target_slot_idx:
                     logger.error(
@@ -935,7 +1013,7 @@ class AbilityMixin:
                         action.target_empty_slot_index,
                         target_slot_idx,
                     )
-                    return None  # Invalid action, wait
+                    return None  # Invalid action choice, wait for correct one
 
                 hand = self.players[snapper_idx].hand
                 opp_idx = self.get_opponent_index(snapper_idx)
@@ -975,78 +1053,70 @@ class AbilityMixin:
                             )
                         else:
                             original_card = card_to_move  # Capture for closure
+                            original_snapper_hand = list(hand)
+                            original_opponent_hand = list(opp_hand)
 
                             def change_move():
-                                # Check indices again
+                                # Check indices and card identity again
                                 if (
                                     0
                                     <= own_card_idx
                                     < len(self.players[snapper_idx].hand)
+                                    and self.players[snapper_idx].hand[own_card_idx]
+                                    is original_card
                                 ):
                                     moved_card = self.players[snapper_idx].hand.pop(
                                         own_card_idx
                                     )
-                                    if moved_card is original_card:
-                                        if (
-                                            0
-                                            <= target_slot_idx
-                                            <= len(self.players[opp_idx].hand)
-                                        ):
-                                            self.players[opp_idx].hand.insert(
-                                                target_slot_idx, moved_card
-                                            )
-                                        else:
-                                            logger.error(
-                                                "SnapMove change error: Target index %d OOB",
-                                                target_slot_idx,
-                                            )
+                                    if (
+                                        0
+                                        <= target_slot_idx
+                                        <= len(self.players[opp_idx].hand)
+                                    ):
+                                        self.players[opp_idx].hand.insert(
+                                            target_slot_idx, moved_card
+                                        )
                                     else:
                                         logger.error(
-                                            "SnapMove change error: Card identity mismatch at source."
+                                            "SnapMove change error: Target index %d OOB",
+                                            target_slot_idx,
                                         )
                                 else:
                                     logger.error(
-                                        "SnapMove change error: Source index %d OOB",
+                                        "SnapMove change error: Source index %d OOB or card mismatch.",
                                         own_card_idx,
                                     )
 
                             def undo_move():
-                                # Check target index valid for pop
-                                if 0 <= target_slot_idx < len(self.players[opp_idx].hand):
-                                    moved_back_card = self.players[opp_idx].hand.pop(
-                                        target_slot_idx
-                                    )
-                                    if moved_back_card is original_card:
-                                        # Check source index valid for insert
-                                        if (
-                                            0
-                                            <= own_card_idx
-                                            <= len(self.players[snapper_idx].hand)
-                                        ):
-                                            self.players[snapper_idx].hand.insert(
-                                                own_card_idx, moved_back_card
-                                            )
-                                        else:
-                                            logger.warning(
-                                                "Undo SnapOpponentMove insert failed: own index %d OOB (Hand size %d)",
-                                                own_card_idx,
-                                                len(self.players[snapper_idx].hand),
-                                            )
-                                    else:
-                                        logger.warning(
-                                            "Undo SnapOpponentMove mismatch: card identity changed (%s vs %s). Putting back wrong card?",
-                                            moved_back_card,
-                                            original_card,
-                                        )
-                                        self.players[opp_idx].hand.insert(
-                                            target_slot_idx, moved_back_card
-                                        )  # Put back what we popped
-                                else:
-                                    logger.warning(
-                                        "Undo SnapOpponentMove pop failed: target index %d invalid for opp hand %s.",
-                                        target_slot_idx,
-                                        self.players[opp_idx].hand,
-                                    )
+                                # Assert preconditions
+                                assert (
+                                    0 <= target_slot_idx < len(self.players[opp_idx].hand)
+                                ), f"Undo SnapMove: Target index {target_slot_idx} OOB (Opp size {len(self.players[opp_idx].hand)})"
+                                assert (
+                                    self.players[opp_idx].hand[target_slot_idx]
+                                    is original_card
+                                ), f"Undo SnapMove: Target card mismatch (Expected {original_card}, Got {self.players[opp_idx].hand[target_slot_idx]})"
+
+                                moved_back_card = self.players[opp_idx].hand.pop(
+                                    target_slot_idx
+                                )
+
+                                assert (
+                                    0
+                                    <= own_card_idx
+                                    <= len(self.players[snapper_idx].hand)
+                                ), f"Undo SnapMove: Source index {own_card_idx} OOB (Own size {len(self.players[snapper_idx].hand)})"
+                                self.players[snapper_idx].hand.insert(
+                                    own_card_idx, moved_back_card
+                                )
+                                # Assert postconditions
+                                assert (
+                                    self.players[snapper_idx].hand
+                                    == original_snapper_hand
+                                ), "Undo SnapMove: Snapper hand mismatch"
+                                assert (
+                                    self.players[opp_idx].hand == original_opponent_hand
+                                ), "Undo SnapMove: Opponent hand mismatch"
 
                             delta_move = (
                                 "snap_opponent_move",
@@ -1070,17 +1140,20 @@ class AbilityMixin:
                         target_slot_idx,
                     )
                     self._clear_pending_action(undo_stack, delta_list)
-                    # This action *resolves* the snap consequence, turn should advance AFTER this if no other snap/pending.
-                    # The calling engine._apply_action needs to check if snap phase should now end and advance turn.
-                    # No card discarded *now*.
-                    return None
+                    # Turn advances after pending action resolved and no snap phase active
+                    return None  # No card discarded this step
                 else:
                     # Failure in validation or index means invalid action was chosen
+                    # The initial legal action check should prevent this path.
+                    logger.error(
+                        "SnapOpponentMove handler reached failure state unexpectedly."
+                    )
                     return None
 
             else:  # Mismatch between pending state and action received
-                logger.warning(
-                    "Unhandled pending action type %s vs received action %s",
+                # This path is now unreachable due to the legal action check at the start
+                logger.error(
+                    "INTERNAL ERROR: Unhandled pending action type %s vs received action %s",
                     type(pending_type).__name__,
                     type(action).__name__,
                 )
@@ -1115,6 +1188,8 @@ class AbilityMixin:
                 "pending_action_player",
                 "pending_action_data",
                 "_add_change",
+                "get_player_card_count",
+                "get_opponent_index",
             ]
         ):
             logger.critical(
@@ -1129,10 +1204,12 @@ class AbilityMixin:
         next_pending_action: Optional[GameAction] = None
 
         # Check if ability requires action based on current game state
-        can_peek_own = self.get_player_card_count(player_index) > 0
-        can_peek_opp = (
-            self.get_player_card_count(self.get_opponent_index(player_index)) > 0
+        player_hand_count = self.get_player_card_count(player_index)
+        opponent_hand_count = self.get_player_card_count(
+            self.get_opponent_index(player_index)
         )
+        can_peek_own = player_hand_count > 0
+        can_peek_opp = opponent_hand_count > 0
         can_swap = can_peek_own and can_peek_opp
 
         if rank in [SEVEN, EIGHT] and can_peek_own:
@@ -1145,15 +1222,16 @@ class AbilityMixin:
             next_pending_action = ActionAbilityKingLookSelect(-1, -1)
         else:
             logger.debug(
-                "Card %s ability requires no action or cannot be performed (Hand sizes: P%d=%d, P%d=%d).",
+                "Card %s ability requires no action or cannot be performed (Hand sizes: P%d=%d, P%d=%d). Fizzles.",
                 discarded_card,
                 player_index,
-                self.get_player_card_count(player_index),
+                player_hand_count,
                 self.get_opponent_index(player_index),
-                self.get_player_card_count(self.get_opponent_index(player_index)),
+                opponent_hand_count,
             )
 
         if next_pending_action:
+            # Store original state *before* setting pending action
             original_pending_action = self.pending_action
             original_pending_player = self.pending_action_player
             original_pending_data = copy.deepcopy(self.pending_action_data)
@@ -1165,6 +1243,10 @@ class AbilityMixin:
                 self.pending_action_data = new_pending_data
 
             def undo_ability_pending():
+                # Assert preconditions (optional)
+                assert self.pending_action is next_pending_action
+                assert self.pending_action_player == player_index
+                # Restore previous state
                 self.pending_action = original_pending_action
                 self.pending_action_player = original_pending_player
                 self.pending_action_data = original_pending_data
@@ -1227,6 +1309,7 @@ class AbilityMixin:
             and self.pending_action_player is None
             and not self.pending_action_data
         ):
+            logger.debug("Clear pending action called, but nothing to clear.")
             return  # Nothing to clear
 
         original_pending_action = self.pending_action
@@ -1239,6 +1322,10 @@ class AbilityMixin:
             self.pending_action_data = {}
 
         def undo_clear():
+            # Assert preconditions (optional)
+            assert self.pending_action is None
+            assert self.pending_action_player is None
+            # Restore previous state
             self.pending_action = original_pending_action
             self.pending_action_player = original_pending_player
             self.pending_action_data = original_pending_data
