@@ -157,8 +157,6 @@ class LogArchiver:
                 elif isinstance(
                     queue_item, str
                 ):  # Handle legacy single-file paths (optional)
-                    # logger.warning("Received single file path '%s' for archiving (batching is preferred). Archiving individually.", queue_item)
-                    # self._archive_single_file(queue_item) # This function is removed
                     logger.warning(
                         "Received deprecated single file path '%s' on archive queue. Ignoring.",
                         queue_item,
@@ -221,8 +219,9 @@ class LogArchiver:
             files_to_archive = glob.glob(glob_pattern)
 
             if not files_to_archive:
-                logger.warning(
-                    "Batch archive triggered for %s, but no matching files found.",
+                logger.debug(
+                    "Batch archive triggered for owner %s (pattern %s), but no matching files found at this moment.",
+                    owner_id,
                     glob_pattern,
                 )
                 return

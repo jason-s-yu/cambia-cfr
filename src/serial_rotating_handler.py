@@ -19,8 +19,7 @@ if TYPE_CHECKING:
 
 # NOTE: This module should NOT use the logger it might be attached to
 # for its internal operations, especially within doRollover, to avoid recursion.
-# Use print(..., file=sys.stderr) for internal status messages if needed.
-# logger = logging.getLogger(__name__) # Avoid using logger internally here
+# Use print(..., file=sys.stderr) or a dedicated internal logger.
 
 
 class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
@@ -68,6 +67,18 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         self.archive_queue = archive_queue
         self.logging_config = logging_config_snapshot
 
+        # Create a dedicated internal logger instance
+        # Use a unique name based on the filename pattern to avoid conflicts
+        internal_logger_name = f"{__name__}.internal.{os.path.basename(filename_pattern)}"
+        self._internal_logger = logging.getLogger(internal_logger_name)
+        # Add a NullHandler to prevent messages if no specific handler is configured for it
+        # and set propagate to False to stop messages going to the root logger.
+        if not self._internal_logger.hasHandlers():
+            self._internal_logger.addHandler(logging.NullHandler())
+        self._internal_logger.propagate = False
+        # Set a default level (can be overridden by external config if needed)
+        self._internal_logger.setLevel(logging.INFO)
+
         if self.backupCount > 0:
             # Determine padding based on the backup count itself, ensuring enough digits
             self._pad_length = len(str(self.backupCount))
@@ -98,10 +109,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 with open(marker_path, "w", encoding="utf-8") as f:
                     f.write(os.path.abspath(self.baseFilename))
             except OSError as e:
-                # Use print for critical log handler errors
-                print(
-                    f"ERROR: SerialRotatingFileHandler: Could not write current log marker to {marker_path}: {e}",
-                    file=sys.stderr,
+                # Use internal logger for critical handler errors
+                self._internal_logger.error(
+                    "Could not write current log marker to %s: %s", marker_path, e
                 )
 
     def _determine_initial_serial(self):
@@ -116,9 +126,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 os.makedirs(log_dir, exist_ok=True)
             except OSError as e:
                 # If directory creation fails, cannot determine initial serial reliably
-                print(
-                    f"ERROR: SerialRotatingFileHandler: Failed to create log directory {log_dir}: {e}",
-                    file=sys.stderr,
+                # Use internal logger for critical handler errors
+                self._internal_logger.error(
+                    "Failed to create log directory %s: %s", log_dir, e
                 )
                 self.current_serial = 1
                 return
@@ -151,11 +161,15 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         Do a rollover, closing the current file and opening the next one.
         If archiving is enabled and the number of existing log files reaches backupCount,
         send a batch archive request to the archive_queue *before* opening the new file.
-        Uses print() for internal status to avoid recursive logging.
+        Uses its internal logger for status messages.
         """
-        # DO NOT use logger inside this method to avoid recursion
         if self.stream:
-            self.stream.close()
+            try:
+                self.stream.close()
+            except Exception as e_close:
+                self._internal_logger.error(
+                    "Error closing stream during rollover: %s", e_close
+                )
             self.stream = None
 
         # --- Batch Archiving Trigger (Check *before* incrementing serial) ---
@@ -173,10 +187,12 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 # Trigger archive if the number of existing files is >= backupCount.
                 # This means the rollover we are about to perform will create the (backupCount + 1)-th file or more.
                 if num_existing_logs >= self.backupCount:
-                    # Use print for internal status message
-                    print(
-                        f"INFO: SerialRotatingFileHandler: Log file count ({num_existing_logs}) meets/exceeds backup count ({self.backupCount}). Queuing BATCH ARCHIVE for pattern {self.base_pattern}",
-                        file=sys.stderr,  # Log to stderr to avoid interfering with potential stdout redirection
+                    # Use internal logger for status message
+                    self._internal_logger.info(
+                        "Log file count (%d) meets/exceeds backup count (%d). Queuing BATCH ARCHIVE for pattern %s",
+                        num_existing_logs,
+                        self.backupCount,
+                        self.base_pattern,
                     )
                     try:
                         # Queue the request with directory and base pattern
@@ -184,26 +200,26 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                             ("BATCH_ARCHIVE", log_dir, self.base_pattern)
                         )  # type: ignore
                     except queue.Full:
-                        print(
-                            f"ERROR: SerialRotatingFileHandler: Archive queue full. Could not queue BATCH ARCHIVE for {self.base_pattern}.",
-                            file=sys.stderr,
+                        self._internal_logger.error(
+                            "Archive queue full. Could not queue BATCH ARCHIVE for %s.",
+                            self.base_pattern,
                         )
                     except Exception as q_err:
-                        print(
-                            f"ERROR: SerialRotatingFileHandler: Failed to queue BATCH_ARCHIVE for {self.base_pattern}: {q_err}",
-                            file=sys.stderr,
+                        self._internal_logger.error(
+                            "Failed to queue BATCH_ARCHIVE for %s: %s",
+                            self.base_pattern,
+                            q_err,
                         )
                 # else:
-                # Optionally print debug status if needed, but can be noisy
-                # print(
-                #     f"DEBUG: SerialRotatingFileHandler: Log file count ({num_existing_logs}) below backup count ({self.backupCount}). No archive triggered for {self.base_pattern}.",
-                #     file=sys.stderr
+                # Optionally log debug status if needed
+                # self._internal_logger.debug(
+                #     "Log file count (%d) below backup count (%d). No archive triggered for %s.",
+                #     num_existing_logs, self.backupCount, self.base_pattern
                 # )
             else:
                 # Log directory doesn't exist, cannot check count
-                print(
-                    f"WARNING: SerialRotatingFileHandler: Log directory {log_dir} not found during rollover archive check.",
-                    file=sys.stderr,
+                self._internal_logger.warning(
+                    "Log directory %s not found during rollover archive check.", log_dir
                 )
         # --- End Batch Archiving Trigger ---
 
@@ -225,9 +241,8 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 self.stream = self._open()
                 self._write_current_log_marker()  # Update marker after opening new file
             except Exception as e_open:
-                print(
-                    f"ERROR: SerialRotatingFileHandler: Failed to open new stream after rollover: {e_open}",
-                    file=sys.stderr,
+                self._internal_logger.error(
+                    "Failed to open new stream after rollover: %s", e_open
                 )
 
     def shouldRollover(self, record):
@@ -240,10 +255,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 self.stream = self._open()
                 self._write_current_log_marker()  # Write marker if stream just opened
             except Exception as e_open:
-                # Use basic print as logging itself might be failing
-                print(
-                    f"ERROR: SerialRotatingFileHandler: Failed to open stream in shouldRollover: {e_open}",
-                    file=sys.stderr,
+                # Use internal logger for critical handler errors
+                self._internal_logger.error(
+                    "Failed to open stream in shouldRollover: %s", e_open
                 )
                 return 0  # Cannot proceed if stream cannot be opened
 
@@ -254,11 +268,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 self.stream.seek(0, 2)  # Go to end of file
                 current_size = self.stream.tell()
             except (OSError, ValueError) as e:
-                # Handle cases where seek/tell might fail (e.g., stream closed)
                 # Cannot use logger here due to potential recursion
-                print(
-                    f"ERROR: SerialRotatingFileHandler: Error seeking/telling stream position: {e}",
-                    file=sys.stderr,
+                self._internal_logger.error(
+                    "Error seeking/telling stream position: %s", e
                 )
                 return 0  # Cannot determine size, don't rollover
 

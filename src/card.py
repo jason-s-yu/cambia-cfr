@@ -90,7 +90,7 @@ class Card:
 
 
 # --- Standard Deck Creation ---
-def create_standard_deck(include_jokers: int = 2) -> list["Card"]:  # Changed type hint
+def create_standard_deck(include_jokers: int = 2) -> list["Card"]:
     """Creates a standard 52-card deck plus optional jokers."""
     # Use ALL_RANKS_STR from constants
     deck = [

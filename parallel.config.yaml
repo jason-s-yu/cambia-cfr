@@ -17,7 +17,7 @@ cfr_training:
   pruning_threshold: 1.0e-6               # Regrets below this considered zero for pruning
   exploitability_interval: 1              # Calculate exploitability every N iterations (higher priority than time)
   exploitability_interval_seconds: 7200   # Calculate exploitability if X seconds pass (e.g., 4 hours), lower priority
-  num_workers: 16                         # Number of parallel workers for simulations (1 for sequential)
+  num_workers: 23                         # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
