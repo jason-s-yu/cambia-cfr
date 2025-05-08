@@ -5,8 +5,8 @@ import json
 import os
 import copy
 import time
-from typing import Dict, Any, Optional
-from dataclasses import asdict
+from typing import Optional
+from dataclasses import asdict, is_dataclass
 import numpy as np
 
 from .game.engine import CambiaGameState
@@ -25,7 +25,7 @@ from .constants import (
     ActionSnapOpponentMove,
 )
 from .config import Config
-from .utils import InfosetKey, PolicyDict, normalize_probabilities
+from .utils import InfosetKey, PolicyDict, normalize_probabilities, SimulationTrace
 from .game.helpers import serialize_card
 
 logger = logging.getLogger(__name__)
@@ -62,27 +62,27 @@ def default_serializer(obj):
     if isinstance(obj, (np.void)):
         return None
     if isinstance(obj, InfosetKey):
-        return obj.astuple()
+        return obj.astuple()  # Use the tuple representation
     if isinstance(obj, Card):
         return serialize_card(obj)
-    # Handle GameAction NamedTuples
-    if hasattr(obj, "_asdict") and callable(obj._asdict):
-        # Serialize card objects within the action dict
+    # Handle GameAction NamedTuples and other dataclasses explicitly
+    if hasattr(obj, "_asdict") and callable(obj._asdict):  # Check for NamedTuple
         action_dict = obj._asdict()
         serialized_dict = {}
         for k, v in action_dict.items():
-            serialized_dict[k] = default_serializer(
-                v
-            )  # Recursive call for nested objects/cards
+            # Recursive call for nested objects/cards
+            serialized_dict[k] = default_serializer(v)
         return {type(obj).__name__: serialized_dict}  # Include type name
-    # Fallback for other types (like simple action classes)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)  # Use dataclasses.asdict for regular dataclasses
+    # Fallback for other types
     try:
-        # If it's a class instance without _asdict, just use its name
+        # If it's a simple object instance, return its class name
         if hasattr(obj, "__class__") and not isinstance(obj, type):
             return obj.__class__.__name__
-        return str(obj)
+        return str(obj)  # Try string representation
     except TypeError:
-        return repr(obj)
+        return repr(obj)  # Final fallback
 
 
 class AnalysisTools:
@@ -95,18 +95,28 @@ class AnalysisTools:
         log_file_prefix: Optional[str] = None,
     ):
         self.config = config
-        self.delta_log_file_path = None  # (Backlog 8) Path for detailed delta logs
+        self.delta_log_file_path = None  # (Deprecated?) Path for detailed delta logs
+        self.simulation_trace_log_path = None  # Path for simulation traces
 
         if log_dir and log_file_prefix:
             try:
                 os.makedirs(log_dir, exist_ok=True)
-                # Setup path for the new delta log file
+                # Setup path for the delta log file (keep for now if needed elsewhere)
                 self.delta_log_file_path = os.path.join(
                     log_dir, f"{log_file_prefix}_game_deltas.jsonl"
                 )
+                # Setup path for the new simulation trace log file (Backlog 5)
+                sim_trace_prefix = getattr(
+                    config.logging,
+                    "simulation_trace_filename_prefix",
+                    "simulation_traces",
+                )
+                self.simulation_trace_log_path = os.path.join(
+                    log_dir, f"{sim_trace_prefix}_simulation_traces.jsonl"
+                )
                 logger.info(
-                    "AnalysisTools: Detailed game delta log path: %s",
-                    self.delta_log_file_path,
+                    "AnalysisTools: Simulation trace log path: %s",
+                    self.simulation_trace_log_path,
                 )
             except OSError as e_mkdir:
                 logger.error(
@@ -114,9 +124,14 @@ class AnalysisTools:
                     log_dir,
                     e_mkdir,
                 )
+            except AttributeError as e_attr:
+                logger.error(
+                    "AnalysisTools: Missing config attribute for logging setup: %s",
+                    e_attr,
+                )
         else:
             logger.warning(
-                "AnalysisTools: Log directory/prefix not provided. Detailed delta logging disabled."
+                "AnalysisTools: Log directory/prefix not provided. Trace/Delta logging disabled."
             )
 
     def calculate_exploitability(
@@ -575,90 +590,79 @@ class AnalysisTools:
         filtered_obs.peeked_cards = None
         return filtered_obs
 
-    # --- Game History Logging (Backlog 8) ---
+    # --- Simulation Trace Logging (Backlog 5) ---
 
-    def log_game_history(self, game_log_data: Dict[str, Any]):
-        """Logs the detailed delta history of a completed game simulation."""
-        if not self.delta_log_file_path:
+    def log_simulation_trace(self, trace_data: SimulationTrace):
+        """Logs the detailed trace of a worker simulation to a JSON Lines file."""
+        if not self.simulation_trace_log_path:
+            # Log warning only if tracing is enabled in config
+            if getattr(self.config.logging, "log_simulation_traces", False):
+                logger.warning(
+                    "Simulation trace logging enabled but path not set. Skipping."
+                )
             return
 
         try:
-            # Basic validation of the input dictionary
-            if not isinstance(game_log_data, dict) or "history" not in game_log_data:
-                logger.warning("Attempted to log invalid game history data structure.")
-                return
-            if not game_log_data["history"]:  # Log if history is empty, but allow it
-                logger.debug(
-                    "Logging game history with empty delta list for iter %d, worker %d.",
-                    game_log_data.get("iteration", -1),
-                    game_log_data.get("worker_id", -1),
+            # Ensure trace_data conforms to the expected structure
+            if (
+                not isinstance(trace_data, dict)
+                or "metadata" not in trace_data
+                or "history" not in trace_data
+            ):
+                logger.warning(
+                    "Attempted to log invalid simulation trace data structure: %s",
+                    trace_data,
                 )
+                return
 
-            with open(self.delta_log_file_path, "a", encoding="utf-8") as f:
+            with open(self.simulation_trace_log_path, "a", encoding="utf-8") as f:
                 # Use the defined default_serializer helper function
-                json_record = json.dumps(game_log_data, default=default_serializer)
+                json_record = json.dumps(trace_data, default=default_serializer)
                 f.write(json_record + "\n")
         except IOError as e_io:
             logger.error(
-                "Error writing game delta history to %s: %s",
-                self.delta_log_file_path,
+                "Error writing simulation trace to %s: %s",
+                self.simulation_trace_log_path,
                 e_io,
             )
         except TypeError as e_type:
-            logger.error("Error serializing game delta details to JSON: %s.", e_type)
+            logger.error(
+                "Error serializing simulation trace details to JSON: %s.", e_type
+            )
             # Attempt to log problematic parts safely
             try:
                 problematic_part = {
-                    k: repr(v)[:200] for k, v in game_log_data.items() if k != "history"
-                }  # Avoid large history list
-                problematic_part["history_len"] = len(game_log_data.get("history", []))
-                logger.debug("Problematic data (repr): %s", problematic_part)
+                    k: repr(v)[:200] for k, v in trace_data.get("metadata", {}).items()
+                }
+                problematic_part["history_len"] = len(trace_data.get("history", []))
+                logger.debug("Problematic trace data (repr): %s", problematic_part)
             except Exception:
                 pass  # Avoid errors during error logging
+        except Exception as e_log:
+            logger.error(
+                "Unexpected error logging simulation trace: %s", e_log, exc_info=True
+            )
 
-    def format_game_details_for_log(
-        self, game_state: CambiaGameState, iteration: int, worker_id: int
-    ) -> Dict[str, Any]:
-        """Formats the metadata for a finished game state for delta logging."""
-        # This function now only prepares metadata. The delta history list is added separately.
-        final_hands_serializable, final_scores = [], []
-        if hasattr(game_state, "players") and isinstance(game_state.players, list):
-            for i, player_state in enumerate(game_state.players):
-                if hasattr(player_state, "hand") and isinstance(player_state.hand, list):
-                    hand = player_state.hand
-                    hand_str = [serialize_card(c) for c in hand]
-                    final_hands_serializable.append(hand_str)
-                    try:
-                        final_scores.append(
-                            sum(c.value for c in hand if isinstance(c, Card))
-                        )
-                    except Exception:
-                        final_scores.append(999)
-                else:
-                    final_hands_serializable.append(["ERROR"])
-                    final_scores.append(999)
-        else:
-            final_hands_serializable = [["ERROR"]] * NUM_PLAYERS
-            final_scores = [999] * NUM_PLAYERS
+    # Deprecated method - kept for reference, but functionality moved to log_simulation_trace
+    # def log_game_history(self, game_log_data: Dict[str, Any]):
+    #     """Logs the detailed delta history of a completed game simulation."""
+    #     logger.warning("log_game_history is deprecated. Use log_simulation_trace.")
+    #     # Original logic remains for backward compatibility if needed, or remove fully.
+    #     if not self.delta_log_file_path: return
+    #     try:
+    #         if not isinstance(game_log_data, dict) or "history" not in game_log_data: return
+    #         if not game_log_data["history"]: return
+    #         with open(self.delta_log_file_path, "a", encoding="utf-8") as f:
+    #             json_record = json.dumps(game_log_data, default=default_serializer)
+    #             f.write(json_record + "\n")
+    #     except IOError as e_io: logger.error("Error writing game delta history to %s: %s", self.delta_log_file_path, e_io)
+    #     except TypeError as e_type: logger.error("Error serializing game delta details to JSON: %s.", e_type)
 
-        return {
-            "game_log_version": 1,
-            "game_id": f"sim_{iteration}_{worker_id}",
-            "iteration": iteration,
-            "worker_id": worker_id,
-            "final_state": {
-                "player_ids": list(range(NUM_PLAYERS)),  # Use constant
-                "final_hands": final_hands_serializable,
-                "final_scores": final_scores,
-                "winner": getattr(game_state, "_winner", None),
-                "final_utilities": getattr(game_state, "_utilities", []),
-                "num_turns": game_state.get_turn_number(),
-                "cambia_caller": game_state.cambia_caller_id,
-                "house_rules": (
-                    asdict(game_state.house_rules)
-                    if hasattr(game_state, "house_rules")
-                    else {}
-                ),
-            },
-            # "history" field (list of action/delta tuples) is added externally
-        }
+    # Deprecated - metadata generation moved to training loop
+    # def format_game_details_for_log(
+    #     self, game_state: CambiaGameState, iteration: int, worker_id: int
+    # ) -> Dict[str, Any]:
+    #     """Formats the metadata for a finished game state for delta logging."""
+    #     # ... implementation removed ...
+    #     logger.warning("format_game_details_for_log is deprecated.")
+    #     return {}

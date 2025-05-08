@@ -2,12 +2,9 @@
 
 import multiprocessing
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, TypeAlias, List, Any
+from typing import Dict, Tuple, TypeAlias, List, Any, Optional, TypedDict
 
 import numpy as np
-
-# Need StateDelta type for WorkerResult
-from .game.types import StateDelta
 
 
 # Type alias for Regret/Strategy Dictionaries
@@ -58,6 +55,26 @@ LocalStrategyUpdateDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 LocalReachProbUpdateDict: TypeAlias = Dict[InfosetKey, float]
 
 
+# --- Simulation Trace Data Structures (Backlog 5) ---
+class SimulationNodeData(TypedDict):
+    """Data captured at each decision node during a worker simulation."""
+
+    depth: int
+    player: int
+    infoset_key: Tuple[Any, ...]  # Serialized InfosetKey (using astuple representation)
+    context: str  # DecisionContext name
+    strategy: List[float]  # Strategy used at this node (list of probabilities)
+    chosen_action: Any  # Serialized chosen action
+    state_delta: List[Tuple[str, ...]]  # List of StateDeltaChange tuples from engine
+
+
+class SimulationTrace(TypedDict):
+    """Structure for logging a complete simulation trace."""
+
+    metadata: Dict[str, Any]  # Iteration, worker_id, final_utility, etc.
+    history: List[SimulationNodeData]
+
+
 # Type alias for the combined results returned by a single worker
 @dataclass
 class WorkerResult:
@@ -67,9 +84,9 @@ class WorkerResult:
     strategy_updates: LocalStrategyUpdateDict = field(default_factory=dict)
     reach_prob_updates: LocalReachProbUpdateDict = field(default_factory=dict)
     stats: WorkerStats = field(default_factory=WorkerStats)
-    # NEW (Backlog 8): Store the game history as action/delta pairs
-    # Use 'Any' for serialized action type, StateDelta for the delta list
-    game_history_deltas: List[Tuple[Any, StateDelta]] = field(default_factory=list)
+    # Backlog 5: Store simulation trace nodes and final utility
+    simulation_nodes: List[SimulationNodeData] = field(default_factory=list)
+    final_utility: Optional[List[float]] = None
 
 
 # Type alias for the logging queue

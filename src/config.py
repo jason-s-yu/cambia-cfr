@@ -204,6 +204,9 @@ class LoggingConfig:
     log_size_update_interval_sec: int = (
         60  # Interval in seconds to update log size display
     )
+    # Simulation Trace Logging (Backlog 5)
+    log_simulation_traces: bool = False
+    simulation_trace_filename_prefix: str = "simulation_traces"
 
     def get_worker_log_level(self, worker_id: int, num_total_workers: int) -> str:
         """
@@ -405,6 +408,17 @@ def load_config(
                     config_dict,
                     ["logging", "log_size_update_interval_sec"],
                     LoggingConfig.log_size_update_interval_sec,
+                ),
+                # Backlog 5: Load new logging options
+                log_simulation_traces=get_nested(
+                    config_dict,
+                    ["logging", "log_simulation_traces"],
+                    LoggingConfig.log_simulation_traces,
+                ),
+                simulation_trace_filename_prefix=get_nested(
+                    config_dict,
+                    ["logging", "simulation_trace_filename_prefix"],
+                    LoggingConfig.simulation_trace_filename_prefix,
                 ),
             )
 

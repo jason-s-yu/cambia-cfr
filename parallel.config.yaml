@@ -76,3 +76,7 @@ logging:
                                            # empty str means archives are stored in the same directory as the log files.
                                            # e.g., logs/cambia_run_YYYYMMDD_HHMMSS/w0/ (if empty) or
                                            # logs/cambia_run_YYYYMMDD_HHMMSS/w0/archives/ (if "archives")
+
+  # Simulation Trace Logging (Backlog 5)
+  log_simulation_traces: false              # Set to true to enable detailed trace logging to .jsonl file
+  simulation_trace_filename_prefix: "simulation_traces" # Base filename for the simulation trace file

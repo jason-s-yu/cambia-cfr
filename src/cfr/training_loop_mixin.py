@@ -9,7 +9,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from ..utils import WorkerResult, WorkerStats, format_large_number, format_infoset_count
+from ..utils import (
+    WorkerResult,
+    WorkerStats,
+    format_large_number,
+    format_infoset_count,
+    SimulationTrace,
+)
 from .exceptions import GracefulShutdownException
 from .worker import run_cfr_simulation_worker
 
@@ -221,6 +227,9 @@ class CFRTrainingLoopMixin:
         run_log_dir_local = getattr(self, "run_log_dir", None)
         run_timestamp_local = getattr(self, "run_timestamp", None)
         display = getattr(self, "live_display_manager", None)  # Use getattr for safety
+        log_sim_traces = getattr(
+            self.config.logging, "log_simulation_traces", False
+        )  # Backlog 5
 
         logger.info(
             "Starting CFR+ training from iteration %d up to %d (%d workers).",
@@ -351,7 +360,6 @@ class CFRTrainingLoopMixin:
                 results: List[Optional[WorkerResult]] = [None] * num_workers
                 sim_failed_count = 0
                 successful_sim_count = 0
-                game_histories_this_iter: List[Dict[str, Any]] = []
 
                 # Execute simulations
                 if num_workers == 1:
@@ -376,14 +384,7 @@ class CFRTrainingLoopMixin:
                                 sim_failed_count += 1
                             else:
                                 successful_sim_count += 1
-                                if hasattr(result, "game_history_deltas"):
-                                    game_histories_this_iter.append(
-                                        {
-                                            "worker_id": 0,
-                                            "iteration": t,
-                                            "history": result.game_history_deltas,
-                                        }
-                                    )
+                                # Note: game_histories_this_iter removed, handled later
                         else:
                             logger.error(
                                 "Worker 0 returned invalid result type: %s",
@@ -573,16 +574,7 @@ class CFRTrainingLoopMixin:
                                                 sim_failed_count += 1
                                             else:
                                                 successful_sim_count += 1
-                                                if hasattr(
-                                                    result_par, "game_history_deltas"
-                                                ):
-                                                    game_histories_this_iter.append(
-                                                        {
-                                                            "worker_id": worker_id_done,
-                                                            "iteration": t,
-                                                            "history": result_par.game_history_deltas,
-                                                        }
-                                                    )
+                                                # Note: History collected later from results list
                                         else:
                                             sim_failed_count += 1
                                             final_status_for_worker = f"Failed (Type: {type(result_par).__name__})"
@@ -731,28 +723,56 @@ class CFRTrainingLoopMixin:
                             )
                         continue
 
-                # (Backlog 8) Log collected game histories
-                if (
-                    game_histories_this_iter
-                    and hasattr(self.analysis, "log_game_history")
-                    and callable(self.analysis.log_game_history)
-                ):
-                    logger.debug(
-                        "Logging %d game delta histories for iter %d.",
-                        len(game_histories_this_iter),
-                        t,
-                    )
-                    for history_detail in game_histories_this_iter:
-                        try:
-                            self.analysis.log_game_history(history_detail)
-                        except Exception as e_log_hist:
-                            logger.error(
-                                "Error logging game delta history for worker %d iter %d: %s",
-                                history_detail.get("worker_id", -1),
+                # --- Simulation Trace Logging (Backlog 5) ---
+                if log_sim_traces:
+                    if hasattr(self.analysis, "log_simulation_trace") and callable(
+                        self.analysis.log_simulation_trace
+                    ):
+                        num_traces_logged = 0
+                        for (
+                            result
+                        ) in (
+                            results
+                        ):  # Iterate through all results (including failed ones if needed?)
+                            if (
+                                isinstance(result, WorkerResult)
+                                and result.simulation_nodes is not None
+                            ):
+                                try:
+                                    metadata = {
+                                        "iteration": t,
+                                        "worker_id": result.stats.worker_id,
+                                        "final_utility": result.final_utility,
+                                        "nodes_visited": result.stats.nodes_visited,
+                                        "max_depth": result.stats.max_depth,
+                                        "min_depth_backtrack": result.stats.min_depth_after_bottom_out,
+                                        "warnings": result.stats.warning_count,
+                                        "errors": result.stats.error_count,
+                                    }
+                                    trace_data = SimulationTrace(
+                                        metadata=metadata, history=result.simulation_nodes
+                                    )
+                                    self.analysis.log_simulation_trace(trace_data)
+                                    num_traces_logged += 1
+                                except Exception as e_log_trace:
+                                    logger.error(
+                                        "Error assembling or logging simulation trace for worker %d iter %d: %s",
+                                        getattr(result.stats, "worker_id", -1),
+                                        t,
+                                        e_log_trace,
+                                        exc_info=True,
+                                    )
+                        if num_traces_logged > 0:
+                            logger.debug(
+                                "Logged %d simulation traces for iter %d.",
+                                num_traces_logged,
                                 t,
-                                e_log_hist,
-                                exc_info=True,
                             )
+                    else:
+                        logger.error(
+                            "Simulation trace logging enabled, but 'log_simulation_trace' missing on AnalysisTools."
+                        )
+                # --- End Simulation Trace Logging ---
 
                 # Post-iteration updates
                 iter_time = time.time() - iter_start_time

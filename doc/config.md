@@ -320,6 +320,16 @@ Configuration for logging messages generated during training.
   * Type: `string`
   * Default: `""` (empty string)
   * Example: `"archives"`, `"old_logs"`
+* **`log_simulation_traces`**:
+  * Description: If `true`, each worker simulation's detailed trace (sequence of decisions, infosets, strategies, actions, deltas) will be logged to a dedicated JSON Lines (`.jsonl`) file for analysis. This can generate large files.
+  * Type: `boolean`
+  * Default: `false`
+  * Example: `true`
+* **`simulation_trace_filename_prefix`**:
+  * Description: The base filename prefix used for the simulation trace log file. The final name will be `{prefix}_simulation_traces.jsonl` within the run log directory.
+  * Type: `string`
+  * Default: `"simulation_traces"`
+  * Example: `"sim_details"`
 
 ---
 
@@ -370,3 +380,6 @@ logging:
   log_archive_enabled: true
   log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker/main log stream
   log_archive_dir: "archives"       # Store archives in a subdirectory named "archives"
+
+  log_simulation_traces: false
+  simulation_trace_filename_prefix: "simulation_traces"
