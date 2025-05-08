@@ -215,7 +215,6 @@ class CFRDataManagerMixin:
                     # First time seeing this infoset or it was empty, initialize directly
                     self.regret_sum[infoset_key] = local_regrets.copy()  # Use copy
                 elif len(current_regrets) != num_actions_local:
-                    # Backlog 12: Handle dimension mismatch robustly
                     logger.warning(
                         "Merge Warn Regret: Dim mismatch key %s. Global:%d, Worker %d:%d. Re-initializing global + adding.",
                         infoset_key,
@@ -260,7 +259,6 @@ class CFRDataManagerMixin:
                 if current_strategy_sum is None or len(current_strategy_sum) == 0:
                     self.strategy_sum[infoset_key] = local_strategy_sum.copy()
                 elif len(current_strategy_sum) != num_actions_local:
-                    # Backlog 12: Handle dimension mismatch
                     logger.warning(
                         "Merge Warn Strategy: Dim mismatch key %s. Global:%d, Worker %d:%d. Re-initializing global + adding.",
                         infoset_key,
@@ -420,7 +418,6 @@ class CFRDataManagerMixin:
                     else:
                         normalized_strategy = normalized_strategy_reanorm
 
-                # Backlog 12: Check against regret sum dimension
                 regret_array = self.regret_sum.get(infoset_key)
                 if regret_array is not None and len(regret_array) != len(
                     normalized_strategy

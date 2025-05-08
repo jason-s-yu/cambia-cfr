@@ -54,29 +54,29 @@ def parse_human_readable_size(size_str: Union[str, int]) -> int:
     return value
 
 
-def parse_num_workers(num_workers: str | int) -> int:
+def parse_num_workers(num_workers: Union[str, int]) -> int:
     """Parse the number of workers, ensuring it's a positive integer."""
     if isinstance(num_workers, int):
         if num_workers < 0:
             # Allow 0 for auto, interpreted as os.cpu_count()
             if num_workers == 0:  # 0 means auto
                 cpu_count = os.cpu_count()
-                return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+                return max(1, (cpu_count - 1)) if cpu_count else 1
             raise ValueError("num_workers must be a positive integer or 0 for auto.")
-        return num_workers
+        return max(1, num_workers)  # Ensure at least 1 worker
     if isinstance(num_workers, str):
         if num_workers.lower() == "auto":
             cpu_count = os.cpu_count()
-            return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+            return max(1, (cpu_count - 1)) if cpu_count else 1
         try:
             val = int(num_workers)
             if val < 0:
                 # Allow 0 for auto
                 if val == 0:  # 0 means auto
                     cpu_count = os.cpu_count()
-                    return cpu_count - 1 if cpu_count is not None and cpu_count > 1 else 1
+                    return max(1, (cpu_count - 1)) if cpu_count else 1
                 raise ValueError("num_workers must be a positive integer or 0 for auto.")
-            return val
+            return max(1, val)  # Ensure at least 1 worker
         except ValueError:
             raise ValueError(
                 f"num_workers string '{num_workers}' must be 'auto' or an integer."
@@ -101,6 +101,13 @@ class SystemConfig:
     """General system-level settings."""
 
     recursion_limit: int = 10000  # Limit for recursion depth
+
+
+@dataclass
+class AnalysisConfig:
+    """Parameters for analysis tools, like exploitability calculation."""
+
+    exploitability_num_workers: int = 1  # Default to 1, parsed later
 
 
 @dataclass
@@ -204,7 +211,7 @@ class LoggingConfig:
     log_size_update_interval_sec: int = (
         60  # Interval in seconds to update log size display
     )
-    # Simulation Trace Logging (Backlog 5)
+    # Simulation Trace Logging
     log_simulation_traces: bool = False
     simulation_trace_filename_prefix: str = "simulation_traces"
 
@@ -301,6 +308,9 @@ class Config:
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
+    analysis: AnalysisConfig = field(
+        default_factory=AnalysisConfig
+    )
     _source_path: Optional[str] = None  # Internal field to store config path
 
 
@@ -409,7 +419,6 @@ def load_config(
                     ["logging", "log_size_update_interval_sec"],
                     LoggingConfig.log_size_update_interval_sec,
                 ),
-                # Backlog 5: Load new logging options
                 log_simulation_traces=get_nested(
                     config_dict,
                     ["logging", "log_simulation_traces"],
@@ -433,6 +442,25 @@ def load_config(
                 )
             )
             agents_config = AgentsConfig(greedy_agent=greedy_agent_config)
+
+            # --- Parse Analysis Config ---
+            cfr_training_num_workers_default = parse_num_workers(
+                get_nested(
+                    config_dict,
+                    ["cfr_training", "num_workers"],
+                    CfrTrainingConfig.num_workers,
+                )
+            )
+            analysis_config_dict = config_dict.get("analysis", {})
+            # Default exploitability workers to reasonable number based on training workers or half CPU
+            default_exploit_workers = max(1, cfr_training_num_workers_default // 2)
+            analysis_config = AnalysisConfig(
+                exploitability_num_workers=parse_num_workers(
+                    analysis_config_dict.get(
+                        "exploitability_num_workers", default_exploit_workers
+                    )
+                )
+            )
 
             # --- Assemble Main Config ---
             cfg = Config(
@@ -475,13 +503,8 @@ def load_config(
                         ["cfr_training", "exploitability_interval_seconds"],
                         CfrTrainingConfig.exploitability_interval_seconds,
                     ),
-                    num_workers=parse_num_workers(
-                        get_nested(
-                            config_dict,
-                            ["cfr_training", "num_workers"],
-                            CfrTrainingConfig.num_workers,
-                        )
-                    ),
+                    # Parse num_workers here after defaults established
+                    num_workers=cfr_training_num_workers_default,
                 ),
                 cfr_plus_params=CfrPlusParamsConfig(
                     weighted_averaging_enabled=get_nested(
@@ -568,6 +591,7 @@ def load_config(
                 ),
                 logging=logging_config,
                 agents=agents_config,
+                analysis=analysis_config,  # Assign parsed analysis config
                 _source_path=os.path.abspath(config_path),
             )
             return cfg

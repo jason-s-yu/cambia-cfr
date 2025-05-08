@@ -55,12 +55,13 @@ class LiveDisplayManager:
         self._min_worker_nodes_overall_str: str = "N/A"
         self._total_log_size_str: str = "Calculating..."
         self._log_records: Deque[logging.LogRecord] = deque(maxlen=50)
+        self._main_process_status: str = "Idle"  # New attribute
 
         self._last_header_text_str: Optional[str] = None
         self._last_worker_table_title: Optional[str] = None
         self._last_worker_statuses_repr: Optional[str] = None
         self._last_log_panel_content_str: Optional[str] = None
-        self._last_log_summary_str: Optional[str] = None
+        self._last_system_status_str: Optional[str] = None  # Renamed
 
         self.progress = self._create_progress_bar()
         self.iteration_task_id = self.progress.add_task(
@@ -96,7 +97,7 @@ class LiveDisplayManager:
         )
         layout["main_content"].split_column(
             Layout(name="main_row", ratio=1),
-            Layout(name="log_summary_panel", size=3),
+            Layout(name="system_status_panel", size=3),  # Renamed panel
         )
         layout["main_row"].split_row(
             Layout(name="workers", ratio=60), Layout(name="logs", ratio=40)
@@ -296,11 +297,20 @@ class LiveDisplayManager:
         )
         return Text(header_str, style="bold white on blue", justify="center")
 
-    def _generate_log_summary_panel(self) -> Panel:
-        """Generates the panel displaying log size summary."""
+    def _generate_system_status_panel(self) -> Panel:
+        """Generates the panel displaying system status (logs, main process)."""
+        status_text = Text.assemble(
+            (f"{self._total_log_size_str:<60}", "dim"),  # Log size info
+            (" | ", "white"),
+            (
+                f"Main Process: {self._main_process_status}",
+                "bright_cyan",
+            ),  # Main process status
+            justify="center",
+        )
         return Panel(
-            Text(self._total_log_size_str, justify="center"),
-            title="Log Sizes",
+            status_text,
+            title="System Status",  # New title
             border_style="dim",
             expand=True,
         )
@@ -338,10 +348,15 @@ class LiveDisplayManager:
             self._last_log_panel_content_str = current_log_str
             layout_updated = True
 
-        current_log_summary_str = self._total_log_size_str
-        if self._last_log_summary_str != current_log_summary_str:
-            self.layout["log_summary_panel"].update(self._generate_log_summary_panel())
-            self._last_log_summary_str = current_log_summary_str
+        # Check changes for the combined system status panel
+        current_system_status_str = (
+            f"{self._total_log_size_str}_{self._main_process_status}"
+        )
+        if self._last_system_status_str != current_system_status_str:
+            self.layout["system_status_panel"].update(
+                self._generate_system_status_panel()
+            )
+            self._last_system_status_str = current_system_status_str
             layout_updated = True
 
         try:
@@ -499,6 +514,12 @@ class LiveDisplayManager:
         new_display_str = f"Active Logs: {current_formatted}B | Archived: {archived_formatted}B | Total Est: {size_str}"
         if self._total_log_size_str != new_display_str:
             self._total_log_size_str = new_display_str
+            self.refresh()
+
+    def update_main_process_status(self, status: str):
+        """Updates the displayed status of the main training process."""
+        if self._main_process_status != status:
+            self._main_process_status = status
             self.refresh()
 
     def start(self):

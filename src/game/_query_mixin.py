@@ -229,7 +229,6 @@ class QueryMixin:
                         "QueryMixin: Start of turn but _get_legal_start_turn_actions missing."
                     )
 
-            # Backlog 7: Log if no actions found in non-terminal state AFTER attempting to get them
             if not legal_actions and not self.is_terminal():
                 logger.warning(
                     "QueryMixin: No legal actions found for P%d in non-terminal state. State: %s, Snap: %s, Pending: %s",

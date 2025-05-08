@@ -55,7 +55,7 @@ LocalStrategyUpdateDict: TypeAlias = Dict[InfosetKey, np.ndarray]
 LocalReachProbUpdateDict: TypeAlias = Dict[InfosetKey, float]
 
 
-# --- Simulation Trace Data Structures (Backlog 5) ---
+# --- Simulation Trace Data Structures ---
 class SimulationNodeData(TypedDict):
     """Data captured at each decision node during a worker simulation."""
 
@@ -84,7 +84,6 @@ class WorkerResult:
     strategy_updates: LocalStrategyUpdateDict = field(default_factory=dict)
     reach_prob_updates: LocalReachProbUpdateDict = field(default_factory=dict)
     stats: WorkerStats = field(default_factory=WorkerStats)
-    # Backlog 5: Store simulation trace nodes and final utility
     simulation_nodes: List[SimulationNodeData] = field(default_factory=list)
     final_utility: Optional[List[float]] = None
 

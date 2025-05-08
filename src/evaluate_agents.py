@@ -387,7 +387,7 @@ def run_evaluation(
                 config.cambia_rules.max_game_turns
                 if config.cambia_rules.max_game_turns > 0
                 else 500
-            )  # Add a default max turn if 0
+            )
 
             while not game_state.is_terminal() and turn < max_turns:
                 turn += 1

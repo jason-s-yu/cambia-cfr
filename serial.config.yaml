@@ -56,6 +56,6 @@ logging:
   log_max_bytes: 9437184        # Max size before rotation (~9MB = 9 * 1024 * 1024)
   log_backup_count: 9999        # Max number of backup log files
 
-  # Simulation Trace Logging (Backlog 5)
+  # Simulation Trace Logging
   log_simulation_traces: false  # Set to true to enable detailed trace logging to .jsonl file
   simulation_trace_filename_prefix: "simulation_traces" # Base filename for the simulation trace file
