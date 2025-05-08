@@ -14,9 +14,11 @@ import re
 import queue
 import threading
 import time
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, TYPE_CHECKING
 
-from .config import Config
+# Use TYPE_CHECKING for conditional import
+if TYPE_CHECKING:
+    from .config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,8 @@ QUEUE_SENTINEL = object()
 
 class LogArchiver:
     """
-    Handles archiving of log files passed via a queue.
+    Handles archiving of log files triggered via a queue.
+    Archives are created in batches when signaled by the SerialRotatingFileHandler.
     Archives are stored either directly in the file's directory or
     in a specified subdirectory within it.
     Operates asynchronously in a separate thread.
@@ -39,7 +42,7 @@ class LogArchiver:
 
     def __init__(
         self,
-        config: Config,
+        config: "Config",
         archive_queue: Union[queue.Queue, "multiprocessing.Queue"],
         run_log_dir: str,
     ):
@@ -48,7 +51,7 @@ class LogArchiver:
 
         Args:
             config: The main application configuration.
-            archive_queue: The queue from which to receive file paths for archiving.
+            archive_queue: The queue from which to receive archive trigger messages.
             run_log_dir: The absolute path to the current run's log directory (used for context).
         """
         self.config = config
@@ -122,31 +125,47 @@ class LogArchiver:
         self._archive_thread = None
 
     def _process_archive_queue(self):
-        """Continuously processes file paths from the archive queue."""
+        """Continuously processes messages from the archive queue."""
         logger.info("Log Archiver thread entering processing loop.")
         while not self._stop_event.is_set():
             try:
                 # Use a short timeout for get() to allow checking self._stop_event periodically
-                file_path_to_archive = self.archive_queue.get(block=True, timeout=0.5)  # type: ignore
+                queue_item = self.archive_queue.get(block=True, timeout=0.5)  # type: ignore
 
-                if file_path_to_archive is QUEUE_SENTINEL:
+                if queue_item is QUEUE_SENTINEL:
                     logger.info("Sentinel received, Log Archiver thread exiting.")
                     break  # Exit loop
 
-                if isinstance(file_path_to_archive, str) and os.path.exists(
-                    file_path_to_archive
+                # Handle BATCH_ARCHIVE trigger
+                if (
+                    isinstance(queue_item, tuple)
+                    and len(queue_item) == 3
+                    and queue_item[0] == "BATCH_ARCHIVE"
                 ):
-                    logger.debug("Received file to archive: %s", file_path_to_archive)
-                    self._archive_single_file(file_path_to_archive)
-                elif isinstance(file_path_to_archive, str):  # Path doesn't exist
+                    _, log_dir, base_pattern = queue_item
+                    if isinstance(log_dir, str) and isinstance(base_pattern, str):
+                        logger.debug(
+                            "Received BATCH_ARCHIVE trigger for dir: %s, pattern: %s",
+                            log_dir,
+                            base_pattern,
+                        )
+                        self._perform_batch_archive(log_dir, base_pattern)
+                    else:
+                        logger.warning(
+                            "Received invalid BATCH_ARCHIVE data types: %s", queue_item
+                        )
+                elif isinstance(
+                    queue_item, str
+                ):  # Handle legacy single-file paths (optional)
+                    # logger.warning("Received single file path '%s' for archiving (batching is preferred). Archiving individually.", queue_item)
+                    # self._archive_single_file(queue_item) # This function is removed
                     logger.warning(
-                        "Received path for archiving, but file does not exist: %s",
-                        file_path_to_archive,
+                        "Received deprecated single file path '%s' on archive queue. Ignoring.",
+                        queue_item,
                     )
                 else:
                     logger.warning(
-                        "Received invalid item from archive queue: %s",
-                        type(file_path_to_archive),
+                        "Received invalid item from archive queue: %s", type(queue_item)
                     )
 
             except queue.Empty:
@@ -160,109 +179,145 @@ class LogArchiver:
                 time.sleep(0.1)
 
         logger.info("Log Archiver thread exited processing loop.")
-        # Attempt to process any remaining items if not stopping abruptly
-        if self._stop_event.is_set():  # If stopping, don't try to drain aggressively
-            logger.info("Log Archiver stopping, not attempting to drain queue further.")
-            return
+        # No draining attempt here - stop means stop
 
-        logger.info("Log Archiver attempting to drain queue before final exit...")
+    def _extract_serial_from_filename(self, filename: str) -> Optional[int]:
+        """Extracts the serial number from a log filename."""
+        # Regex assumes pattern like _NNN.log at the end
+        match = re.search(r"_(\d+)\.log$", filename)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None
+
+    def _get_owner_id_from_base_pattern(self, base_pattern: str) -> str:
+        """Extracts owner ID like 'w0' or 'main' from the base pattern."""
+        # Example base_pattern: /path/to/logs/run_id/w0/cambia_run_ts-w0
+        # Example base_pattern: /path/to/logs/run_id/cambia_run_ts-main
+        base_name = os.path.basename(base_pattern)
+        worker_match = re.search(r"-(w\d+)$", base_name)
+        main_match = re.search(r"-(main)$", base_name)
+        if worker_match:
+            return worker_match.group(1)
+        elif main_match:
+            return main_match.group(1)
+        else:
+            # Fallback: Use the directory name if it looks like a worker ID
+            parent_dir_name = os.path.basename(os.path.dirname(base_pattern))
+            if parent_dir_name.startswith("w") and parent_dir_name[1:].isdigit():
+                return parent_dir_name
+            return "unknown_owner"  # Fallback
+
+    def _perform_batch_archive(self, log_dir: str, base_pattern: str):
+        """
+        Finds all log files matching the pattern, archives them into a single tar.gz
+        (named with the serial range), and deletes the originals on success.
+        """
         try:
-            while True:
-                file_path_to_archive = self.archive_queue.get_nowait()  # type: ignore
-                if file_path_to_archive is QUEUE_SENTINEL:
-                    continue  # Ignore further sentinels if any
-                if isinstance(file_path_to_archive, str) and os.path.exists(
-                    file_path_to_archive
-                ):
-                    logger.debug("Draining queue: Archiving %s", file_path_to_archive)
-                    self._archive_single_file(file_path_to_archive)
+            owner_id = self._get_owner_id_from_base_pattern(base_pattern)
+            glob_pattern = f"{base_pattern}_*.log"
+            files_to_archive = glob.glob(glob_pattern)
+
+            if not files_to_archive:
+                logger.warning(
+                    "Batch archive triggered for %s, but no matching files found.",
+                    glob_pattern,
+                )
+                return
+
+            # Sort files by serial number to find the range
+            files_with_serials = []
+            max_serial_num_for_padding = 0
+            for f_path in files_to_archive:
+                serial = self._extract_serial_from_filename(os.path.basename(f_path))
+                if serial is not None:
+                    files_with_serials.append((serial, f_path))
+                    max_serial_num_for_padding = max(max_serial_num_for_padding, serial)
                 else:
                     logger.warning(
-                        "Draining queue: Invalid or non-existent path %s",
-                        file_path_to_archive,
+                        "Could not extract serial number from file %s, skipping for naming/archiving.",
+                        f_path,
                     )
-        except queue.Empty:
-            logger.info("Archive queue drained.")
-        except Exception as e:
-            logger.error("Error draining archive queue: %s", e, exc_info=True)
 
-    def _archive_single_file(self, file_path: str):
-        """Archives a single specified log file."""
-        if not os.path.exists(file_path):
-            logger.warning("Cannot archive file, it does not exist: %s", file_path)
-            return
+            if not files_with_serials:
+                logger.error(
+                    "Could not extract serial numbers from any found files for %s. Cannot perform batch archive.",
+                    glob_pattern,
+                )
+                return
 
-        try:
-            worker_log_dir = os.path.dirname(file_path)
-            # Attempt to extract worker_id from the directory structure or filename
-            # This is a heuristic and might need adjustment based on actual log paths
-            worker_id_str = (
-                "unknown_owner"  # Default for files not clearly tied to a worker
-            )
-            dir_name = os.path.basename(worker_log_dir)
-            if dir_name.startswith("w") and dir_name[1:].isdigit():
-                worker_id_str = dir_name  # e.g. "w0", "w12"
-            else:  # Try to infer from filename if directory name is not specific
-                # Regex to find "-w<digits>_" or "-main_" in the filename for grouping
-                # Example: cambia_run_xxxx-w0_001.log -> w0
-                # Example: cambia_run_xxxx-main_001.log -> main
-                filename_only = os.path.basename(file_path)
-                worker_match = re.search(r"-(w\d+)_", filename_only)
-                main_match = re.search(r"-(main)_", filename_only)
+            files_with_serials.sort()
+            oldest_serial, oldest_file_path = files_with_serials[0]
+            latest_serial, _ = files_with_serials[-1]
+            actual_files_to_archive_paths = [f[1] for f in files_with_serials]
 
-                if worker_match:
-                    worker_id_str = worker_match.group(1)
-                elif main_match:
-                    worker_id_str = main_match.group(1)
-                # If neither, worker_id_str remains "unknown_owner"
+            # Determine padding based on max serial number OR backupCount, whichever is larger
+            backup_count = getattr(self.config.logging, "log_backup_count", 0)
+            pad_length = max(len(str(max_serial_num_for_padding)), len(str(backup_count)))
 
-            logger.debug(
-                "ARCHIVER_EVENT: Archiving file %s for effective owner_id %s",
-                file_path,
-                worker_id_str,
+            # Format the range string with padding
+            range_string = (
+                f"{oldest_serial:0{pad_length}d}-{latest_serial:0{pad_length}d}"
             )
 
-            # Create a more descriptive base name: log_owner_<original_filename_stem>
-            original_filename_stem = os.path.splitext(os.path.basename(file_path))[0]
-            archive_base_name = f"log_{worker_id_str}_{original_filename_stem}"
+            # Construct archive name based on owner and range
+            archive_base_name = f"log_{owner_id}_{range_string}"
+            logger.info(
+                "Performing batch archive for owner '%s'. Found %d files (Serials: %s). Archive base: %s",
+                owner_id,
+                len(actual_files_to_archive_paths),
+                range_string,
+                archive_base_name,
+            )
 
             created_archive_path = self._archive_files_in_dir(
-                worker_log_dir,  # The directory where the file resides
-                worker_id_str,  # The derived owner ID for managing archive limits
-                [file_path],  # List containing only the single file to archive
-                archive_base_name,  # The specific base name for this archive
+                log_dir,  # Pass the directory where logs reside
+                owner_id,
+                actual_files_to_archive_paths,
+                archive_base_name,  # Pass the new base name including the range
             )
 
             if created_archive_path:
                 logger.info(
-                    "ARCHIVER_EVENT: File %s archived to %s. Deleting original.",
-                    file_path,
+                    "Batch archive %s created successfully. Deleting %d original files...",
                     created_archive_path,
+                    len(actual_files_to_archive_paths),
                 )
-                try:
-                    os.remove(file_path)
-                    logger.debug("ARCHIVER_EVENT: Deleted original file %s", file_path)
-                except OSError as e:
-                    logger.error(
-                        "ARCHIVER_EVENT: Error deleting original archived file %s: %s",
-                        file_path,
-                        e,
+                deletion_errors = 0
+                for file_path in actual_files_to_archive_paths:
+                    try:
+                        os.remove(file_path)
+                        logger.debug("Deleted original log file: %s", file_path)
+                    except OSError as e:
+                        deletion_errors += 1
+                        logger.error(
+                            "Error deleting original archived file %s: %s", file_path, e
+                        )
+                if deletion_errors > 0:
+                    logger.warning(
+                        "Finished batch archive, but %d errors occurred during deletion of originals.",
+                        deletion_errors,
                     )
-                # Manage archive limits based on the owner and the prefix used for their archives
+                else:
+                    logger.info("Successfully deleted all original log files.")
+
+                # Manage overall archive limit for this owner
                 self._manage_archive_limit(
-                    worker_log_dir,
-                    worker_id_str,
-                    archive_base_name_prefix=f"log_{worker_id_str}_",
+                    log_dir, owner_id, archive_base_name_prefix=f"log_{owner_id}_"
                 )
             else:
-                logger.warning(
-                    "ARCHIVER_EVENT: Archival of %s attempted but _archive_files_in_dir returned None.",
-                    file_path,
+                logger.error(
+                    "Batch archive creation failed for owner %s, pattern %s. Original files were NOT deleted.",
+                    owner_id,
+                    base_pattern,
                 )
+
         except Exception as e:
             logger.error(
-                "ARCHIVER_EVENT: Unexpected error archiving file %s: %s",
-                file_path,
+                "Unexpected error performing batch archive for pattern %s: %s",
+                base_pattern,
                 e,
                 exc_info=True,
             )
@@ -283,7 +338,7 @@ class LogArchiver:
         log_file_parent_dir: str,  # The directory containing the log file(s) to be archived
         owner_id_str: str,  # An ID for the owner (e.g. "w0", "main") for archive naming
         files_to_archive: List[str],
-        archive_base_name_template: str,  # Base name, e.g., "worker_w0_logs" or "log_w0_specificfile"
+        archive_base_name_template: str,  # Base name, e.g., "log_w0_001-005"
     ) -> Optional[str]:
         """
         Creates a tar.gz archive of the given files.
@@ -312,11 +367,12 @@ class LogArchiver:
             return None
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        # Use the template for the base name, ensuring uniqueness with timestamp
+        # Use the template for the base name (now including range), ensuring uniqueness with timestamp
         archive_filename = f"{archive_base_name_template}_{timestamp}.tar.gz"
         archive_path = os.path.join(target_archive_dir, archive_filename)
         logger.debug("Attempting to create archive: %s", archive_path)
 
+        files_added_count = 0
         try:
             with tarfile.open(archive_path, "w:gz") as tar:
                 for file_path in files_to_archive:
@@ -332,18 +388,23 @@ class LogArchiver:
                         os.path.basename(file_path),
                     )
                     tar.add(file_path, arcname=os.path.basename(file_path))
+                    files_added_count += 1
             # Verify archive was created and has content before logging success
-            if os.path.exists(archive_path) and os.path.getsize(archive_path) > 0:
+            if (
+                os.path.exists(archive_path)
+                and os.path.getsize(archive_path) > 0
+                and files_added_count > 0
+            ):
                 logger.info(
                     "Successfully created archive %s for owner %s with %d file(s).",
                     archive_path,
                     owner_id_str,
-                    len(files_to_archive),
+                    files_added_count,
                 )
                 return archive_path
             else:  # Archive creation might have failed silently or produced an empty file.
                 logger.error(
-                    "Archive %s for owner %s reported as created, but is missing or empty.",
+                    "Archive %s for owner %s reported as created, but is missing, empty, or no files were added.",
                     archive_path,
                     owner_id_str,
                 )
