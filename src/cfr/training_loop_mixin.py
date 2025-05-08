@@ -6,6 +6,7 @@ import multiprocessing.pool
 import os
 import threading
 import time
+import queue
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..utils import (
@@ -15,6 +16,7 @@ from ..utils import (
     format_infoset_count,
 )
 from .exceptions import GracefulShutdownException
+from .worker import run_cfr_simulation_worker
 
 
 # Use TYPE_CHECKING to avoid circular import for type hints where possible
@@ -33,9 +35,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-# Timeout removed from POOL_TERMINATE_TIMEOUT_SECONDS as pool.join() has no timeout arg
-# POOL_TERMINATE_TIMEOUT_SECONDS = 10 # This constant is no longer used for pool.join()
 
 
 class CFRTrainingLoopMixin:
@@ -82,19 +81,30 @@ class CFRTrainingLoopMixin:
     def _shutdown_pool(self, pool: Optional[multiprocessing.pool.Pool]):
         """Gracefully shuts down the multiprocessing pool."""
         if pool:
-            logger.info("Terminating worker pool...")
-            try:
-                pool.terminate()
-                # Add a small delay to allow worker processes to potentially react to SIGTERM
-                time.sleep(0.5)  # 500ms delay
-                pool.join()  # Join AFTER terminate, no timeout argument needed or accepted
-                logger.info("Worker pool terminated and joined.")
-            except ValueError:
-                logger.warning("Attempted to terminate/join an already closed pool.")
-            except Exception as e_pool_shutdown:
-                logger.error(
-                    "Exception during pool shutdown: %s", e_pool_shutdown, exc_info=True
-                )
+            # Check if pool is still running before interacting
+            # Note: _state attribute is internal, but commonly checked
+            pool_running = getattr(pool, "_state", -1) == multiprocessing.pool.RUN
+
+            if pool_running:
+                logger.info("Terminating worker pool...")
+                try:
+                    pool.terminate()
+                    # Add a small delay to allow worker processes to potentially react to SIGTERM
+                    time.sleep(0.5)  # 500ms delay
+                    pool.join()  # Join AFTER terminate, no timeout argument needed or accepted
+                    logger.info("Worker pool terminated and joined.")
+                except ValueError:
+                    logger.warning(
+                        "Attempted to terminate/join an already closed pool state."
+                    )
+                except Exception as e_pool_shutdown:
+                    logger.error(
+                        "Exception during pool shutdown: %s",
+                        e_pool_shutdown,
+                        exc_info=True,
+                    )
+            else:
+                logger.info("Worker pool already terminated or closed.")
 
     def _try_update_log_size_display(self):
         """Attempts to update the log size display periodically."""
@@ -159,6 +169,13 @@ class CFRTrainingLoopMixin:
             display.update_main_process_status("Computing average strategy...")
 
         try:
+            # Check for shutdown BEFORE computing average strategy
+            if self.shutdown_event.is_set():
+                logger.warning(
+                    "Shutdown detected before computing average strategy for exploitability."
+                )
+                raise GracefulShutdownException("Shutdown during exploitability prep")
+
             current_avg_strategy = self.compute_average_strategy()
 
             if current_avg_strategy is not None:
@@ -166,6 +183,13 @@ class CFRTrainingLoopMixin:
                 # Update status before starting calculation
                 if display and hasattr(display, "update_main_process_status"):
                     display.update_main_process_status("Calculating exploitability...")
+
+                # Check for shutdown BEFORE starting long calculation
+                if self.shutdown_event.is_set():
+                    logger.warning(
+                        "Shutdown detected before starting exploitability calculation."
+                    )
+                    raise GracefulShutdownException("Shutdown during exploitability prep")
 
                 exploit_start_time = time.time()
                 try:
@@ -186,6 +210,10 @@ class CFRTrainingLoopMixin:
                         time.time() - exploit_start_time,
                     )
                     self._last_exploitability_calc_time = time.time()  # Update timestamp
+                except (
+                    GracefulShutdownException
+                ):  # Catch if raised internally by calculate_exploitability
+                    raise  # Re-raise to be caught by main loop handler
                 except Exception:
                     logger.exception(
                         "Error calculating exploitability at iter %d.", iteration
@@ -204,6 +232,8 @@ class CFRTrainingLoopMixin:
                 if display and hasattr(display, "update_main_process_status"):
                     display.update_main_process_status("Idle / Waiting...")
 
+        except GracefulShutdownException:  # Catch if raised during avg strategy calc
+            raise  # Re-raise to be caught by main loop handler
         except Exception as e_avg_strat:
             logger.exception(
                 "Error computing average strategy for exploitability: %s", e_avg_strat
@@ -306,6 +336,7 @@ class CFRTrainingLoopMixin:
 
         try:
             for t in range(start_iter_num, end_iter_num + 1):
+                # Check shutdown at start of loop
                 if self.shutdown_event.is_set():
                     logger.warning("Shutdown detected before starting iteration %d.", t)
                     raise GracefulShutdownException("Shutdown detected before iteration")
@@ -371,27 +402,232 @@ class CFRTrainingLoopMixin:
                         f"Could not prepare regret snapshot for iter {t}"
                     ) from e_snap
 
-                worker_base_args = (
-                    t,
-                    self.config,
-                    regret_snapshot,
-                    progress_q_local,
-                    archive_q_local,
-                )
+                worker_args_list = []
+                if run_log_dir_local and run_timestamp_local:
+                    for i in range(num_workers):
+                        worker_args_list.append(
+                            (
+                                t,
+                                self.config,
+                                regret_snapshot,
+                                progress_q_local,
+                                archive_q_local,
+                                i,  # worker_id
+                                run_log_dir_local,
+                                run_timestamp_local,
+                            )
+                        )
+                else:  # Should not happen if setup succeeded
+                    logger.error("run_log_dir or run_timestamp missing for worker args!")
+                    raise RuntimeError("Missing log dir/timestamp for workers")
+
                 results: List[Optional[WorkerResult]] = [None] * num_workers
                 sim_failed_count = 0
                 successful_sim_count = 0
 
-                # Execute simulations (no changes here)
-                # ... (Existing logic for sequential and parallel execution) ...
+                # --- Execute simulations ---
                 if num_workers == 1:
-                    # ... (sequential execution logic) ...
-                    pass  # No changes needed in this block for status display
-                else:  # Parallel execution
-                    # ... (parallel execution logic) ...
-                    pass  # No changes needed in this block for status display
+                    # Sequential execution
+                    logger.debug("Running simulation sequentially for iter %d...", t)
+                    try:
+                        # Check shutdown BEFORE running simulation
+                        if self.shutdown_event.is_set():
+                            raise GracefulShutdownException(
+                                "Shutdown before sequential worker"
+                            )
+                        results[0] = run_cfr_simulation_worker(worker_args_list[0])
+                        if results[0] and isinstance(results[0], WorkerResult):
+                            self._worker_statuses[0] = results[0].stats
+                            min_nodes_this_iter_overall = min(
+                                min_nodes_this_iter_overall,
+                                results[0].stats.nodes_visited,
+                            )
+                            if results[0].stats.error_count > 0:
+                                sim_failed_count += 1
+                            else:
+                                successful_sim_count += 1
+                            if log_sim_traces and self.analysis:
+                                self.analysis.log_simulation_trace(
+                                    {
+                                        "metadata": {
+                                            "iteration": t,
+                                            "worker_id": 0,
+                                            "final_utility": results[0].final_utility,
+                                            "stats": results[0].stats.__dict__,
+                                        },
+                                        "history": results[0].simulation_nodes,
+                                    }
+                                )
+                        else:
+                            self._worker_statuses[0] = "Execution Failed"
+                            sim_failed_count += 1
+                    except GracefulShutdownException:  # Catch shutdown during run
+                        raise  # Re-raise
+                    except Exception as e_seq:
+                        logger.exception(
+                            "Sequential simulation worker failed iter %d: %s", t, e_seq
+                        )
+                        self._worker_statuses[0] = "Execution Failed"
+                        sim_failed_count += 1
+                else:
+                    # Parallel execution
+                    if not pool:
+                        logger.info("Creating worker pool (size %d)...", num_workers)
+                        pool = multiprocessing.Pool(processes=num_workers)
+
+                    async_results = pool.map_async(
+                        run_cfr_simulation_worker, worker_args_list
+                    )
+                    try:
+                        timeout_interval = 0.5  # seconds
+                        while not async_results.ready():
+                            # Check shutdown frequently while waiting
+                            if self.shutdown_event.is_set():
+                                logger.warning(
+                                    "Shutdown detected while waiting for workers iter %d. Terminating pool.",
+                                    t,
+                                )
+                                self._shutdown_pool(pool)  # Terminate pool on shutdown
+                                pool = None  # Mark pool as stopped
+                                raise GracefulShutdownException(
+                                    "Shutdown during worker execution"
+                                )
+
+                            async_results.wait(
+                                timeout=timeout_interval
+                            )  # Wait with timeout
+
+                            # --- Progress Queue Processing ---
+                            if progress_q_local:
+                                while True:  # Drain queue
+                                    try:
+                                        update = progress_q_local.get_nowait()
+                                        worker_id_upd, cur_d, max_d, nodes, min_d_bt = (
+                                            update
+                                        )
+                                        if 0 <= worker_id_upd < num_workers:
+                                            current_status = self._worker_statuses.get(
+                                                worker_id_upd
+                                            )
+                                            status_str = "Running"
+                                            if isinstance(current_status, tuple):
+                                                status_str = current_status[
+                                                    0
+                                                ]  # Preserve state string
+
+                                            new_status = (
+                                                status_str,
+                                                cur_d,
+                                                max_d,
+                                                nodes,
+                                                min_d_bt,
+                                            )
+                                            # Update only if different to avoid excessive refreshes
+                                            if current_status != new_status:
+                                                self._worker_statuses[worker_id_upd] = (
+                                                    new_status
+                                                )
+                                                if display:
+                                                    display.update_worker_status(
+                                                        worker_id_upd, new_status
+                                                    )
+                                                min_nodes_this_iter_overall = min(
+                                                    min_nodes_this_iter_overall, nodes
+                                                )
+
+                                    except queue.Empty:
+                                        break  # No more updates currently
+                                    except Exception as pqe:
+                                        logger.error(
+                                            "Error processing progress queue: %s", pqe
+                                        )
+                        # Get final results ONLY if shutdown wasn't triggered
+                        if not self.shutdown_event.is_set():
+                            results = async_results.get()
+                        else:
+                            # If shutdown was triggered, we already raised GracefulShutdownException
+                            # Results are irrelevant. Ensure loop terminates.
+                            # This path should technically not be reached due to the raise above.
+                            logger.warning(
+                                "Shutdown occurred before getting worker results."
+                            )
+                            raise GracefulShutdownException(
+                                "Shutdown while waiting for results"
+                            )
+
+                        # Process final results from workers
+                        for i, res in enumerate(results):
+                            if isinstance(res, WorkerResult):
+                                self._worker_statuses[i] = res.stats
+                                if res.stats.error_count == 0:
+                                    successful_sim_count += 1
+                                    min_nodes_this_iter_overall = min(
+                                        min_nodes_this_iter_overall,
+                                        res.stats.nodes_visited,
+                                    )
+                                    if log_sim_traces and self.analysis:
+                                        self.analysis.log_simulation_trace(
+                                            {
+                                                "metadata": {
+                                                    "iteration": t,
+                                                    "worker_id": i,
+                                                    "final_utility": res.final_utility,
+                                                    "stats": res.stats.__dict__,
+                                                },
+                                                "history": res.simulation_nodes,
+                                            }
+                                        )
+                                else:  # Error occurred
+                                    sim_failed_count += 1
+                                    logger.warning(
+                                        "Worker %d reported %d errors.",
+                                        i,
+                                        res.stats.error_count,
+                                    )
+                            elif (
+                                res is None
+                            ):  # Worker might have crashed or returned None
+                                self._worker_statuses[i] = "Failed (None Result)"
+                                sim_failed_count += 1
+                                logger.error(
+                                    "Worker %d returned None result for iter %d.", i, t
+                                )
+                            else:  # Unexpected return type
+                                self._worker_statuses[i] = (
+                                    f"Failed (Type {type(res).__name__})"
+                                )
+                                sim_failed_count += 1
+                                logger.error(
+                                    "Worker %d returned unexpected result type %s for iter %d.",
+                                    i,
+                                    type(res).__name__,
+                                    t,
+                                )
+
+                    except (
+                        GracefulShutdownException,
+                        KeyboardInterrupt,
+                    ):  # Catch shutdown here too
+                        logger.warning(
+                            "Shutdown/Interrupt received during worker pool execution iter %d. Ensuring pool shutdown.",
+                            t,
+                        )
+                        self._shutdown_pool(pool)
+                        pool = None
+                        raise  # Re-raise
+                    except Exception as e_pool:
+                        logger.exception(
+                            "Error during worker pool execution iter %d: %s", t, e_pool
+                        )
+                        self._shutdown_pool(pool)
+                        pool = None
+                        raise  # Propagate error up
 
                 # --- End Simulation Execution ---
+
+                # Check shutdown AFTER simulations
+                if self.shutdown_event.is_set():
+                    raise GracefulShutdownException("Shutdown after worker simulations")
 
                 # Update display min nodes
                 if display and hasattr(display, "_min_worker_nodes_overall_str"):
@@ -432,6 +668,10 @@ class CFRTrainingLoopMixin:
                         t,
                     )
 
+                # Check shutdown BEFORE merge
+                if self.shutdown_event.is_set():
+                    raise GracefulShutdownException("Shutdown before merge")
+
                 if valid_results_for_merge:
                     logger.debug(
                         "Merging results from %d successful workers for iter %d...",
@@ -469,7 +709,7 @@ class CFRTrainingLoopMixin:
                         # Reset status after merge error
                         if display and hasattr(display, "update_main_process_status"):
                             display.update_main_process_status("Idle / Waiting...")
-                        continue
+                        continue  # Skip rest of iteration on merge failure
                     finally:
                         # Reset status after merge (even if successful)
                         if display and hasattr(display, "update_main_process_status"):
@@ -481,6 +721,12 @@ class CFRTrainingLoopMixin:
                     len(self.regret_sum) if hasattr(self, "regret_sum") else 0
                 )
                 self._total_infosets_str = format_infoset_count(regret_sum_len)
+
+                # Check shutdown BEFORE exploitability
+                if self.shutdown_event.is_set():
+                    raise GracefulShutdownException(
+                        "Shutdown before exploitability check"
+                    )
 
                 # --- Exploitability Calculation (Iteration and Time based) ---
                 should_calculate_exploitability = False
@@ -512,10 +758,16 @@ class CFRTrainingLoopMixin:
                         trigger_reason,
                     )
                     if hasattr(self, "_calculate_exploitability_if_needed"):
-                        self._calculate_exploitability_if_needed(t)
+                        self._calculate_exploitability_if_needed(
+                            t
+                        )  # This now raises GracefulShutdownException
                     else:
                         logger.error("Cannot calculate exploitability: method missing.")
                 # --- End Exploitability Calculation ---
+
+                # Check shutdown AFTER exploitability
+                if self.shutdown_event.is_set():
+                    raise GracefulShutdownException("Shutdown after exploitability check")
 
                 # Update display
                 if display and hasattr(display, "update_stats"):
@@ -533,6 +785,10 @@ class CFRTrainingLoopMixin:
                                     i_disp, final_status_iter_end
                                 )
 
+                # Check shutdown BEFORE save
+                if self.shutdown_event.is_set():
+                    raise GracefulShutdownException("Shutdown before save interval")
+
                 # Periodic save
                 if save_interval > 0 and t % save_interval == 0:
                     logger.info("Saving progress at iteration %d...", t)
@@ -540,6 +796,10 @@ class CFRTrainingLoopMixin:
                         self.save_data()
                     else:
                         logger.error("Cannot save data: save_data method missing.")
+
+                last_completed_iteration = (
+                    t  # Update last successfully completed iteration
+                )
 
             logger.info("Training loop completed %d iterations.", total_iterations_to_run)
 
@@ -552,7 +812,7 @@ class CFRTrainingLoopMixin:
             if hasattr(self, "shutdown_event") and not self.shutdown_event.is_set():
                 self.shutdown_event.set()
             self._perform_emergency_save(
-                last_completed_iteration,
+                last_completed_iteration,  # Pass last known good iteration
                 start_iter_num,
                 exception_type,
                 pool_to_shutdown=pool,
@@ -564,7 +824,7 @@ class CFRTrainingLoopMixin:
         except Exception as main_loop_e:
             logger.exception("Unhandled exception in main training loop:")
             self._perform_emergency_save(
-                last_completed_iteration,
+                last_completed_iteration,  # Pass last known good iteration
                 start_iter_num,
                 type(main_loop_e).__name__,
                 pool_to_shutdown=pool,
@@ -572,9 +832,12 @@ class CFRTrainingLoopMixin:
             raise
 
         # --- Normal Completion ---
+        # Check if shutdown event was set *just* as the loop finished
         if hasattr(self, "shutdown_event") and not self.shutdown_event.is_set():
             end_time = time.time()
-            total_completed_in_run = self.current_iteration - last_completed_iteration
+            total_completed_in_run = self.current_iteration - (
+                start_iter_num - 1
+            )  # Use start_iter_num
             logger.info(
                 "Training loop finished normally after %d iterations.",
                 total_completed_in_run,
@@ -634,11 +897,15 @@ class CFRTrainingLoopMixin:
             logger.info("Final data saved.")
             if hasattr(self, "_write_run_summary") and callable(self._write_run_summary):
                 self._write_run_summary()
+        else:  # Shutdown event was set during normal completion
+            logger.warning(
+                "Shutdown signal received during normal completion. Final save/summary skipped (emergency save should cover)."
+            )
 
     def _perform_emergency_save(
         self,
-        last_completed_iteration_before_run: int,
-        start_iter_num_this_run: int,
+        last_completed_iteration: int,
+        start_iter_num_this_run: int,  # Keep this arg for consistency
         reason: str,
         pool_to_shutdown: Optional[multiprocessing.pool.Pool],
     ):
@@ -646,20 +913,8 @@ class CFRTrainingLoopMixin:
         logger.warning("Attempting emergency save due to: %s", reason)
         self._shutdown_pool(pool_to_shutdown)  # Ensure workers stopped
 
-        current_iter_val = getattr(
-            self, "current_iteration", 0
-        )  # Get current iteration safely
-
-        # Determine the iteration to save (last fully completed one)
-        if current_iter_val >= start_iter_num_this_run:
-            # If we started a new iteration, save the state from *before* it began
-            iter_to_save_as_completed = current_iter_val - 1
-        else:
-            # If interrupted before the first new iteration, save the loaded state
-            iter_to_save_as_completed = last_completed_iteration_before_run
-
-        # Ensure non-negative iteration number
-        iter_to_save_as_completed = max(0, iter_to_save_as_completed)
+        # Save based on the last fully completed iteration recorded before interruption
+        iter_to_save_as_completed = last_completed_iteration
 
         logger.info(
             "Attempting to save data reflecting completion of iteration %d.",
@@ -681,7 +936,7 @@ class CFRTrainingLoopMixin:
         except Exception as e_save:
             logger.exception("Emergency save failed: %s", e_save)
         finally:
-            # Restore actual current iteration number
+            # Restore actual current iteration number (might be inaccurate if interrupt mid-iter)
             self.current_iteration = original_current_iter_val
             # Write summary regardless of save success
             if hasattr(self, "_write_run_summary") and callable(self._write_run_summary):

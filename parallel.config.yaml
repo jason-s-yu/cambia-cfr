@@ -16,7 +16,7 @@ cfr_training:
   pruning_enabled: true                   # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6               # Regrets below this considered zero for pruning
   exploitability_interval: 100            # Calculate exploitability every N iterations (higher priority than time)
-  exploitability_interval_seconds: 7200   # Calculate exploitability if X seconds pass (e.g., 4 hours), lower priority
+  exploitability_interval_seconds: 7200   # Calculate exploitability if X seconds pass (e.g., 2 hours), lower priority
   num_workers: 23                         # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
@@ -47,15 +47,22 @@ persistence:
   # Path relative to execution directory where agent data is saved/loaded
   agent_data_save_path: "strategy/cambia_cfr_strategy-v0.8.3-l1-p16-archlog-timeexpl.joblib"
 
+# Baseline Agent Settings (primarily for evaluation)
 agents:
   greedy_agent:
     # Parameters for the simple greedy baseline agent
     cambia_call_threshold: 5  # Call Cambia if hand value is this or lower (if legal)
 
+# Analysis Settings
+analysis:
+  # Number of workers within each Best Response calculation process.
+  # 1 = sequential BR action eval. "auto" or 0 defaults based on cfr_training.num_workers.
+  exploitability_num_workers: 0
+
 # Logging Configuration
 logging:
   log_level_file: "DEBUG"            # Global fallback for main process, and for workers if worker_config missing/doesn't cover.
-  log_level_console: "DEBUG"      # Logging level for the console
+  log_level_console: "DEBUG"         # Logging level for the console live display.
   log_dir: "logs"                   # Directory to store log files
   log_file_prefix: "cambia"         # Prefix for log files within the run directory
   log_max_bytes: "10MB"             # Max size before rotation for an individual log file (e.g., worker_N_001.log)
@@ -67,15 +74,13 @@ logging:
     default_level: "INFO"   # Base level for workers, unless a sequential rule or override matches.
     sequential_rules:
       - "DEBUG"             # Worker 0: DEBUG. Subsequent workers use default_level unless overridden.
-    overrides: []
+    overrides: []           # Example: [{worker_ids: [0], level: "WARNING"}]
 
   # Log Archiving Settings (for worker logs and main process logs)
   log_archive_enabled: true                # Enable archiving of rotated log files.
   log_archive_max_archives: 0              # Max number of archive files (tar.gz) to keep per owner (e.g. w0, main); <=0 is unlimited.
   log_archive_dir: ""                      # Subdirectory within the log file's own directory for storing its archives;
                                            # empty str means archives are stored in the same directory as the log files.
-                                           # e.g., logs/cambia_run_YYYYMMDD_HHMMSS/w0/ (if empty) or
-                                           # logs/cambia_run_YYYYMMDD_HHMMSS/w0/archives/ (if "archives")
 
   # Simulation Trace Logging
   log_simulation_traces: false              # Set to true to enable detailed trace logging to .jsonl file

@@ -308,9 +308,7 @@ class Config:
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
-    analysis: AnalysisConfig = field(
-        default_factory=AnalysisConfig
-    )
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     _source_path: Optional[str] = None  # Internal field to store config path
 
 

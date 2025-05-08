@@ -6,6 +6,7 @@ import os
 import copy
 import queue
 import time
+import threading
 import multiprocessing
 import multiprocessing.pool
 import traceback
@@ -33,6 +34,9 @@ from .config import Config
 from .utils import InfosetKey, PolicyDict, normalize_probabilities, SimulationTrace
 from .game.helpers import serialize_card
 
+from .cfr.exceptions import GracefulShutdownException
+
+
 # Conditional imports for type hinting
 from typing import TYPE_CHECKING
 
@@ -57,6 +61,8 @@ def _br_action_worker(
     """
     Target function for the BR pool. Applies one action and calls node logic.
     """
+    # No direct access to the main shutdown event here.
+    # Relies on the pool being terminated if shutdown is triggered.
     try:
         # Apply the action to the copied state
         state_delta, undo_info = game_state_copy.apply_action(action)
@@ -102,13 +108,15 @@ def _br_action_worker(
         # No undo needed as we work on copies
         return action_value
     except Exception as e:
+        # Log error from within the worker process
         logger.error(
-            "BR ActionWorker(D%d): Error processing action %s: %s\n%s",
+            "BR ActionWorker(D%d, P%d): Error processing action %s: %s\n%s",
             depth,
+            br_player,
             action,
             e,
             traceback.format_exc(),
-            exc_info=False,
+            exc_info=False,  # Keep log cleaner
         )
         return -float("inf")  # Indicate failure
 
@@ -139,24 +147,37 @@ def _run_br_calculation_process(
     config: Config,
     br_player: int,
     result_queue: multiprocessing.Queue,
+    # Add shutdown_event (will be a copy, but can be checked)
+    # Note: Modifying the *original* event won't work across processes.
+    # This check is primarily for reacting if the main process signalled shutdown
+    # *before* this process started its main work.
+    shutdown_event_copy: Optional[threading.Event],
 ):
     """
     Function executed by each of the two main BR calculation processes.
-    Sets up a local pool and calls the BR entry point.
+    Sets up a local pool and calls the BR entry point. Includes basic error handling.
     """
+    pool: Optional[multiprocessing.pool.Pool] = None  # Define pool here for finally block
     try:
-        # Basic logging setup for this process (optional, could log to specific file)
-        # configure_logging_for_process(f"br_process_p{br_player}")
+        # --- Check for immediate shutdown ---
+        if shutdown_event_copy is not None and shutdown_event_copy.is_set():
+            logger.warning(
+                "BR Process P%d: Shutdown detected at startup. Exiting.", br_player
+            )
+            result_queue.put((br_player, float("inf")))  # Indicate failure/abort
+            return
 
-        logger.info("BR Process P%d: Starting...", br_player)
+        # Basic logging setup for this process (optional, could log to specific file)
+        # configure_logging_for_process(f"br_process_p{br_player}") # Example
+
+        logger.info("BR Process P%d: Starting calculation...", br_player)
         exploit_workers = config.analysis.exploitability_num_workers
         logger.info(
-            "BR Process P%d: Using %d workers for action evaluation.",
+            "BR Process P%d: Using %d pool workers for action evaluation.",
             br_player,
             exploit_workers,
         )
 
-        pool: Optional[multiprocessing.pool.Pool] = None
         if exploit_workers > 1:
             pool = multiprocessing.Pool(processes=exploit_workers)
             logger.debug("BR Process P%d: Worker pool created.", br_player)
@@ -216,16 +237,25 @@ def _run_br_calculation_process(
         result_queue.put((br_player, br_value))
 
     except Exception as e:
+        # Log the error from within the BR process
         logger.error(
-            "BR Process P%d: Unhandled exception: %s\n%s",
+            "!!! BR Process P%d: Unhandled exception during calculation: %s\n%s",
             br_player,
             e,
-            traceback.format_exc(),
-            exc_info=False,
+            traceback.format_exc(),  # Log full traceback from process
+            exc_info=False,  # Prevent duplicate logging by root logger if propagated
         )
-        result_queue.put((br_player, float("inf")))  # Signal failure
+        try:
+            # Attempt to put failure signal on queue
+            result_queue.put((br_player, float("inf")))
+        except Exception as q_err:
+            logger.error(
+                "BR Process P%d: Failed to put error signal on queue: %s",
+                br_player,
+                q_err,
+            )
     finally:
-        # Clean up the local pool
+        # Clean up the local pool associated with *this* BR process
         if pool:
             try:
                 logger.debug("BR Process P%d: Closing worker pool...", br_player)
@@ -236,6 +266,7 @@ def _run_br_calculation_process(
                 logger.error(
                     "BR Process P%d: Error closing pool: %s", br_player, e_pool_close
                 )
+        logger.info("BR Process P%d: Exiting.", br_player)
 
 
 # Helper function for default serialization in JSON dump
@@ -346,6 +377,8 @@ class AnalysisTools:
         average_strategy: PolicyDict,
         config: Config,
         live_display_manager: Optional["LiveDisplayManager"] = None,
+        # Add shutdown_event from trainer
+        shutdown_event: Optional[threading.Event] = None,
     ) -> float:
         """Calculates the exploitability of the agent's average strategy using parallel processes."""
         if not average_strategy:
@@ -354,6 +387,7 @@ class AnalysisTools:
 
         exploitability = float("inf")  # Default to infinity
         start_time = time.time()
+        br_processes: List[multiprocessing.Process] = []  # Keep track of processes
 
         # Update display status
         if live_display_manager and hasattr(
@@ -367,7 +401,6 @@ class AnalysisTools:
             logger.info("Starting parallel exploitability calculation...")
             # Use a standard multiprocessing Queue
             result_queue = multiprocessing.Queue()
-            processes: List[multiprocessing.Process] = []
 
             # Spawn two processes, one for each BR player
             for br_player in range(NUM_PLAYERS):
@@ -375,40 +408,70 @@ class AnalysisTools:
                     "Spawning Best Response calculation process for Player %d...",
                     br_player,
                 )
+                # Pass the shutdown event (it will be a copy, but process can check initial state)
                 process = multiprocessing.Process(
                     target=_run_br_calculation_process,
-                    args=(average_strategy, config, br_player, result_queue),
+                    args=(
+                        average_strategy,
+                        config,
+                        br_player,
+                        result_queue,
+                        shutdown_event,
+                    ),
                     name=f"BR_Calc_P{br_player}",
                 )
-                processes.append(process)
+                br_processes.append(process)
                 process.start()
 
             # Wait for both processes to finish and collect results
             results_dict = {}
             processes_completed = 0
             while processes_completed < NUM_PLAYERS:
+                # Check shutdown event periodically while waiting
+                if shutdown_event and shutdown_event.is_set():
+                    logger.warning(
+                        "Exploitability calculation interrupted by shutdown signal."
+                    )
+                    # Terminate running BR processes
+                    for p in br_processes:
+                        if p.is_alive():
+                            logger.warning(
+                                "Terminating BR process %s due to shutdown.", p.name
+                            )
+                            p.terminate()
+                    raise GracefulShutdownException(
+                        "Shutdown during exploitability calculation"
+                    )
+
                 try:
-                    # Use timeout to allow periodic checks if needed (e.g., for shutdown signals)
-                    p_id, value = result_queue.get(timeout=1.0)
+                    # Use timeout to allow periodic checks
+                    p_id, value = result_queue.get(timeout=0.5)  # Shorter timeout
                     results_dict[p_id] = value
                     processes_completed += 1
                     logger.info("BR Process P%d finished. Result: %.6f", p_id, value)
                 except queue.Empty:
-                    # Check if any process terminated unexpectedly
-                    for i, p in enumerate(processes):
-                        if not p.is_alive() and i not in results_dict:
-                            logger.error(
-                                "BR Process P%d terminated unexpectedly. Assigning inf.",
-                                i,
-                            )
-                            results_dict[i] = float("inf")
-                            processes_completed += 1
-                    continue  # Continue waiting if not all processes finished
+                    # Check if any process terminated unexpectedly ONLY if not shutting down
+                    if not (shutdown_event and shutdown_event.is_set()):
+                        for i, p in enumerate(br_processes):
+                            # Check if process is dead AND we haven't received its result yet
+                            if not p.is_alive() and i not in results_dict:
+                                logger.error(
+                                    "BR Process P%d terminated unexpectedly (exit code %s). Assigning inf.",
+                                    i,
+                                    p.exitcode,
+                                )
+                                results_dict[i] = float("inf")
+                                processes_completed += 1  # Mark as completed (failed)
+                    continue  # Continue waiting or checking shutdown/dead processes
+                except Exception as q_get_err:
+                    logger.error("Error getting result from BR queue: %s", q_get_err)
+                    # Treat as failure? For now, continue waiting/checking.
 
-            # Join processes after collecting results
-            for process in processes:
+            # Join processes after collecting results or shutdown
+            logger.debug("Joining BR processes...")
+            for process in br_processes:
                 try:
-                    process.join(timeout=5.0)
+                    process.join(timeout=5.0)  # Keep timeout for process join
                     if process.is_alive():
                         logger.warning(
                             "Process %s did not join within timeout. Terminating.",
@@ -417,7 +480,8 @@ class AnalysisTools:
                         process.terminate()
                         process.join(timeout=1.0)  # Wait briefly after terminate
                 except Exception as e_join:
-                    logger.error("Error joining process %s: %s", process.name, e_join)
+                    logger.error("Error joining BR process %s: %s", process.name, e_join)
+            logger.debug("BR processes joined.")
 
             # Calculate final exploitability
             br_value_p0 = results_dict.get(0, float("inf"))
@@ -425,13 +489,27 @@ class AnalysisTools:
 
             if br_value_p0 == float("inf") or br_value_p1 == float("inf"):
                 logger.warning(
-                    "Exploitability calculation resulted in infinity (BR failed for at least one player)."
+                    "Exploitability calculation resulted in infinity (BR failed/aborted for at least one player)."
                 )
                 exploitability = float("inf")
             else:
                 exploitability = (br_value_p0 + br_value_p1) / 2.0
                 logger.info("Calculated Exploitability: %.6f", exploitability)
 
+        except GracefulShutdownException:
+            logger.warning("Exploitability calculation aborted due to shutdown signal.")
+            exploitability = float("inf")  # Mark as aborted/failed
+            # Ensure any remaining processes are cleaned up if possible
+            for p in br_processes:
+                if p.is_alive():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        p.join(0.5)
+                    except Exception:
+                        pass
         except Exception as e_exploit:
             logger.exception(
                 "Error during parallel exploitability calculation setup/coordination: %s",
@@ -439,19 +517,17 @@ class AnalysisTools:
             )
             exploitability = float("inf")  # Indicate error
         finally:
-            # Ensure status is reset even on error
+            # Ensure status is reset even on error/shutdown
             if live_display_manager and hasattr(
                 live_display_manager, "update_main_process_status"
             ):
                 live_display_manager.update_main_process_status("Idle / Waiting...")
             logger.info(
-                "Total Exploitability calculation time: %.2f seconds",
+                "Total Exploitability calculation attempt time: %.2f seconds",
                 time.time() - start_time,
             )
 
         return exploitability
-
-    # Deprecated: _compute_best_response_value removed, logic moved to _run_br_calculation_process
 
     @staticmethod
     def _best_response_node_logic(
@@ -510,7 +586,6 @@ class AnalysisTools:
                     tasks = []
                     for action in legal_actions:
                         # Create deep copies of game and agent states for the worker
-                        # Note: deepcopy can be slow, potential optimization point if needed
                         try:
                             game_state_copy = copy.deepcopy(game_state)
                             br_agent_state_copy = br_agent_state.clone()
@@ -521,9 +596,8 @@ class AnalysisTools:
                                 depth,
                                 e_copy,
                             )
-                            # Fallback to serial execution? Or return error? Fallback for now.
-                            pool = None  # Disable pool for this node
-                            break  # Break from action loop, will go to serial logic below
+                            pool = None  # Fallback to serial
+                            break
 
                         tasks.append(
                             (
@@ -542,11 +616,11 @@ class AnalysisTools:
                             results = pool.starmap(_br_action_worker, tasks)
                             valid_results = [r for r in results if r != -float("inf")]
                             if not valid_results:
-                                logger.warning(
-                                    "BR NodeLogic(D%d): BR player P%d (parallel) had no successful action paths. Returning 0.",
-                                    depth,
-                                    br_player,
-                                )
+                                # logger.warning( # Reduce log noise
+                                #     "BR NodeLogic(D%d): BR player P%d (parallel) had no successful action paths. Returning 0.",
+                                #     depth,
+                                #     br_player,
+                                # )
                                 return 0.0
                             return max(valid_results)
                         except Exception as e_starmap:
@@ -555,10 +629,9 @@ class AnalysisTools:
                                 depth,
                                 e_starmap,
                             )
-                            # Fallback to serial execution on starmap error
-                            pool = None  # Disable pool
+                            pool = None  # Fallback to serial
 
-                # Serial execution for BR player's actions (if pool=None, 1 action, or error fallback)
+                # Serial execution for BR player's actions
                 max_value = -float("inf")
                 actions_attempted_serially = 0
                 for action in legal_actions:
@@ -570,13 +643,16 @@ class AnalysisTools:
                             action,
                             game_state,
                         )
-                        continue  # Skip this action path
+                        continue
 
                     obs_after_action = AnalysisTools._create_observation_for_br(
                         game_state, action, acting_player
                     )
                     if obs_after_action is None:
-                        undo_info()
+                        try:
+                            undo_info()
+                        except Exception:
+                            pass
                         continue
 
                     next_br_agent_state = br_agent_state.clone()
@@ -596,10 +672,13 @@ class AnalysisTools:
                             depth,
                             action,
                             e_update,
-                            exc_info=False,  # Reduce noise
+                            exc_info=False,
                         )
-                        undo_info()
-                        continue  # Skip this action path
+                        try:
+                            undo_info()
+                        except Exception:
+                            pass
+                        continue
 
                     action_value = AnalysisTools._best_response_node_logic(
                         game_state,
@@ -608,24 +687,30 @@ class AnalysisTools:
                         next_br_agent_state,
                         next_opp_view_agent_state,
                         depth + 1,
-                        pool=None,  # Always serial in recursive calls
+                        pool=None,
                     )
-                    undo_info()  # Restore state
+                    try:
+                        undo_info()  # Restore state
+                    except Exception as e_undo:
+                        logger.error(
+                            "BR NodeLogic(D%d): Error undoing BR action %s: %s",
+                            depth,
+                            action,
+                            e_undo,
+                        )
                     max_value = max(max_value, action_value)
                     actions_attempted_serially += 1
 
-                # If no actions were successfully explored, return 0?
                 if max_value == -float("inf") and actions_attempted_serially == 0:
-                    logger.warning(
-                        "BR NodeLogic(D%d): BR player P%d (serial) had no successful action paths. Returning 0.",
-                        depth,
-                        br_player,
-                    )
+                    # logger.warning( # Reduce log noise
+                    #     "BR NodeLogic(D%d): BR player P%d (serial) had no successful action paths. Returning 0.",
+                    #     depth,
+                    #     br_player,
+                    # )
                     return 0.0
                 return max_value
 
             else:  # Opponent's turn (always serial)
-                # Use Opponent's view state to get the key
                 try:
                     base_infoset_tuple = opp_view_agent_state.get_infoset_key()
                     if not isinstance(base_infoset_tuple, tuple):
@@ -638,9 +723,9 @@ class AnalysisTools:
                         acting_player,
                         e_key,
                         opp_view_agent_state,
-                        exc_info=False,  # Reduce noise
+                        exc_info=False,
                     )
-                    return 0.0  # Error case
+                    return 0.0
 
                 opponent_strategy = opponent_avg_strategy.get(infoset_key)
                 strategy_was_missing = opponent_strategy is None
@@ -675,15 +760,14 @@ class AnalysisTools:
 
                 if num_actions > 0 and strategy_sum > 1e-9:
                     if not np.isclose(strategy_sum, 1.0):
-                        if (
-                            not strategy_was_missing and not dim_mismatch
-                        ):  # Only warn if strategy was present but unnormalized
-                            logger.warning(
-                                "BR NodeLogic(D%d): Normalizing opponent strategy key %s (Sum: %f)",
-                                depth,
-                                infoset_key,
-                                strategy_sum,
-                            )
+                        if not strategy_was_missing and not dim_mismatch:
+                            # logger.warning( # Reduce log noise
+                            #     "BR NodeLogic(D%d): Normalizing opponent strategy key %s (Sum: %f)",
+                            #     depth,
+                            #     infoset_key,
+                            #     strategy_sum,
+                            # )
+                            pass
                         opponent_strategy = normalize_probabilities(opponent_strategy)
                         if len(opponent_strategy) == 0 or not np.isclose(
                             opponent_strategy.sum(), 1.0
@@ -712,13 +796,16 @@ class AnalysisTools:
                                 action,
                                 game_state,
                             )
-                            continue  # Assume 0 value for this path
+                            continue
 
                         obs_after_action = AnalysisTools._create_observation_for_br(
                             game_state, action, acting_player
                         )
                         if obs_after_action is None:
-                            undo_info()
+                            try:
+                                undo_info()
+                            except Exception:
+                                pass
                             continue
 
                         next_br_agent_state = br_agent_state.clone()
@@ -738,10 +825,13 @@ class AnalysisTools:
                                 depth,
                                 action,
                                 e_update,
-                                exc_info=False,  # Reduce noise
+                                exc_info=False,
                             )
-                            undo_info()
-                            continue  # Assume 0 value for this path
+                            try:
+                                undo_info()
+                            except Exception:
+                                pass
+                            continue
 
                         recursive_value = AnalysisTools._best_response_node_logic(
                             game_state,
@@ -750,21 +840,27 @@ class AnalysisTools:
                             next_br_agent_state,
                             next_opp_view_agent_state,
                             depth + 1,
-                            pool=None,  # Always serial in recursive calls
+                            pool=None,
                         )
-                        undo_info()
+                        try:
+                            undo_info()
+                        except Exception as e_undo:
+                            logger.error(
+                                "BR NodeLogic(D%d): Error undoing Opp action %s: %s",
+                                depth,
+                                action,
+                                e_undo,
+                            )
                         expected_value += action_prob * recursive_value
                 else:
-                    # This path should only be reached if num_actions > 0 but strategy sum is ~0.
                     if num_actions > 0:
-                        logger.warning(
-                            "BR NodeLogic(D%d): Opponent P%d zero strategy sum at OppView infoset %s.",
-                            depth,
-                            acting_player,
-                            infoset_key,
-                        )
-                    # If opponent effectively cannot act according to strategy, BR player gets utility of current state?
-                    # This interpretation seems reasonable for BR.
+                        # logger.warning( # Reduce log noise
+                        #     "BR NodeLogic(D%d): Opponent P%d zero strategy sum at OppView infoset %s.",
+                        #     depth,
+                        #     acting_player,
+                        #     infoset_key,
+                        # )
+                        pass
                     return game_state.get_utility(br_player)
 
                 return expected_value
@@ -776,7 +872,7 @@ class AnalysisTools:
                 e_br_rec,
                 game_state,
             )
-            return 0.0  # Return neutral value on unhandled error
+            return 0.0
 
     @staticmethod
     def _get_decision_context(game_state: CambiaGameState) -> Optional[DecisionContext]:
@@ -826,23 +922,17 @@ class AnalysisTools:
     ) -> Optional[AgentObservation]:
         """Helper to create a basic observation for BR agent updates."""
         try:
-            # BR calculation needs accurate drawn_card info for the acting agent's state update,
-            # especially for replace actions where the agent needs to know the card.
-            # Let's refine this to pass the drawn card if it's relevant.
             drawn_card_for_obs = None
             if isinstance(action, ActionDiscard):
-                # The card just discarded *was* the drawn card. It's now the top of discard.
                 drawn_card_for_obs = game_state.get_discard_top()
             elif isinstance(action, ActionReplace):
-                # The card just placed into the hand *was* the drawn card.
-                # Need to pass this for the acting player's AgentState update.
                 if acting_player != -1 and 0 <= action.target_hand_index < len(
                     game_state.players[acting_player].hand
                 ):
                     drawn_card_for_obs = game_state.players[acting_player].hand[
                         action.target_hand_index
                     ]
-                else:  # Log error if index is bad
+                else:
                     logger.error(
                         "BR Create Obs: ActionReplace index %d invalid for actor %d hand size %d",
                         action.target_hand_index,
@@ -854,8 +944,6 @@ class AnalysisTools:
                         ),
                     )
 
-            # Peeked cards are generally not needed for public state update in BR,
-            # as BR agent has perfect info implicitly. Set to None.
             peeked_cards_for_obs = None
 
             obs = AgentObservation(
@@ -866,7 +954,7 @@ class AnalysisTools:
                     game_state.get_player_card_count(i) for i in range(NUM_PLAYERS)
                 ],
                 stockpile_size=game_state.get_stockpile_size(),
-                drawn_card=drawn_card_for_obs,  # Pass the potentially determined drawn card
+                drawn_card=drawn_card_for_obs,
                 peeked_cards=peeked_cards_for_obs,
                 snap_results=copy.deepcopy(game_state.snap_results_log),
                 did_cambia_get_called=game_state.cambia_caller_id is not None,
@@ -885,19 +973,17 @@ class AnalysisTools:
     ) -> AgentObservation:
         """
         Filters observation for BR agent state updates.
-        Crucially, keeps drawn_card info *if* the observer is the acting player
-        and the action was Replace/Discard, as the agent needs this for state update.
+        Keeps drawn_card info *if* the observer is the acting player
+        and the action was Replace/Discard.
         """
         filtered_obs = copy.copy(obs)
 
-        # Keep drawn_card only if observer is actor AND action requires it
         if obs.drawn_card and obs.acting_player == observer_id:
             if not isinstance(obs.action, (ActionDiscard, ActionReplace)):
-                filtered_obs.drawn_card = None  # Not needed for other actions
+                filtered_obs.drawn_card = None
         elif obs.drawn_card and obs.acting_player != observer_id:
-            filtered_obs.drawn_card = None  # Observer is not actor
+            filtered_obs.drawn_card = None
 
-        # BR doesn't use peeked_cards for state update (assumes perfect info implicitly)
         filtered_obs.peeked_cards = None
 
         return filtered_obs
@@ -907,7 +993,6 @@ class AnalysisTools:
     def log_simulation_trace(self, trace_data: SimulationTrace):
         """Logs the detailed trace of a worker simulation to a JSON Lines file."""
         if not self.simulation_trace_log_path:
-            # Log warning only if tracing is enabled in config
             if getattr(self.config.logging, "log_simulation_traces", False):
                 logger.warning(
                     "Simulation trace logging enabled but path not set. Skipping."
@@ -915,7 +1000,6 @@ class AnalysisTools:
             return
 
         try:
-            # Ensure trace_data conforms to the expected structure
             if (
                 not isinstance(trace_data, dict)
                 or "metadata" not in trace_data
@@ -928,7 +1012,6 @@ class AnalysisTools:
                 return
 
             with open(self.simulation_trace_log_path, "a", encoding="utf-8") as f:
-                # Use the defined default_serializer helper function
                 json_record = json.dumps(trace_data, default=default_serializer)
                 f.write(json_record + "\n")
         except IOError as e_io:
@@ -941,7 +1024,6 @@ class AnalysisTools:
             logger.error(
                 "Error serializing simulation trace details to JSON: %s.", e_type
             )
-            # Attempt to log problematic parts safely
             try:
                 problematic_part = {
                     k: repr(v)[:200] for k, v in trace_data.get("metadata", {}).items()
@@ -949,7 +1031,7 @@ class AnalysisTools:
                 problematic_part["history_len"] = len(trace_data.get("history", []))
                 logger.debug("Problematic trace data (repr): %s", problematic_part)
             except Exception:
-                pass  # Avoid errors during error logging
+                pass
         except Exception as e_log:
             logger.error(
                 "Unexpected error logging simulation trace: %s", e_log, exc_info=True

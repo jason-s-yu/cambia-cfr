@@ -8,6 +8,7 @@ import sys
 import signal
 import threading
 import multiprocessing
+import multiprocessing.managers
 import queue
 import traceback
 
@@ -292,44 +293,51 @@ def main():
         else getattr(config.cfr_training, "num_iterations", 0)
     )
 
-    # Determine if multiprocessing Manager is needed for archive queue
-    needs_mp_manager_for_archive = num_workers_for_display > 1 and getattr(
-        config.logging, "log_archive_enabled", False
-    )
+    # --- Simplified Queue Initialization ---
+    # Use manager ONLY if necessary (MP workers > 1 AND archiving enabled)
+    # Otherwise, use standard queue or None.
+    needs_manager_for_queues = num_workers_for_display > 1
+    is_archiving_enabled = getattr(config.logging, "log_archive_enabled", False)
 
     try:
-        # Set up multiprocessing manager and queues if needed
-        if num_workers_for_display > 1:
+        if needs_manager_for_queues:
             manager = multiprocessing.Manager()
             progress_queue = manager.Queue(-1)
-            if needs_mp_manager_for_archive:
+            # Use Manager Queue for archiver ONLY if MP workers AND archiving enabled
+            if is_archiving_enabled:
                 archive_queue_global = manager.Queue(-1)
+                print("Using Manager Queue for Archiver", file=sys.stderr)  # Debug
             else:
-                archive_queue_global = queue.Queue(
-                    -1
-                )  # Use threading queue if archiver runs in main process thread
-        else:  # Single worker or no archiving
-            progress_queue = (
-                None  # Single worker updates directly if needed, or no progress queue
-            )
-            archive_queue_global = queue.Queue(
-                -1
-            )  # Use threading queue if archiving enabled
+                archive_queue_global = None  # No archiving needed
+                print(
+                    "Using None Queue for Archiver (Archiving Disabled)", file=sys.stderr
+                )  # Debug
+        else:  # Single worker or no MP needed
+            progress_queue = None
+            # Use threading queue for archiver if archiving is enabled (runs in main thread)
+            if is_archiving_enabled:
+                archive_queue_global = queue.Queue(-1)
+                print("Using Threading Queue for Archiver", file=sys.stderr)  # Debug
+            else:
+                archive_queue_global = None  # No archiving needed
+                print(
+                    "Using None Queue for Archiver (Archiving Disabled / Single Worker)",
+                    file=sys.stderr,
+                )  # Debug
 
         # Start LogArchiver thread if enabled
-        if getattr(config.logging, "log_archive_enabled", False):
-            if (
-                archive_queue_global is None
-            ):  # Should not happen if logic above is correct
+        if is_archiving_enabled:
+            if archive_queue_global is None:  # Should only happen if logic above failed
                 print(
-                    "ERROR: Log archiving enabled but archive queue not initialized.",
+                    "ERROR: Log archiving enabled but archive queue is None.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            log_archiver_global = LogArchiver(
-                config, archive_queue_global, ""
-            )  # run_log_dir set later
+            # LogArchiver needs run_log_dir, set later
+            log_archiver_global = LogArchiver(config, archive_queue_global, "")
             log_archiver_global.start()
+        else:
+            log_archiver_global = None  # Ensure it's None if disabled
 
         # Setup logging (requires config, display manager, archive queue)
         # Pass False for verbose flag, let config control levels
@@ -545,19 +553,24 @@ def main():
 
         # Perform final save/summary via trainer if needed (e.g., normal exit)
         # Emergency save should have been handled in exception blocks or by trainer internally
-        if trainer and training_completed_normally and not is_shutting_down_gracefully:
-            # If completed normally without shutdown signal, perform final save/summary
-            rich_console.print("Performing final save and summary...")
-            try:
-                if hasattr(trainer, "save_data") and callable(trainer.save_data):
-                    trainer.save_data()
-                if hasattr(trainer, "_write_run_summary") and callable(
-                    trainer._write_run_summary
-                ):
-                    trainer._write_run_summary()
-            except Exception as e_final_save:
+        if trainer and training_completed_normally:
+            # Ensure shutdown wasn't signalled *just* as training completed normally
+            if not shutdown_event.is_set():
+                rich_console.print("Performing final save and summary...")
+                try:
+                    if hasattr(trainer, "save_data") and callable(trainer.save_data):
+                        trainer.save_data()
+                    if hasattr(trainer, "_write_run_summary") and callable(
+                        trainer._write_run_summary
+                    ):
+                        trainer._write_run_summary()
+                except Exception as e_final_save:
+                    rich_console.print(
+                        f"[red]Error during final save/summary: {e_final_save}[/red]"
+                    )
+            else:
                 rich_console.print(
-                    f"[red]Error during final save/summary: {e_final_save}[/red]"
+                    "Shutdown occurred during final steps. Skipping final save/summary (emergency save should have run)."
                 )
         elif not training_completed_normally and trainer:
             # If exited due to error/shutdown, summary should have been written by _perform_emergency_save

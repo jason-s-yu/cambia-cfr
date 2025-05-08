@@ -435,8 +435,6 @@ def _traverse_game_for_worker(
         # Calculate reach probability for the next state (pass unchanged reach probs down)
         next_reach_probs = reach_probs.copy()
 
-        # REMOVED: Logic to determine card drawn THIS step
-
         # Apply action and recurse
         state_delta: Optional[StateDelta] = None
         undo_info: Optional[UndoInfo] = None
@@ -452,8 +450,6 @@ def _traverse_game_for_worker(
                     and simulation_nodes[-1] is node_data
                 ):
                     node_data["state_delta"] = [list(d) for d in state_delta]
-
-                # REMOVED: Extraction of card_drawn_this_step
 
             else:
                 logger_traverse.error(
@@ -988,7 +984,6 @@ def _create_observation(
     next_state: CambiaGameState,
     acting_player: int,
     snap_results: List[Dict],
-    # REMOVED explicit_drawn_card
 ) -> Optional[AgentObservation]:
     """Creates the AgentObservation object based on the state *after* the action."""
     logger_obs = logging.getLogger(__name__)  # Use module logger
