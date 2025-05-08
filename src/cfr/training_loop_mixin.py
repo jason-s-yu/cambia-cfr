@@ -31,7 +31,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-POOL_TERMINATE_TIMEOUT_SECONDS = 10
+# Timeout removed from POOL_TERMINATE_TIMEOUT_SECONDS as pool.join() has no timeout arg
+# POOL_TERMINATE_TIMEOUT_SECONDS = 10 # This constant is no longer used for pool.join()
 
 
 class CFRTrainingLoopMixin:
@@ -79,7 +80,9 @@ class CFRTrainingLoopMixin:
             logger.info("Terminating worker pool...")
             try:
                 pool.terminate()
-                pool.join()  # Join AFTER terminate, no timeout needed
+                # Add a small delay to allow worker processes to potentially react to SIGTERM
+                time.sleep(0.5)  # 500ms delay
+                pool.join()  # Join AFTER terminate, no timeout argument needed or accepted
                 logger.info("Worker pool terminated and joined.")
             except ValueError:
                 logger.warning("Attempted to terminate/join an already closed pool.")
@@ -968,7 +971,6 @@ class CFRTrainingLoopMixin:
                 f.write("\n--- Worker Summary (Final Status) ---\n")
 
                 if num_workers > 0 and worker_statuses:
-                    # ... (Rest of the worker summary logic remains the same as previous version) ...
                     # (Ensure WorkerStats is imported or use Any if needed)
                     total_nodes = 0
                     max_depth_overall = 0
@@ -981,7 +983,6 @@ class CFRTrainingLoopMixin:
                         status_info = worker_statuses.get(i)
                         status_line = f"Worker {i}: "
                         if isinstance(status_info, WorkerStats):  # Use imported type
-                            # ... formatting code ...
                             status_line += f"Completed (MaxD:{status_info.max_depth}, Nodes:{status_info.nodes_visited:,}, MinDBT:{status_info.min_depth_after_bottom_out}, Warn:{status_info.warning_count}, Err:{status_info.error_count})"
                             total_nodes += status_info.nodes_visited
                             max_depth_overall = max(

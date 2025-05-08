@@ -2,7 +2,7 @@
 
 import logging
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple, Union, List
+from typing import Deque, Dict, Optional, Tuple, Union, List, Callable
 
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -20,6 +20,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 from .utils import WorkerStats, format_large_number
+from .cfr.exceptions import GracefulShutdownException
 
 # Define worker status type alias used internally by the display
 WorkerDisplayStatus = Union[
@@ -528,7 +529,7 @@ class LiveDisplayManager:
             finally:
                 self.live = None
 
-    def run(self, func, *args, **kwargs):
+    def run(self, func: Callable, *args, **kwargs):
         """Runs a function within the Live context."""
         if self.live:
             current_live_instance = self.live
@@ -552,8 +553,23 @@ class LiveDisplayManager:
                     result = func(*args, **kwargs)
                     return result
                 finally:
+                    # Ensure live context is marked as stopped internally
                     self.live = None
+
+        # --- Modified Exception Handling ---
+        except (GracefulShutdownException, KeyboardInterrupt) as shutdown_exc:
+            # Catch expected shutdown signals without logging as error
+            if self.live:
+                try:
+                    self.live.stop()
+                except Exception:
+                    pass  # Ignore errors stopping display during shutdown
+                finally:
+                    self.live = None
+            # Re-raise the caught shutdown exception for main_train.py to handle
+            raise shutdown_exc
         except Exception:
+            # Catch any *other* unexpected exceptions
             if self.live:
                 try:
                     self.live.stop()
@@ -561,5 +577,8 @@ class LiveDisplayManager:
                     pass
                 finally:
                     self.live = None
-            logging.error("Error occurred within Live context run:", exc_info=True)
-            raise
+            # Log these unexpected errors
+            logging.error(
+                "Unexpected error occurred within Live context run:", exc_info=True
+            )
+            raise  # Re-raise the unexpected exception
