@@ -85,10 +85,15 @@ Parameters controlling the main Counterfactual Regret Minimization training proc
   * Default: `1.0e-6`
   * Example: `0.00001`
 * **`exploitability_interval`**:
-  * Description: How often (in iterations) to calculate and log the exploitability of the current average strategy. Set to `0` to disable.
+  * Description: How often (in iterations) to calculate and log the exploitability of the current average strategy. Set to `0` to disable calculation based purely on iteration count. If both iteration and time intervals are non-zero, the check happens if *either* condition is met.
   * Type: `integer`
   * Default: `1000`
-  * Example: `500`
+  * Example: `500`, `0`
+* **`exploitability_interval_seconds`**:
+  * Description: The minimum time interval (in seconds) between exploitability calculations. Set to `0` to disable time-based calculation. If both iteration and time intervals are non-zero, the check happens if *either* condition is met. Useful for getting progress updates even if iterations are slow.
+  * Type: `integer`
+  * Default: `0`
+  * Example: `14400` (4 hours), `3600` (1 hour)
 * **`num_workers`**:
   * Description: The number of parallel worker processes to use for game simulations.
     * `1`: Runs simulations sequentially in the main process.
@@ -365,4 +370,3 @@ logging:
   log_archive_enabled: true
   log_archive_max_archives: 10      # Keep up to 10 tar.gz files per worker/main log stream
   log_archive_dir: "archives"       # Store archives in a subdirectory named "archives"
-```

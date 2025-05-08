@@ -7,6 +7,7 @@ Custom Log Handler for Serial Rotation
 import logging.handlers
 import multiprocessing
 import os
+import sys
 import re
 import glob
 import queue
@@ -16,7 +17,10 @@ from typing import Optional, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from .config import LoggingConfig
 
-logger = logging.getLogger(__name__)
+# NOTE: This module should NOT use the logger it might be attached to
+# for its internal operations, especially within doRollover, to avoid recursion.
+# Use print(..., file=sys.stderr) for internal status messages if needed.
+# logger = logging.getLogger(__name__) # Avoid using logger internally here
 
 
 class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
@@ -26,7 +30,7 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
     scheme ensures file_001.log is the oldest, file_002.log is the next oldest, etc.,
     with padding determined by backupCount. Writes the current active log file path
     to a '.current_log' file in its directory.
-    If log archiving is enabled, when the number of log files exceeds backupCount,
+    If log archiving is enabled, when the number of log files reaches the backupCount + 1,
     a signal is sent to the archive_queue to perform a batch archive of all
     current log files for this stream.
     """
@@ -65,13 +69,15 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         self.logging_config = logging_config_snapshot
 
         if self.backupCount > 0:
-            self._pad_length = len(
-                str(self.backupCount + 1)
-            )  # Pad for one more than backupCount for current
+            # Determine padding based on the backup count itself, ensuring enough digits
+            self._pad_length = len(str(self.backupCount))
         else:
             self._pad_length = 4  # Default padding if no backup count
 
         self._determine_initial_serial()
+        # Dynamically adjust padding if the determined initial serial needs more digits
+        self._pad_length = max(self._pad_length, len(str(self.current_serial)))
+
         initial_filename = (
             f"{self.base_pattern}_{self.current_serial:0{self._pad_length}d}.log"
         )
@@ -94,7 +100,8 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
             except OSError as e:
                 # Use print for critical log handler errors
                 print(
-                    f"ERROR: SerialRotatingFileHandler: Could not write current log marker to {marker_path}: {e}"
+                    f"ERROR: SerialRotatingFileHandler: Could not write current log marker to {marker_path}: {e}",
+                    file=sys.stderr,
                 )
 
     def _determine_initial_serial(self):
@@ -110,7 +117,8 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
             except OSError as e:
                 # If directory creation fails, cannot determine initial serial reliably
                 print(
-                    f"ERROR: SerialRotatingFileHandler: Failed to create log directory {log_dir}: {e}"
+                    f"ERROR: SerialRotatingFileHandler: Failed to create log directory {log_dir}: {e}",
+                    file=sys.stderr,
                 )
                 self.current_serial = 1
                 return
@@ -119,7 +127,6 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
 
         max_serial = 0
         # Regex to match the serial number part of the filename, e.g., "_001.log"
-        # It uses self._pad_length if available, or a general pattern.
         # We need to match filenames like 'prefix_001.log', 'prefix_002.log' etc.
         # The base_pattern is 'path/to/prefix'.
         filename_regex_pattern = rf"{re.escape(base_name_only)}_(\d+)\.log$"
@@ -142,26 +149,16 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
     def doRollover(self):
         """
         Do a rollover, closing the current file and opening the next one.
-        If archiving is enabled and the number of log files reaches the backupCount + 1,
-        send a batch archive request to the archive_queue.
+        If archiving is enabled and the number of existing log files reaches backupCount,
+        send a batch archive request to the archive_queue *before* opening the new file.
+        Uses print() for internal status to avoid recursive logging.
         """
+        # DO NOT use logger inside this method to avoid recursion
         if self.stream:
             self.stream.close()
             self.stream = None
 
-        self.current_serial += 1
-        # Update pad_length dynamically if current_serial exceeds previous padding capacity
-        current_pad_needed = len(str(self.current_serial))
-        if self.backupCount > 0:
-            self._pad_length = max(current_pad_needed, len(str(self.backupCount)))
-        else:
-            self._pad_length = max(current_pad_needed, 4)
-
-        self.baseFilename = (
-            f"{self.base_pattern}_{self.current_serial:0{self._pad_length}d}.log"
-        )
-
-        # --- Batch Archiving Trigger ---
+        # --- Batch Archiving Trigger (Check *before* incrementing serial) ---
         archive_enabled = self.logging_config and self.logging_config.log_archive_enabled
         if self.backupCount > 0 and archive_enabled and self.archive_queue:
             log_dir = os.path.dirname(self.base_pattern)
@@ -169,74 +166,17 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
             glob_pattern_str = f"{base_name_only}_*.log"
 
             if os.path.isdir(log_dir):
-                log_files = glob.glob(os.path.join(log_dir, glob_pattern_str))
-                # Check count *after* potentially creating the new file (though stream isn't opened yet)
-                # The check should happen based on files *before* the new one is opened,
-                # triggering when the *next* one would exceed the count.
-                # So, if count == backupCount, the *next* file created (self.current_serial)
-                # will make the total count backupCount + 1, triggering the archive of
-                # the files up to and including the one *just before* the current one.
-                # Let's adjust: Trigger when len(log_files) >= self.backupCount
-                # This means we have the desired number of backups, and the *next* rotation
-                # (the one happening now) will create the (backupCount + 1)-th file.
-                # We archive the existing `backupCount` files.
-
-                # Re-think: The request says "when the total number [...] reaches log_backup_count + 1".
-                # This implies the check happens *after* the new file exists logically.
-                # Let's check the count *before* opening the new stream.
-                # The current file (before rollover) is `self.base_pattern` + `self.current_serial - 1`.
-                # The new file will be `self.base_pattern` + `self.current_serial`.
-
-                # Glob for existing files *before* opening the new one.
+                # Glob for existing files matching the pattern
                 existing_log_files = glob.glob(os.path.join(log_dir, glob_pattern_str))
+                num_existing_logs = len(existing_log_files)
 
-                # If the number of existing files equals or exceeds backupCount,
-                # the new file we are about to create (self.current_serial) will bring the total to backupCount + 1 or more.
-                # Let's trigger when the number of existing files is *exactly* backupCount.
-                # This means the new file (self.current_serial) will be the (backupCount + 1)-th file.
-                # We then archive *all* backupCount + 1 files.
-
-                # Let's simplify: trigger when the glob count hits the threshold needed.
-                # If we have backupCount logs, the next one makes backupCount+1.
-                # Check after the new file is created (conceptually).
-                # Glob again *after* setting self.baseFilename
-                new_glob_pattern = os.path.join(log_dir, glob_pattern_str)
-                current_log_files = glob.glob(new_glob_pattern)
-
-                # Add the conceptually new file to the count if it wasn't picked by glob yet
-                # (it might not exist physically until the stream is opened).
-                # It's safer to check the count based on serial numbers.
-                # Trigger if self.current_serial > self.backupCount
-
-                # --- Revised Trigger Logic ---
-                # Trigger archive if the serial number of the file *we are about to create*
-                # is greater than the backup count. This means we already have 'backupCount'
-                # older files (1 to backupCount).
-                # However, the request implies archiving *all* existing when the threshold is met.
-                # Let's stick to the "count reaches backupCount + 1" interpretation.
-                # Glob for all files matching the pattern. If count >= backupCount + 1, trigger.
-
-                final_glob_pattern = os.path.join(log_dir, f"{base_name_only}_*.log")
-                all_files = glob.glob(final_glob_pattern)
-                # Add the file we are about to create if it wasn't globbed (unlikely but possible)
-                current_file_path_abs = os.path.abspath(self.baseFilename)
-                if current_file_path_abs not in [os.path.abspath(f) for f in all_files]:
-                    # This condition shouldn't really be met if the filename follows the pattern
-                    # but acts as a safeguard if the file isn't created before this check.
-                    effective_count = len(all_files) + 1
-                else:
-                    effective_count = len(all_files)
-
-                # Trigger if the total number of log files (including the new one)
-                # *would be* backupCount + 1. Since we just incremented current_serial,
-                # if current_serial is exactly backupCount + 1, it means we just created
-                # the file that reaches the threshold.
-                if self.current_serial == self.backupCount + 1:
-                    logger.info(
-                        "Log count threshold reached (%d >= %d). Queuing BATCH ARCHIVE for pattern %s",
-                        self.current_serial,
-                        self.backupCount + 1,
-                        self.base_pattern,
+                # Trigger archive if the number of existing files is >= backupCount.
+                # This means the rollover we are about to perform will create the (backupCount + 1)-th file or more.
+                if num_existing_logs >= self.backupCount:
+                    # Use print for internal status message
+                    print(
+                        f"INFO: SerialRotatingFileHandler: Log file count ({num_existing_logs}) meets/exceeds backup count ({self.backupCount}). Queuing BATCH ARCHIVE for pattern {self.base_pattern}",
+                        file=sys.stderr,  # Log to stderr to avoid interfering with potential stdout redirection
                     )
                     try:
                         # Queue the request with directory and base pattern
@@ -244,25 +184,51 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                             ("BATCH_ARCHIVE", log_dir, self.base_pattern)
                         )  # type: ignore
                     except queue.Full:
-                        logger.error(
-                            "Archive queue full. Could not queue BATCH ARCHIVE for %s.",
-                            self.base_pattern,
+                        print(
+                            f"ERROR: SerialRotatingFileHandler: Archive queue full. Could not queue BATCH ARCHIVE for {self.base_pattern}.",
+                            file=sys.stderr,
                         )
                     except Exception as q_err:
-                        logger.error(
-                            "Failed to queue BATCH_ARCHIVE for %s: %s",
-                            self.base_pattern,
-                            q_err,
+                        print(
+                            f"ERROR: SerialRotatingFileHandler: Failed to queue BATCH_ARCHIVE for {self.base_pattern}: {q_err}",
+                            file=sys.stderr,
                         )
+                # else:
+                # Optionally print debug status if needed, but can be noisy
+                # print(
+                #     f"DEBUG: SerialRotatingFileHandler: Log file count ({num_existing_logs}) below backup count ({self.backupCount}). No archive triggered for {self.base_pattern}.",
+                #     file=sys.stderr
+                # )
             else:
                 # Log directory doesn't exist, cannot check count
-                pass
-
+                print(
+                    f"WARNING: SerialRotatingFileHandler: Log directory {log_dir} not found during rollover archive check.",
+                    file=sys.stderr,
+                )
         # --- End Batch Archiving Trigger ---
 
+        # Increment serial number for the new file
+        self.current_serial += 1
+
+        # Update pad_length dynamically if current_serial exceeds previous padding capacity
+        current_pad_needed = len(str(self.current_serial))
+        self._pad_length = max(self._pad_length, current_pad_needed)
+
+        # Set the filename for the new log file
+        self.baseFilename = (
+            f"{self.base_pattern}_{self.current_serial:0{self._pad_length}d}.log"
+        )
+
+        # Open the new log file if not delaying
         if not self.delay:
-            self.stream = self._open()
-            self._write_current_log_marker()  # Update marker after opening new file
+            try:
+                self.stream = self._open()
+                self._write_current_log_marker()  # Update marker after opening new file
+            except Exception as e_open:
+                print(
+                    f"ERROR: SerialRotatingFileHandler: Failed to open new stream after rollover: {e_open}",
+                    file=sys.stderr,
+                )
 
     def shouldRollover(self, record):
         """
@@ -270,13 +236,32 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         Also writes current log marker if stream was opened due to delay.
         """
         if self.stream is None:  # Stream may not have been opened yet
-            self.stream = self._open()
-            self._write_current_log_marker()  # Write marker if stream just opened
+            try:
+                self.stream = self._open()
+                self._write_current_log_marker()  # Write marker if stream just opened
+            except Exception as e_open:
+                # Use basic print as logging itself might be failing
+                print(
+                    f"ERROR: SerialRotatingFileHandler: Failed to open stream in shouldRollover: {e_open}",
+                    file=sys.stderr,
+                )
+                return 0  # Cannot proceed if stream cannot be opened
 
         if self.maxBytes > 0:
             # Ensure the stream is in append mode for accurate size check if opened in 'w' initially
             # Although our mode is 'a' by default.
-            self.stream.seek(0, 2)  # Go to end of file
+            try:
+                self.stream.seek(0, 2)  # Go to end of file
+                current_size = self.stream.tell()
+            except (OSError, ValueError) as e:
+                # Handle cases where seek/tell might fail (e.g., stream closed)
+                # Cannot use logger here due to potential recursion
+                print(
+                    f"ERROR: SerialRotatingFileHandler: Error seeking/telling stream position: {e}",
+                    file=sys.stderr,
+                )
+                return 0  # Cannot determine size, don't rollover
+
             msg = "%s\n" % self.format(record)
             # Use utf-8 as a fallback if no encoding is set.
             try:
@@ -288,6 +273,6 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 # If encoding fails for any reason, try a safe fallback
                 msg_bytes = msg.encode("utf-8", "replace")
 
-            if self.stream.tell() + len(msg_bytes) >= self.maxBytes:
+            if current_size + len(msg_bytes) >= self.maxBytes:
                 return 1
         return 0

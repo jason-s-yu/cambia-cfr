@@ -11,12 +11,13 @@ system:
 
 # CFR Training Parameters
 cfr_training:
-  num_iterations: 10000         # Total training iterations
-  save_interval: 1              # Save progress every N iterations
-  pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
-  pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
-  exploitability_interval: 1    # Calculate exploitability every N iterations (0 to disable)
-  num_workers: 16               # Number of parallel workers for simulations (1 for sequential)
+  num_iterations: 10000                   # Total training iterations
+  save_interval: 1                        # Save progress every N iterations
+  pruning_enabled: true                   # Enable Regret-Based Pruning (RBP)
+  pruning_threshold: 1.0e-6               # Regrets below this considered zero for pruning
+  exploitability_interval: 1              # Calculate exploitability every N iterations (higher priority than time)
+  exploitability_interval_seconds: 7200   # Calculate exploitability if X seconds pass (e.g., 4 hours), lower priority
+  num_workers: 16                         # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters
 cfr_plus_params:
@@ -44,7 +45,7 @@ cambia_rules:
 # Persistence Settings
 persistence:
   # Path relative to execution directory where agent data is saved/loaded
-  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.8.1-l1-p16-archlog.joblib"
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.8.3-l1-p16-archlog-timeexpl.joblib"
 
 agents:
   greedy_agent:

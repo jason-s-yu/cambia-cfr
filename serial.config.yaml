@@ -16,6 +16,7 @@ cfr_training:
   pruning_enabled: true         # Enable Regret-Based Pruning (RBP)
   pruning_threshold: 1.0e-6     # Regrets below this considered zero for pruning
   exploitability_interval: 100  # Calculate exploitability every N iterations (0 to disable)
+  exploitability_interval_seconds: 0 # Calculate exploitability if X seconds pass (0=disabled)
   num_workers: 1           # Number of parallel workers for simulations (1 for sequential)
 
 # CFR+ Specific Parameters

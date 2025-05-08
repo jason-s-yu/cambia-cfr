@@ -65,6 +65,7 @@ class CFRTrainingLoopMixin:
     # Timing / Periodic updates
     _total_run_time_start: float = 0.0
     _last_log_size_update_time: float = 0.0
+    _last_exploitability_calc_time: float = 0.0
     # Use Any for WorkerDisplayStatus if definition is complex or elsewhere
     _worker_statuses: Dict[int, Any] = {}
 
@@ -72,6 +73,7 @@ class CFRTrainingLoopMixin:
         """Initializes attributes specific to the training loop."""
         self._last_log_size_update_time = 0.0
         self._total_run_time_start = 0.0
+        self._last_exploitability_calc_time = 0.0  # Initialize time tracking
         self._worker_statuses = {}
 
     def _shutdown_pool(self, pool: Optional[multiprocessing.pool.Pool]):
@@ -135,6 +137,58 @@ class CFRTrainingLoopMixin:
                     exc_info=True,
                 )
 
+    def _calculate_exploitability_if_needed(self, iteration: int):
+        """Calculates exploitability if the iteration or time interval is met."""
+        # Check if methods exist before calling
+        if not (
+            hasattr(self, "compute_average_strategy")
+            and callable(self.compute_average_strategy)
+            and hasattr(self, "analysis")
+            and hasattr(self.analysis, "calculate_exploitability")
+            and callable(self.analysis.calculate_exploitability)
+        ):
+            logger.error("Missing methods for exploitability calculation.")
+            return
+
+        try:
+            current_avg_strategy = self.compute_average_strategy()
+            if current_avg_strategy is not None:
+                logger.info("Calculating exploitability at iteration %d...", iteration)
+                exploit_start_time = time.time()
+                try:
+                    exploit = self.analysis.calculate_exploitability(
+                        current_avg_strategy, self.config
+                    )
+                    if hasattr(self, "exploitability_results") and isinstance(
+                        self.exploitability_results, list
+                    ):
+                        self.exploitability_results.append((iteration, exploit))
+                    self._last_exploit_str = (
+                        f"{exploit:.4f}" if exploit != float("inf") else "N/A"
+                    )
+                    logger.info(
+                        "Exploitability: %s (took %.2fs)",
+                        self._last_exploit_str,
+                        time.time() - exploit_start_time,
+                    )
+                    self._last_exploitability_calc_time = time.time()  # Update timestamp
+                except Exception:
+                    logger.exception(
+                        "Error calculating exploitability at iter %d.", iteration
+                    )
+                    self._last_exploit_str = "Calc FAILED"
+            else:
+                logger.warning(
+                    "Could not compute avg strategy for exploitability at iter %d.",
+                    iteration,
+                )
+                self._last_exploit_str = "N/A (Avg Err)"
+        except Exception as e_avg_strat:
+            logger.exception(
+                "Error computing average strategy for exploitability: %s", e_avg_strat
+            )
+            self._last_exploit_str = "N/A (Avg Err)"
+
     def train(self, num_iterations: Optional[int] = None):
         """Runs the main CFR+ training loop, potentially in parallel."""
 
@@ -156,7 +210,10 @@ class CFRTrainingLoopMixin:
         start_iter_num = last_completed_iteration + 1
         end_iter_num = last_completed_iteration + total_iterations_to_run
 
-        exploitability_interval = getattr(cfr_config, "exploitability_interval", 0)
+        exploitability_iter_interval = getattr(cfr_config, "exploitability_interval", 0)
+        exploitability_time_interval = getattr(
+            cfr_config, "exploitability_interval_seconds", 0
+        )
         num_workers = getattr(cfr_config, "num_workers", 1)
         save_interval = getattr(cfr_config, "save_interval", 0)
         progress_q_local = getattr(self, "progress_queue", None)
@@ -170,6 +227,11 @@ class CFRTrainingLoopMixin:
             start_iter_num,
             end_iter_num,
             num_workers,
+        )
+        logger.info(
+            "Exploitability Check: Iter=%d, Time=%ds",
+            exploitability_iter_interval,
+            exploitability_time_interval,
         )
         if total_iterations_to_run <= 0:
             logger.warning(
@@ -189,6 +251,10 @@ class CFRTrainingLoopMixin:
 
         self._total_run_time_start = time.time()
         self._last_log_size_update_time = time.time()
+        # Initialize last calc time to start to allow first calc if interval is set
+        self._last_exploitability_calc_time = (
+            0.0 if exploitability_time_interval > 0 else time.time()
+        )
         pool: Optional[multiprocessing.pool.Pool] = None
         self._worker_statuses = {i: "Initializing" for i in range(num_workers)}
 
@@ -301,9 +367,7 @@ class CFRTrainingLoopMixin:
                         )
                         result = run_cfr_simulation_worker(worker_args_seq)
                         results[0] = result
-                        if isinstance(
-                            result, WorkerResult
-                        ):  # Runtime check using imported type
+                        if isinstance(result, WorkerResult):
                             self._worker_statuses[0] = result.stats
                             min_nodes_this_iter_overall = min(
                                 min_nodes_this_iter_overall, result.stats.nodes_visited
@@ -332,7 +396,7 @@ class CFRTrainingLoopMixin:
                         if display and hasattr(display, "update_worker_status"):
                             display.update_worker_status(0, self._worker_statuses[0])
 
-                    except Exception as e_seq:
+                    except Exception:
                         logger.exception("Error during sequential simulation iter %d.", t)
                         self._worker_statuses[0] = "Error (Exception)"
                         if display and hasattr(display, "update_worker_status"):
@@ -343,34 +407,39 @@ class CFRTrainingLoopMixin:
                         if progress_q_local:
                             try:
                                 while True:
-                                    (
-                                        prog_w_id,
-                                        prog_cur_d,
-                                        prog_max_d,
-                                        prog_n,
-                                        prog_min_d_bt,
-                                    ) = progress_q_local.get_nowait()
-                                    if prog_w_id == 0:
-                                        new_status_tuple_seq: Any = (
-                                            "Running",
+                                    prog_data = progress_q_local.get_nowait()
+                                    if (
+                                        isinstance(prog_data, tuple)
+                                        and len(prog_data) == 5
+                                    ):
+                                        (
+                                            prog_w_id,
                                             prog_cur_d,
                                             prog_max_d,
                                             prog_n,
                                             prog_min_d_bt,
-                                        )
-                                        if isinstance(
-                                            self._worker_statuses.get(0), tuple
-                                        ):
-                                            self._worker_statuses[0] = (
-                                                new_status_tuple_seq
+                                        ) = prog_data
+                                        if prog_w_id == 0:
+                                            new_status_tuple_seq: Any = (
+                                                "Running",
+                                                prog_cur_d,
+                                                prog_max_d,
+                                                prog_n,
+                                                prog_min_d_bt,
                                             )
-                                            if display and hasattr(
-                                                display, "update_worker_status"
+                                            if isinstance(
+                                                self._worker_statuses.get(0), tuple
                                             ):
-                                                display.update_worker_status(
-                                                    prog_w_id, new_status_tuple_seq
+                                                self._worker_statuses[0] = (
+                                                    new_status_tuple_seq
                                                 )
-                                    self._try_update_log_size_display()
+                                                if display and hasattr(
+                                                    display, "update_worker_status"
+                                                ):
+                                                    display.update_worker_status(
+                                                        prog_w_id, new_status_tuple_seq
+                                                    )
+                                        self._try_update_log_size_display()
                             except queue.Empty:
                                 pass
                             except Exception as e_prog:
@@ -494,9 +563,7 @@ class CFRTrainingLoopMixin:
                                         result_par = async_res.get(timeout=0.01)
                                         results[worker_id_done] = result_par
                                         final_status_for_worker: Any  # Use Any
-                                        if isinstance(
-                                            result_par, WorkerResult
-                                        ):  # Runtime check
+                                        if isinstance(result_par, WorkerResult):
                                             final_status_for_worker = result_par.stats
                                             min_nodes_this_iter_overall = min(
                                                 min_nodes_this_iter_overall,
@@ -561,7 +628,7 @@ class CFRTrainingLoopMixin:
                         logger.warning("Graceful shutdown initiated for iter %d pool.", t)
                         self._shutdown_pool(pool)
                         raise
-                    except Exception as e_pool_mgmt:
+                    except Exception:
                         logger.exception(
                             "Error during parallel pool management iter %d.", t
                         )
@@ -653,7 +720,7 @@ class CFRTrainingLoopMixin:
                             logger.error(
                                 "Merge required but _merge_local_updates method missing!"
                             )
-                    except Exception as e_merge:
+                    except Exception:
                         logger.exception("Error merging results iter %d.", t)
                         if display and hasattr(display, "update_stats"):
                             display.update_stats(
@@ -694,49 +761,40 @@ class CFRTrainingLoopMixin:
                 )
                 self._total_infosets_str = format_infoset_count(regret_sum_len)
 
-                # Exploitability
-                if exploitability_interval > 0 and t % exploitability_interval == 0:
-                    logger.info("Calculating exploitability at iteration %d...", t)
-                    exploit_start_time = time.time()
-                    # Check methods exist before calling
-                    if (
-                        hasattr(self, "compute_average_strategy")
-                        and callable(self.compute_average_strategy)
-                        and hasattr(self, "analysis")
-                        and hasattr(self.analysis, "calculate_exploitability")
-                        and callable(self.analysis.calculate_exploitability)
-                    ):
-                        current_avg_strategy = self.compute_average_strategy()
-                        if current_avg_strategy is not None:
-                            try:
-                                exploit = self.analysis.calculate_exploitability(
-                                    current_avg_strategy, self.config
-                                )
-                                if hasattr(self, "exploitability_results") and isinstance(
-                                    self.exploitability_results, list
-                                ):
-                                    self.exploitability_results.append((t, exploit))
-                                self._last_exploit_str = (
-                                    f"{exploit:.4f}" if exploit != float("inf") else "N/A"
-                                )
-                                logger.info(
-                                    "Exploitability: %s (took %.2fs)",
-                                    self._last_exploit_str,
-                                    time.time() - exploit_start_time,
-                                )
-                            except Exception as e_exploit:
-                                logger.exception(
-                                    "Error calculating exploitability at iter %d.", t
-                                )
-                                self._last_exploit_str = "Calc FAILED"
-                        else:
-                            logger.warning(
-                                "Could not compute avg strategy for exploitability at iter %d.",
-                                t,
-                            )
-                            self._last_exploit_str = "N/A (Avg Err)"
+                # --- Exploitability Calculation (Iteration and Time based) ---
+                should_calculate_exploitability = False
+                trigger_reason = ""
+
+                # Check iteration interval
+                if (
+                    exploitability_iter_interval > 0
+                    and t % exploitability_iter_interval == 0
+                ):
+                    should_calculate_exploitability = True
+                    trigger_reason = "iteration interval"
+
+                # Check time interval (if not already triggered by iteration)
+                current_time = time.time()
+                if (
+                    not should_calculate_exploitability
+                    and exploitability_time_interval > 0
+                    and (current_time - self._last_exploitability_calc_time)
+                    >= exploitability_time_interval
+                ):
+                    should_calculate_exploitability = True
+                    trigger_reason = "time interval"
+
+                if should_calculate_exploitability:
+                    logger.info(
+                        "Triggering exploitability calculation at iteration %d (Reason: %s)",
+                        t,
+                        trigger_reason,
+                    )
+                    if hasattr(self, "_calculate_exploitability_if_needed"):
+                        self._calculate_exploitability_if_needed(t)
                     else:
-                        logger.error("Missing methods for exploitability calculation.")
+                        logger.error("Cannot calculate exploitability: method missing.")
+                # --- End Exploitability Calculation ---
 
                 # Update display
                 if display and hasattr(display, "update_stats"):
@@ -807,42 +865,26 @@ class CFRTrainingLoopMixin:
                 )
             logger.info("Final iteration count: %d", self.current_iteration)
 
-            # Final exploitability
-            logger.info("Computing final average strategy...")
+            # Final exploitability calculation (if not just calculated)
+            final_calc_needed = True
             if (
-                hasattr(self, "compute_average_strategy")
-                and callable(self.compute_average_strategy)
-                and hasattr(self, "analysis")
-                and hasattr(self.analysis, "calculate_exploitability")
-                and callable(self.analysis.calculate_exploitability)
+                exploitability_iter_interval > 0
+                and self.current_iteration > 0
+                and self.current_iteration % exploitability_iter_interval == 0
             ):
-                final_avg_strategy = self.compute_average_strategy()
-                if final_avg_strategy is not None:
-                    logger.info("Calculating final exploitability...")
-                    try:
-                        final_exploit = self.analysis.calculate_exploitability(
-                            final_avg_strategy, self.config
-                        )
-                        if hasattr(self, "exploitability_results") and isinstance(
-                            self.exploitability_results, list
-                        ):
-                            self.exploitability_results.append(
-                                (self.current_iteration, final_exploit)
-                            )
-                        logger.info("Final exploitability: %.4f", final_exploit)
-                        self._last_exploit_str = (
-                            f"{final_exploit:.4f}"
-                            if final_exploit != float("inf")
-                            else "N/A"
-                        )
-                    except Exception as e_final_exploit:
-                        logger.exception("Error calculating final exploitability.")
-                        self._last_exploit_str = "Calc FAILED"
+                final_calc_needed = False
+            if not final_calc_needed and exploitability_time_interval > 0:
+                if (
+                    time.time() - self._last_exploitability_calc_time
+                ) < 1.0:  # Allow small tolerance
+                    final_calc_needed = False
+
+            if final_calc_needed:
+                logger.info("Performing final exploitability calculation...")
+                if hasattr(self, "_calculate_exploitability_if_needed"):
+                    self._calculate_exploitability_if_needed(self.current_iteration)
                 else:
-                    logger.warning("Could not compute final average strategy.")
-                    self._last_exploit_str = "N/A (Avg Err)"
-            else:
-                logger.error("Missing methods for final exploitability calculation.")
+                    logger.error("Cannot calculate final exploitability: method missing.")
 
             # Final display update
             regret_sum_len_final = (

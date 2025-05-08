@@ -116,6 +116,9 @@ class CfrTrainingConfig:
     exploitability_interval: int = (
         1000  # How often (in iterations) to calculate exploitability
     )
+    exploitability_interval_seconds: int = (
+        0  # Min seconds between exploitability calcs (0=disabled)
+    )
     num_workers: int = (
         1  # Number of parallel workers for simulations. 1 for serial operation
     )
@@ -266,7 +269,7 @@ class LoggingConfig:
         return self.log_level_file.upper()
 
 
-# --- NEW: Baseline Agent Configuration ---
+# --- Baseline Agent Configuration ---
 @dataclass
 class GreedyAgentConfig:
     """Configuration specific to the Greedy baseline agent."""
@@ -294,9 +297,7 @@ class Config:
     cambia_rules: CambiaRulesConfig = field(default_factory=CambiaRulesConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    agents: AgentsConfig = field(
-        default_factory=AgentsConfig
-    )  # NEW: Baseline agent configs
+    agents: AgentsConfig = field(default_factory=AgentsConfig)
     _source_path: Optional[str] = None  # Internal field to store config path
 
 
@@ -407,7 +408,7 @@ def load_config(
                 ),
             )
 
-            # --- NEW: Parse Baseline Agents Config ---
+            # --- Parse Baseline Agents Config ---
             agents_config_dict = config_dict.get("agents", {})
             greedy_agent_config_dict = agents_config_dict.get(
                 "greedy_agent", {}
@@ -454,6 +455,11 @@ def load_config(
                         config_dict,
                         ["cfr_training", "exploitability_interval"],
                         CfrTrainingConfig.exploitability_interval,
+                    ),
+                    exploitability_interval_seconds=get_nested(
+                        config_dict,
+                        ["cfr_training", "exploitability_interval_seconds"],
+                        CfrTrainingConfig.exploitability_interval_seconds,
                     ),
                     num_workers=parse_num_workers(
                         get_nested(
