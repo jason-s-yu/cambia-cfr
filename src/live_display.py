@@ -365,15 +365,18 @@ class LiveDisplayManager:
 
     def refresh(self):
         """Updates the Live display if necessary."""
+        # Add check for self.live before calling update
         if self.live:
             try:
                 content_changed = self._update_layout_if_changed()
                 if content_changed:
                     self.live.update(self.layout, refresh=True)
             except Exception as e:
+                # Log error but allow program to continue if possible
                 logging.error(
                     "Error explicitly refreshing Live display: %s", e, exc_info=True
                 )
+        # If self.live is None, do nothing (display stopped)
 
     def add_log_record(self, record: logging.LogRecord):
         """Adds a log record to the display queue and refreshes."""

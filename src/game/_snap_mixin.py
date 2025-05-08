@@ -781,13 +781,16 @@ class SnapLogicMixin:
         original_snap_card = self.snap_discarded_card
         original_snap_potentials = list(self.snap_potential_snappers)
         original_snap_idx = self.snap_current_snapper_idx
-        # Keep snap_results_log until next snap starts
+        original_snap_log = list(
+            self.snap_results_log
+        )  # Capture log before potential clear
 
         def change_snap_end():
             self.snap_phase_active = False
             self.snap_discarded_card = None
             self.snap_potential_snappers = []
             self.snap_current_snapper_idx = 0
+            self.snap_results_log = []  # Clear the log upon ending the phase
 
         def undo_snap_end():
             # Assert preconditions
@@ -797,9 +800,12 @@ class SnapLogicMixin:
             self.snap_discarded_card = original_snap_card
             self.snap_potential_snappers = original_snap_potentials
             self.snap_current_snapper_idx = original_snap_idx
+            self.snap_results_log = original_snap_log  # Restore the log
             logger.debug("Undo snap end.")
 
-        delta_snap_end = ("end_snap_phase",)
+        delta_snap_end = ("end_snap_phase",)  # Log that the phase ended
+        # Add a separate delta for clearing the log, if needed for fine-grained replay
+        # For simplicity, the change_snap_end handles it.
         self._add_change(
             change_snap_end, undo_snap_end, delta_snap_end, undo_stack, delta_list
         )

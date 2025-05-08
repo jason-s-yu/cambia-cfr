@@ -274,6 +274,7 @@ class AbilityMixin:
             for attr in [
                 "pending_action",
                 "pending_action_player",
+                "pending_action_data",
                 "players",
                 "discard_pile",
                 "_add_change",
@@ -763,7 +764,7 @@ class AbilityMixin:
                         opp_h_idx,
                         card2_str,
                     )
-                    original_pending = (
+                    original_pending_tuple = (  # Keep using tuple for undo state capture
                         self.pending_action,
                         self.pending_action_player,
                         copy.deepcopy(self.pending_action_data),
@@ -774,9 +775,8 @@ class AbilityMixin:
                         "opp_idx": opp_h_idx,
                         "card1": card1,
                         "card2": card2,
-                        "ability_card": original_pending.get(
-                            "ability_card"
-                        ),  # Propagate original ability card
+                        # Propagate original ability card from *current* step's data
+                        "ability_card": self.pending_action_data.get("ability_card"),
                     }
                     next_pending_action_type = ActionAbilityKingSwapDecision(
                         perform_swap=False
@@ -796,26 +796,25 @@ class AbilityMixin:
                             self.pending_action,
                             self.pending_action_player,
                             self.pending_action_data,
-                        ) = original_pending
+                        ) = original_pending_tuple  # Use captured tuple
                         logger.debug("Undo King Look -> Pending Swap.")
 
                     prev_pending_type_name = (
-                        type(original_pending[0]).__name__
-                        if original_pending[0]
+                        type(original_pending_tuple[0]).__name__
+                        if original_pending_tuple[0]
                         else None
                     )
+                    # Serialize data for logging/delta (handle potential None for ability_card)
                     serialized_orig_data = {
                         k: serialize_card(v) if isinstance(v, Card) else v
-                        for k, v in original_pending[2].items()
+                        for k, v in original_pending_tuple[2].items()
                     }
                     serialized_new_data = {
                         "own_idx": own_h_idx,
                         "opp_idx": opp_h_idx,
                         "card1": card1_str,
                         "card2": card2_str,
-                        "ability_card": serialize_card(
-                            original_pending.get("ability_card")
-                        ),
+                        "ability_card": serialize_card(new_pending_data["ability_card"]),
                     }
                     delta_king_pending = (
                         "set_pending_action",
@@ -823,7 +822,7 @@ class AbilityMixin:
                         player,
                         serialized_new_data,
                         prev_pending_type_name,
-                        original_pending[1],
+                        original_pending_tuple[1],  # Original player
                         serialized_orig_data,
                     )
 
