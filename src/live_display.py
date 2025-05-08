@@ -115,18 +115,17 @@ class LiveDisplayManager:
             expand=True,
             padding=(0, 1),
         )
-        table.add_column("ID", style="dim", width=3, justify="right")
+        table.add_column("ID", style="dim", width=4, justify="right")
         table.add_column(
-            "Status", style="cyan", justify="left", no_wrap=True, min_width=9
+            "Status", style="cyan", justify="left", no_wrap=True, min_width=10
         )
-        table.add_column("Cur/Max Depth", style="green", width=13, justify="right")
-        table.add_column("Min Depth (BT)", style="purple", width=14, justify="right")
-        table.add_column(  # New Column for Min Depth Diff
-            "Min Depth (Diff)", style="deep_sky_blue1", width=16, justify="right"
+        table.add_column("Curr/Max Depth", style="green", width=15, justify="right")
+        table.add_column(
+            "Min Depth (Diff)", style="deep_sky_blue1", width=20, justify="right"
         )
-        table.add_column("Nodes", style="blue", width=10, justify="right")
-        table.add_column("Warn", style="yellow", width=5, justify="right")
-        table.add_column("Err", style="red", width=5, justify="right")
+        table.add_column("Nodes", style="blue", width=12, justify="right")
+        table.add_column("Warn", style="yellow", width=6, justify="right")
+        table.add_column("Err", style="red", width=6, justify="right")
 
         for i in range(self.num_workers):
             status_info = self._worker_statuses.get(i, "Unknown")
@@ -159,6 +158,7 @@ class LiveDisplayManager:
                 min_depth_backtrack_str = (
                     str(int(min_depth_backtrack_val))
                     if min_depth_backtrack_val != float("inf")
+                    and min_depth_backtrack_val > 0
                     else "N/A"
                 )
                 if (
@@ -214,14 +214,12 @@ class LiveDisplayManager:
                 else:
                     status_str = status_info
                 depth_str, nodes_str, warn_str, err_str = "N/A", "-", "-", "-"
-                min_depth_backtrack_str = "N/A"
                 min_depth_diff_str = "N/A"
 
             table.add_row(
                 str(i),
                 status_str,
                 depth_str,
-                min_depth_backtrack_str,
                 min_depth_diff_str,
                 nodes_str,
                 warn_str,
