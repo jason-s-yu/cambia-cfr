@@ -362,6 +362,7 @@ class AgentState:
                 placeholder_value=KnownCardInfo(
                     bucket=CardBucket.UNKNOWN, last_seen_turn=self._current_game_turn
                 ),
+                is_own_hand=True,  # Specify this is for own hand
             )
             self.own_hand = rebuilt_own_hand  # Update directly if successful
 
@@ -449,11 +450,11 @@ class AgentState:
                     if isinstance(action, ActionReplace):
                         drawn_card_from_obs = observation.drawn_card
                         target_idx = action.target_hand_index
-                        if (
-                            drawn_card_from_obs
-                        ):  # Card *must* be known if we are replacing
-                            drawn_bucket = get_card_bucket(drawn_card_from_obs)
-                            if target_idx in self.own_hand:
+                        if target_idx in self.own_hand:
+                            if drawn_card_from_obs and isinstance(
+                                drawn_card_from_obs, Card
+                            ):  # Card known from observation
+                                drawn_bucket = get_card_bucket(drawn_card_from_obs)
                                 self.own_hand[target_idx] = KnownCardInfo(
                                     bucket=drawn_bucket,
                                     last_seen_turn=self._current_game_turn,
@@ -467,17 +468,23 @@ class AgentState:
                                     drawn_card_from_obs,
                                 )
                             else:
-                                logger.warning(
-                                    " Agent %d Replace target index %d not found after reconciliation (Current: %s). State inconsistent?",
+                                # Drawn card is None or not Card - Expected in BR calc
+                                logger.debug(
+                                    " Agent %d Replace action at idx %d observed without drawn card (expected in BR). Setting belief to UNKNOWN.",
                                     self.player_id,
                                     target_idx,
-                                    list(self.own_hand.keys()),
+                                )
+                                self.own_hand[target_idx] = KnownCardInfo(
+                                    bucket=CardBucket.UNKNOWN,
+                                    last_seen_turn=self._current_game_turn,
+                                    card=None,
                                 )
                         else:
-                            # This error means the observation creation logic failed upstream
-                            logger.error(
-                                " Agent %d Replace action observed, but no drawn card in observation! Cannot update belief.",
+                            logger.warning(
+                                " Agent %d Replace target index %d not found after reconciliation (Current: %s). State inconsistent?",
                                 self.player_id,
+                                target_idx,
+                                list(self.own_hand.keys()),
                             )
 
                     elif isinstance(
@@ -715,10 +722,12 @@ class AgentState:
         expected_final_count: int,
         added_placeholder_count: int,
         placeholder_value: Any,
+        is_own_hand: bool = False,
     ) -> Dict[int, Any]:
         """
         Rebuilds a state dictionary (own_hand or opponent_belief) ensuring
         contiguous indices [0..N-1], handling removals and additions.
+        Handles count mismatches by prioritizing existing items or adding placeholders.
         """
         new_dict: Dict[int, Any] = {}
         items_to_keep = []
@@ -734,30 +743,51 @@ class AgentState:
             [copy.copy(placeholder_value) for _ in range(added_placeholder_count)]
         )
 
-        # 3. Assign to new dictionary with contiguous indices
+        # 3. Assign to new dictionary with contiguous indices, handling count mismatches
         current_total_items = len(items_to_keep)
-        for new_idx, item in enumerate(items_to_keep):
-            # Only assign up to the expected final count
-            if new_idx < expected_final_count:
-                new_dict[new_idx] = item
-            else:
-                # This indicates an inconsistency between removals/adds and expected count
-                logger.warning(
-                    "Rebuild state T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra item %s. Removed: %s, Added: %d, Original Indices: %s",
-                    self._current_game_turn,
-                    current_total_items,
-                    expected_final_count,
-                    item,
-                    removed_indices,
-                    added_placeholder_count,
-                    original_indices_sorted,
-                )
-                break  # Stop adding extra items
+        hand_type_str = "Own Hand" if is_own_hand else "Opp Belief"
 
-        # 4. Final assertion for consistency
+        if current_total_items == expected_final_count:
+            # Ideal case: counts match
+            for new_idx, item in enumerate(items_to_keep):
+                new_dict[new_idx] = item
+        elif current_total_items > expected_final_count:
+            # More items calculated than expected: keep the first 'expected' count
+            logger.warning(
+                "Rebuild %s T%d: More items (%d) than expected (%d) after adds/removes. Keeping first %d. Removed: %s, Added: %d, Original Indices: %s",
+                hand_type_str,
+                self._current_game_turn,
+                current_total_items,
+                expected_final_count,
+                expected_final_count,
+                removed_indices,
+                added_placeholder_count,
+                original_indices_sorted,
+            )
+            for new_idx in range(expected_final_count):
+                new_dict[new_idx] = items_to_keep[new_idx]
+        else:  # current_total_items < expected_final_count
+            # Fewer items calculated than expected: add placeholders to reach expected count
+            logger.warning(
+                "Rebuild %s T%d: Fewer items (%d) than expected (%d) after adds/removes. Adding %d placeholders. Removed: %s, Added: %d, Original Indices: %s",
+                hand_type_str,
+                self._current_game_turn,
+                current_total_items,
+                expected_final_count,
+                expected_final_count - current_total_items,
+                removed_indices,
+                added_placeholder_count,
+                original_indices_sorted,
+            )
+            for new_idx, item in enumerate(items_to_keep):
+                new_dict[new_idx] = item
+            for new_idx in range(current_total_items, expected_final_count):
+                new_dict[new_idx] = copy.copy(placeholder_value)
+
+        # 4. Final assertion for internal consistency (should always pass if logic above is sound)
         final_count = len(new_dict)
         assert final_count == expected_final_count, (
-            f"Rebuild state T{self._current_game_turn} failed! Expected final count {expected_final_count}, got {final_count}. "
+            f"Rebuild {hand_type_str} T{self._current_game_turn} FINAL COUNT CHECK FAILED! Expected {expected_final_count}, got {final_count}. "
             f"Original indices: {original_indices_sorted}, Removed: {removed_indices}, Added: {added_placeholder_count}. Final keys: {sorted(new_dict.keys())}"
         )
 
@@ -772,53 +802,36 @@ class AgentState:
         added_placeholder_count: int,
         placeholder_value: Union[CardBucket, DecayCategory],
     ) -> Tuple[Dict[int, Union[CardBucket, DecayCategory]], Dict[int, int]]:
-        """Rebuilds opponent_belief and preserves/transfers last_seen timestamps."""
+        """Rebuilds opponent_belief and preserves/transfers last_seen timestamps, handling count mismatches."""
+        # Leverage the generic _rebuild_hand_state_new logic by wrapping/unwrapping
+        # We need to preserve the original indices to map timestamps correctly
+
+        # Create a temporary dict mapping original index to (belief, timestamp)
+        temp_original_dict_with_ts = {}
+        for idx, belief in original_belief_dict.items():
+            ts = original_last_seen_dict.get(idx)
+            temp_original_dict_with_ts[idx] = (belief, ts)
+
+        # Use the generic rebuild logic
+        rebuilt_temp_dict = self._rebuild_hand_state_new(
+            original_dict=temp_original_dict_with_ts,
+            removed_indices=removed_indices,
+            expected_final_count=expected_final_count,
+            added_placeholder_count=added_placeholder_count,
+            placeholder_value=(
+                placeholder_value,
+                None,
+            ),  # Placeholder includes None timestamp
+            is_own_hand=False,  # Specify this is for opponent belief
+        )
+
+        # Unpack the results back into separate belief and timestamp dictionaries
         new_belief: Dict[int, Union[CardBucket, DecayCategory]] = {}
         new_last_seen: Dict[int, int] = {}
-        items_to_keep = []
-        original_indices_sorted = sorted(original_belief_dict.keys())
-
-        # 1. Collect kept beliefs and their original indices/timestamps
-        original_idx_map = {}  # Map: position in items_to_keep -> original_index
-        for i, idx in enumerate(original_indices_sorted):
-            if idx not in removed_indices:
-                items_to_keep.append(original_belief_dict[idx])
-                original_idx_map[len(items_to_keep) - 1] = idx  # Store original index
-
-        # 2. Add placeholders
-        items_to_keep.extend(
-            [copy.copy(placeholder_value) for _ in range(added_placeholder_count)]
-        )
-
-        # 3. Assign to new dictionaries
-        current_total_items = len(items_to_keep)
-        for new_idx, item in enumerate(items_to_keep):
-            if new_idx < expected_final_count:
-                new_belief[new_idx] = item
-                # If this item came from the original dict, restore its timestamp
-                if new_idx in original_idx_map:
-                    original_idx = original_idx_map[new_idx]
-                    if original_idx in original_last_seen_dict:
-                        new_last_seen[new_idx] = original_last_seen_dict[original_idx]
-            else:
-                logger.warning(
-                    "Rebuild Opp Belief T%d: More items (%d) than expected (%d) after adds/removes. Discarding extra item %s. Removed: %s, Added: %d, Original Indices: %s",
-                    self._current_game_turn,
-                    current_total_items,
-                    expected_final_count,
-                    item,
-                    removed_indices,
-                    added_placeholder_count,
-                    original_indices_sorted,
-                )
-                break
-
-        # 4. Final assertion
-        final_count = len(new_belief)
-        assert final_count == expected_final_count, (
-            f"Rebuild Opp Belief T{self._current_game_turn} failed! Expected final count {expected_final_count}, got {final_count}. "
-            f"Original indices: {original_indices_sorted}, Removed: {removed_indices}, Added: {added_placeholder_count}. Final keys: {sorted(new_belief.keys())}"
-        )
+        for new_idx, (belief, ts) in rebuilt_temp_dict.items():
+            new_belief[new_idx] = belief
+            if ts is not None:
+                new_last_seen[new_idx] = ts
 
         return new_belief, new_last_seen
 
