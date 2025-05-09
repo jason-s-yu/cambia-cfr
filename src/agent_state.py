@@ -753,7 +753,7 @@ class AgentState:
                 new_dict[new_idx] = item
         elif current_total_items > expected_final_count:
             # More items calculated than expected: keep the first 'expected' count
-            logger.warning(
+            logger.info(
                 "Rebuild %s T%d: More items (%d) than expected (%d) after adds/removes. Keeping first %d. Removed: %s, Added: %d, Original Indices: %s",
                 hand_type_str,
                 self._current_game_turn,
@@ -768,7 +768,7 @@ class AgentState:
                 new_dict[new_idx] = items_to_keep[new_idx]
         else:  # current_total_items < expected_final_count
             # Fewer items calculated than expected: add placeholders to reach expected count
-            logger.warning(
+            logger.info(
                 "Rebuild %s T%d: Fewer items (%d) than expected (%d) after adds/removes. Adding %d placeholders. Removed: %s, Added: %d, Original Indices: %s",
                 hand_type_str,
                 self._current_game_turn,

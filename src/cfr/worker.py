@@ -713,7 +713,15 @@ def run_cfr_simulation_worker(
                 except Exception:
                     pass
 
-        # Setup per-worker logging
+        # Set root level BEFORE adding handlers
+        worker_root_logger.setLevel(logging.DEBUG)
+
+        # Add NullHandler to prevent defaults and stop propagation
+        null_handler = logging.NullHandler()
+        worker_root_logger.addHandler(null_handler)
+        worker_root_logger.propagate = False  # Prevent logs reaching main process root
+
+        # Setup per-worker logging to file
         worker_log_dir = os.path.join(run_log_dir, f"w{worker_id}")
         os.makedirs(worker_log_dir, exist_ok=True)
         log_pattern = os.path.join(
@@ -737,14 +745,16 @@ def run_cfr_simulation_worker(
         file_log_level = getattr(logging, worker_log_level_str.upper(), logging.DEBUG)
         file_handler.setLevel(file_log_level)
         file_handler.setFormatter(formatter)
-        worker_root_logger.addHandler(file_handler)
-        worker_root_logger.setLevel(logging.DEBUG)  # Set root low, handlers filter
-        logger_instance = logging.getLogger(__name__)  # Use module logger
+        worker_root_logger.addHandler(file_handler)  # Add specific file handler
+
+        # Now get the logger instance for this module AFTER setup
+        logger_instance = logging.getLogger(__name__)
         logger_instance.info(
-            "Worker %d logging initialized (dir: %s, level: %s)",
+            "Worker %d logging initialized (dir: %s, file_level: %s). Root handlers: %s",
             worker_id,
             worker_log_dir,
             logging.getLevelName(file_log_level),
+            [type(h).__name__ for h in worker_root_logger.handlers],
         )
 
     except Exception as log_setup_e:
