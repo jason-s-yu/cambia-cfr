@@ -8,6 +8,8 @@
 
 We implement parallel training for the Cambia CFR+ agent using a technique similar to **External Sampling Monte Carlo Counterfactual Regret Minimization (ESMCFR)**.
 
+To run training, execute `python -m src.main_train --config parallel.config.yaml` in parallel. You will need to modify parallel.config.yaml.
+
 ### Goal
 
 The primary objective of this parallelization is to **reduce the wall-clock time required to complete each training iteration**. Standard CFR involves deep traversals of the game tree, which can be computationally intensive and slow on a single CPU core, especially for games with large state spaces or long potential game lengths like Cambia.
