@@ -1,0 +1,33 @@
+// src/remote_logging/logging.proto
+
+syntax = "proto3";
+
+package remote_logging;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// Service definition for the logging endpoint
+service LoggingService {
+  // A client-to-server streaming RPC.
+  // Accepts a stream of log entries and returns a summary.
+  rpc StreamLog (stream LogEntry) returns (LogSummary);
+}
+
+// Represents a single log entry
+message LogEntry {
+  google.protobuf.Timestamp timestamp = 1;
+  string level = 2;       // e.g., "INFO", "ERROR"
+  string message = 3;
+  string source = 4;      // e.g., "cfr.worker.1", "main_train"
+  
+  // A flexible map for additional structured context
+  map<string, google.protobuf.Value> context = 5;
+}
+
+// Response message summarizing the received log stream
+message LogSummary {
+  uint64 entries_received = 1;
+  bool success = 2;
+  string message = 3;
+}
