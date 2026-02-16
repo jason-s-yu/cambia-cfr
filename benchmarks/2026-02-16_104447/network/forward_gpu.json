@@ -1,0 +1,37 @@
+{
+  "name": "forward_pass",
+  "config": {
+    "batch_sizes": [
+      1024,
+      2048,
+      4096
+    ],
+    "num_warmup": 3,
+    "num_iters": 20,
+    "network": "AdvantageNetwork"
+  },
+  "timings": {
+    "batch_1024_avg_s": 0.0008043224998800724,
+    "batch_1024_std_s": 7.060277658755464e-05,
+    "batch_2048_avg_s": 0.0007043534000331419,
+    "batch_2048_std_s": 3.208246464036123e-05,
+    "batch_4096_avg_s": 0.0011082015000283719,
+    "batch_4096_std_s": 0.0009928507934787827
+  },
+  "metrics": {
+    "batch_1024_throughput": 1273121.1673833348,
+    "batch_1024_avg_ms": 0.8043224998800724,
+    "batch_1024_std_ms": 0.07060277658755464,
+    "batch_2048_throughput": 2907631.311077132,
+    "batch_2048_avg_ms": 0.704353400033142,
+    "batch_2048_std_ms": 0.03208246464036123,
+    "batch_4096_throughput": 3696078.7364889286,
+    "batch_4096_avg_ms": 1.1082015000283718,
+    "batch_4096_std_ms": 0.9928507934787827
+  },
+  "metadata": {
+    "device": "cuda",
+    "network_params": 174610
+  },
+  "timestamp": "2026-02-16T10:46:23.714341"
+}

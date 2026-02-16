@@ -1,0 +1,80 @@
+# Minimal config for benchmarking - based on parallel.config.yaml
+api:
+  base_url: "http://localhost:8080"
+  auth:
+    email: "someone@example.com"
+    password: "password"
+
+system:
+  recursion_limit: 10000
+
+cfr_training:
+  num_iterations: 1
+  save_interval: 1
+  pruning_enabled: true
+  pruning_threshold: 1.0e-6
+  exploitability_interval: 100
+  exploitability_interval_seconds: 7200
+  num_workers: 1
+
+cfr_plus_params:
+  weighted_averaging_enabled: true
+  averaging_delay: 100
+
+agent_params:
+  memory_level: 1
+  time_decay_turns: 3
+
+cambia_rules:
+  allowDrawFromDiscardPile: false
+  allowReplaceAbilities: false
+  snapRace: false
+  penaltyDrawCount: 2
+  use_jokers: 2
+  cards_per_player: 4
+  initial_view_count: 2
+  cambia_allowed_round: 0
+  allowOpponentSnapping: false
+  max_game_turns: 46
+
+persistence:
+  agent_data_save_path: "strategy/cambia_cfr_strategy-v0.8.3-l1-p16-archlog-timeexpl.joblib"
+
+agents:
+  greedy_agent:
+    cambia_call_threshold: 5
+
+analysis:
+  exploitability_num_workers: 0
+
+deep_cfr:
+  hidden_dim: 256
+  dropout: 0.1
+  learning_rate: 0.001
+  batch_size: 2048
+  train_steps_per_iteration: 4000
+  alpha: 1.5
+  traversals_per_step: 1  # Reduced from 1000 for benchmarking
+  advantage_buffer_capacity: 2000000
+  strategy_buffer_capacity: 2000000
+  save_interval: 10
+  use_gpu: false
+
+logging:
+  log_level_file: "ERROR"
+  log_level_console: "ERROR"
+  log_dir: "logs"
+  log_file_prefix: "cambia"
+  log_max_bytes: "10MB"
+  log_backup_count: 5
+  log_size_update_interval_sec: 60
+  worker_config:
+    default_level: "ERROR"
+    sequential_rules:
+      - "ERROR"
+    overrides: []
+  log_archive_enabled: false
+  log_archive_max_archives: 0
+  log_archive_dir: ""
+  log_simulation_traces: false
+  simulation_trace_filename_prefix: "simulation_traces"

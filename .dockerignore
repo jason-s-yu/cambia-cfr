@@ -1,0 +1,15 @@
+.git
+logs/
+strategy/
+benchmarks/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.venv/
+*.pt
+*.npz
+*.joblib

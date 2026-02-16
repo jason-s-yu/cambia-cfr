@@ -1108,33 +1108,32 @@ class AgentState:
         return matching_indices
 
     def clone(self) -> "AgentState":
-        """Creates a deep copy of the agent state."""
-        try:
-            # Use copy.deepcopy for mutable fields
-            new_state = AgentState(
-                player_id=self.player_id,
-                opponent_id=self.opponent_id,
-                memory_level=self.memory_level,
-                time_decay_turns=self.time_decay_turns,
-                initial_hand_size=self.initial_hand_size,
-                config=self.config,  # Config can be shallow copied
-                own_hand=copy.deepcopy(self.own_hand),
-                opponent_belief=copy.deepcopy(self.opponent_belief),
-                opponent_last_seen_turn=copy.deepcopy(self.opponent_last_seen_turn),
-                known_discard_top_bucket=self.known_discard_top_bucket,
-                opponent_card_count=self.opponent_card_count,
-                stockpile_estimate=self.stockpile_estimate,
-                game_phase=self.game_phase,
-                cambia_caller=self.cambia_caller,
-                _current_game_turn=self._current_game_turn,
-            )
-            return new_state
-        except Exception as e_clone:
-            # JUSTIFIED: Clone failure is critical and should propagate
-            logger.exception(
-                "Agent %d: Error cloning agent state: %s", self.player_id, e_clone
-            )
-            raise  # Re-raise exception
+        """Creates a copy of the agent state. Uses manual copy instead of deepcopy
+        for performance (called millions of times during traversals)."""
+        # own_hand: Dict[int, KnownCardInfo] — copy KnownCardInfo objects (mutable dataclass)
+        own_hand_copy = {
+            k: KnownCardInfo(bucket=v.bucket, last_seen_turn=v.last_seen_turn, card=v.card)
+            for k, v in self.own_hand.items()
+        }
+        # opponent_belief/opponent_last_seen_turn: values are enums/ints (immutable)
+        new_state = AgentState(
+            player_id=self.player_id,
+            opponent_id=self.opponent_id,
+            memory_level=self.memory_level,
+            time_decay_turns=self.time_decay_turns,
+            initial_hand_size=self.initial_hand_size,
+            config=self.config,
+            own_hand=own_hand_copy,
+            opponent_belief=dict(self.opponent_belief),
+            opponent_last_seen_turn=dict(self.opponent_last_seen_turn),
+            known_discard_top_bucket=self.known_discard_top_bucket,
+            opponent_card_count=self.opponent_card_count,
+            stockpile_estimate=self.stockpile_estimate,
+            game_phase=self.game_phase,
+            cambia_caller=self.cambia_caller,
+            _current_game_turn=self._current_game_turn,
+        )
+        return new_state
 
     def __str__(self) -> str:
         """Provides a concise string representation of the agent's belief state."""

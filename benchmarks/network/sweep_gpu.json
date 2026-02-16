@@ -1,0 +1,47 @@
+{
+  "name": "batch_size_sweep",
+  "config": {
+    "batch_sizes": [
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "device": "cuda"
+  },
+  "timings": {
+    "batch_256_avg_s": 0.011671937819992309,
+    "batch_512_avg_s": 0.004018545179969806,
+    "batch_1024_avg_s": 0.00376675121999142,
+    "batch_2048_avg_s": 0.004232775659984327,
+    "batch_4096_avg_s": 0.007894130479980959,
+    "batch_8192_avg_s": 0.010777398300015194,
+    "batch_16384_avg_s": 0.00455780631997186
+  },
+  "metrics": {
+    "batch_256_throughput": 21932.94754890741,
+    "batch_256_memory_mb": 21.46923828125,
+    "batch_512_throughput": 127409.2929331821,
+    "batch_512_memory_mb": 23.90283203125,
+    "batch_1024_throughput": 271852.3045974702,
+    "batch_1024_memory_mb": 29.55517578125,
+    "batch_2048_throughput": 483843.2661010868,
+    "batch_2048_memory_mb": 44.03173828125,
+    "batch_4096_throughput": 518866.51866056817,
+    "batch_4096_memory_mb": 64.34423828125,
+    "batch_8192_throughput": 760109.2371234392,
+    "batch_8192_memory_mb": 110.45361328125,
+    "batch_16384_throughput": 3594711.764781869,
+    "batch_16384_memory_mb": 200.28173828125,
+    "optimal_batch_size": 16384,
+    "optimal_throughput": 3594711.764781869
+  },
+  "metadata": {
+    "device": "cuda",
+    "network_params": 174610
+  },
+  "timestamp": "2026-02-16T12:07:46.564829"
+}

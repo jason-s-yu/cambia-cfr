@@ -1,0 +1,38 @@
+{
+  "name": "backward_pass",
+  "config": {
+    "batch_sizes": [
+      1024,
+      2048,
+      4096
+    ],
+    "num_warmup": 3,
+    "num_iters": 20,
+    "network": "AdvantageNetwork",
+    "includes": "forward + loss + backward + grad_clip + optimizer"
+  },
+  "timings": {
+    "batch_1024_avg_s": 0.01821014150004885,
+    "batch_1024_std_s": 0.01061220544782351,
+    "batch_2048_avg_s": 0.009791995499926997,
+    "batch_2048_std_s": 0.004668602864878411,
+    "batch_4096_avg_s": 0.011705053799960296,
+    "batch_4096_std_s": 0.003197690323108273
+  },
+  "metrics": {
+    "batch_1024_throughput": 56232.402147850036,
+    "batch_1024_avg_ms": 18.21014150004885,
+    "batch_1024_std_ms": 10.612205447823511,
+    "batch_2048_throughput": 209150.4229158672,
+    "batch_2048_avg_ms": 9.791995499926998,
+    "batch_2048_std_ms": 4.6686028648784115,
+    "batch_4096_throughput": 349934.3164073192,
+    "batch_4096_avg_ms": 11.705053799960297,
+    "batch_4096_std_ms": 3.197690323108273
+  },
+  "metadata": {
+    "device": "cuda",
+    "network_params": 174610
+  },
+  "timestamp": "2026-02-16T10:54:18.707742"
+}

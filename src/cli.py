@@ -400,5 +400,315 @@ def info(
         raise typer.Exit(1)
 
 
+# Benchmark subcommand group
+benchmark_app = typer.Typer(
+    help="Run performance benchmarks",
+    no_args_is_help=True,
+)
+app.add_typer(benchmark_app, name="benchmark")
+
+
+@benchmark_app.command("all")
+def benchmark_all(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    device: str = typer.Option(
+        "cpu",
+        "--device",
+        "-d",
+        help="Device to run on (cpu/cuda)",
+    ),
+    config: Path = typer.Option(
+        "/workspace/config/parallel.config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Also save raw JSON output",
+    ),
+):
+    """Run all benchmarks."""
+    from .benchmarks.runner import BenchmarkSuite
+    from .benchmarks import network_bench
+    from .benchmarks.traversal_bench import benchmark_traversal
+    from .benchmarks.worker_scaling import benchmark_worker_scaling
+    from .benchmarks.memory_bench import benchmark_memory
+    from .benchmarks.e2e_bench import benchmark_e2e
+
+    suite = BenchmarkSuite()
+    suite.register(network_bench.benchmark_network_performance, "network")
+    suite.register(benchmark_traversal, "traversal")
+    suite.register(benchmark_worker_scaling, "scaling")
+    suite.register(benchmark_memory, "memory")
+    suite.register(benchmark_e2e, "e2e")
+
+    results = suite.run_all(
+        output_dir=str(output_dir),
+        device=device,
+        config_path=str(config),
+    )
+
+    print(f"\nBenchmark suite complete. Results saved to {output_dir}")
+
+
+@benchmark_app.command("network")
+def benchmark_network_cmd(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    device: str = typer.Option(
+        "cpu",
+        "--device",
+        "-d",
+        help="Device to run on (cpu/cuda)",
+    ),
+    batch_sizes: Optional[str] = typer.Option(
+        None,
+        "--batch-sizes",
+        help="Comma-separated list of batch sizes (e.g., 256,512,1024)",
+    ),
+):
+    """Run network performance benchmarks."""
+    from datetime import datetime
+    from .benchmarks import network_bench
+    from .benchmarks.reporting import print_result
+    import json
+
+    batch_size_list = None
+    if batch_sizes:
+        batch_size_list = [int(x.strip()) for x in batch_sizes.split(",")]
+
+    result = network_bench.benchmark_network_performance(
+        device=device, batch_sizes=batch_size_list
+    )
+
+    print_result(result)
+
+    # Save to timestamped directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = output_dir / timestamp / "network"
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = out_path / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+
+    print(f"\nResults saved to {json_path}")
+
+
+@benchmark_app.command("traversal")
+def benchmark_traversal_cmd(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    num_traversals: int = typer.Option(
+        20,
+        "--num-traversals",
+        "-n",
+        help="Number of traversals to run",
+    ),
+    config: Path = typer.Option(
+        "/workspace/config/parallel.config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+):
+    """Run traversal benchmarks."""
+    from datetime import datetime
+    from .benchmarks.traversal_bench import benchmark_traversal
+    from .benchmarks.reporting import print_result
+    import json
+
+    result = benchmark_traversal(
+        num_traversals=num_traversals,
+        config_path=str(config),
+        device="cpu",
+    )
+
+    print_result(result)
+
+    # Save to timestamped directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = output_dir / timestamp / "traversal"
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = out_path / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+
+    print(f"\nResults saved to {json_path}")
+
+
+@benchmark_app.command("scaling")
+def benchmark_scaling_cmd(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    worker_counts: Optional[str] = typer.Option(
+        None,
+        "--worker-counts",
+        help="Comma-separated list of worker counts (e.g., 1,2,4,8)",
+    ),
+    traversals: int = typer.Option(
+        100,
+        "--traversals",
+        "-t",
+        help="Traversals per test",
+    ),
+    config: Path = typer.Option(
+        "/workspace/config/parallel.config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+):
+    """Run worker scaling benchmarks."""
+    from datetime import datetime
+    from .benchmarks.worker_scaling import benchmark_worker_scaling
+    from .benchmarks.reporting import print_result
+    import json
+
+    worker_count_list = None
+    if worker_counts:
+        worker_count_list = [int(x.strip()) for x in worker_counts.split(",")]
+
+    result = benchmark_worker_scaling(
+        worker_counts=worker_count_list,
+        traversals_per_test=traversals,
+        config_path=str(config),
+        device="cpu",
+    )
+
+    print_result(result)
+
+    # Save to timestamped directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = output_dir / timestamp / "scaling"
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = out_path / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+
+    print(f"\nResults saved to {json_path}")
+
+
+@benchmark_app.command("memory")
+def benchmark_memory_cmd(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    config: Path = typer.Option(
+        "/workspace/config/parallel.config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+):
+    """Run memory profiling benchmarks."""
+    from datetime import datetime
+    from .benchmarks.memory_bench import benchmark_memory
+    from .benchmarks.reporting import print_result
+    import json
+
+    result = benchmark_memory(
+        config_path=str(config),
+        device="cpu",
+    )
+
+    print_result(result)
+
+    # Save to timestamped directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = output_dir / timestamp / "memory"
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = out_path / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+
+    print(f"\nResults saved to {json_path}")
+
+
+@benchmark_app.command("e2e")
+def benchmark_e2e_cmd(
+    output_dir: Path = typer.Option(
+        "/workspace/benchmarks",
+        "--output-dir",
+        "-o",
+        help="Output directory for benchmark results",
+    ),
+    device: str = typer.Option(
+        "cpu",
+        "--device",
+        "-d",
+        help="Device to run on (cpu/cuda)",
+    ),
+    num_steps: int = typer.Option(
+        2,
+        "--num-steps",
+        "-n",
+        help="Number of training steps to benchmark",
+    ),
+    num_workers: int = typer.Option(
+        4,
+        "--num-workers",
+        "-w",
+        help="Number of parallel workers",
+    ),
+    config: Path = typer.Option(
+        "/workspace/config/parallel.config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+):
+    """Run end-to-end training step benchmark."""
+    from datetime import datetime
+    from .benchmarks.e2e_bench import benchmark_e2e
+    from .benchmarks.reporting import print_result
+    import json
+
+    result = benchmark_e2e(
+        num_steps=num_steps,
+        device=device,
+        num_workers=num_workers,
+        config_path=str(config),
+    )
+
+    print_result(result)
+
+    # Save to timestamped directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = output_dir / timestamp / "e2e"
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = out_path / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+
+    print(f"\nResults saved to {json_path}")
+
+
 if __name__ == "__main__":
     app()

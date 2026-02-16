@@ -48,7 +48,7 @@ from ..constants import (
 from ..game.engine import CambiaGameState
 from ..serial_rotating_handler import SerialRotatingFileHandler
 from ..abstraction import get_card_bucket
-from ..encoding import encode_infoset, encode_action_mask, action_to_index, NUM_ACTIONS
+from ..encoding import encode_infoset, encode_action_mask, action_to_index, INPUT_DIM, NUM_ACTIONS
 from ..networks import AdvantageNetwork, get_strategy_from_advantages
 from ..reservoir import ReservoirSample
 from ..utils import WorkerStats, SimulationNodeData
@@ -74,15 +74,14 @@ class DeepCFRWorkerResult:
 
 
 def _get_strategy_from_network(
-    network_weights: Dict[str, torch.Tensor],
+    network: AdvantageNetwork,
     features: np.ndarray,
     action_mask: np.ndarray,
-    network_config: Dict[str, int],
 ) -> np.ndarray:
     """
-    Compute strategy from advantage network weights.
+    Compute strategy from advantage network.
 
-    Loads weights into a temporary AdvantageNetwork, runs forward pass,
+    Uses a pre-built AdvantageNetwork (created once per worker), runs forward pass,
     then applies ReLU + normalize (regret matching on predicted advantages).
 
     Returns numpy array of shape (NUM_ACTIONS,) with strategy probabilities.
@@ -91,21 +90,10 @@ def _get_strategy_from_network(
         NetworkError: If network inference fails
     """
     try:
-        input_dim = network_config.get("input_dim", features.shape[0])
-        hidden_dim = network_config.get("hidden_dim", 256)
-        output_dim = network_config.get("output_dim", NUM_ACTIONS)
-
-        net = AdvantageNetwork(
-            input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim
-        )
-        net.load_state_dict(network_weights)
-        net.eval()
-
         with torch.no_grad():
             features_tensor = torch.from_numpy(features).float().unsqueeze(0)
             mask_tensor = torch.from_numpy(action_mask).bool().unsqueeze(0)
-            # get_strategy_from_advantages expects torch tensors, returns torch tensor
-            raw_advantages = net(features_tensor, mask_tensor).squeeze(0)
+            raw_advantages = network(features_tensor, mask_tensor).squeeze(0)
             strategy_tensor = get_strategy_from_advantages(
                 raw_advantages.unsqueeze(0), mask_tensor
             )
@@ -118,10 +106,9 @@ def _deep_traverse(
     game_state: CambiaGameState,
     agent_states: List[AgentState],
     updating_player: int,
-    network_weights: Optional[Dict[str, torch.Tensor]],
+    network: Optional[AdvantageNetwork],
     iteration: int,
     config: Config,
-    network_config: Dict[str, int],
     advantage_samples: List[ReservoirSample],
     strategy_samples: List[ReservoirSample],
     depth: int,
@@ -311,10 +298,10 @@ def _deep_traverse(
         return np.zeros(NUM_PLAYERS, dtype=np.float64)
 
     # Compute strategy from advantage network
-    if network_weights is not None:
+    if network is not None:
         try:
             strategy = _get_strategy_from_network(
-                network_weights, features, action_mask, network_config
+                network, features, action_mask
             )
         except NetworkError as e_net:
             logger_t.warning(
@@ -477,10 +464,9 @@ def _deep_traverse(
                             game_state,
                             next_agent_states,
                             updating_player,
-                            network_weights,
+                            network,
                             iteration,
                             config,
-                            network_config,
                             advantage_samples,
                             strategy_samples,
                             depth + 1,
@@ -697,10 +683,9 @@ def _deep_traverse(
                         game_state,
                         next_agent_states,
                         updating_player,
-                        network_weights,
+                        network,
                         iteration,
                         config,
-                        network_config,
                         advantage_samples,
                         strategy_samples,
                         depth + 1,
@@ -807,7 +792,13 @@ def run_deep_cfr_worker(
                 except Exception:
                     pass
 
-        worker_root_logger.setLevel(logging.DEBUG)
+        # Set root logger level to match the worker's configured level
+        # (avoids creating expensive LogRecords that just get filtered by handler)
+        worker_log_level_str = config.logging.get_worker_log_level(
+            worker_id, config.cfr_training.num_workers
+        )
+        effective_level = getattr(logging, worker_log_level_str.upper(), logging.WARNING)
+        worker_root_logger.setLevel(effective_level)
         null_handler = logging.NullHandler()
         worker_root_logger.addHandler(null_handler)
         worker_root_logger.propagate = False
@@ -829,11 +820,7 @@ def run_deep_cfr_worker(
             archive_queue=archive_queue,
             logging_config_snapshot=config.logging,
         )
-        worker_log_level_str = config.logging.get_worker_log_level(
-            worker_id, config.cfr_training.num_workers
-        )
-        file_log_level = getattr(logging, worker_log_level_str.upper(), logging.DEBUG)
-        file_handler.setLevel(file_log_level)
+        file_handler.setLevel(effective_level)
         file_handler.setFormatter(formatter)
         worker_root_logger.addHandler(file_handler)
 
@@ -855,23 +842,32 @@ def run_deep_cfr_worker(
 
     # --- Main simulation logic ---
     try:
-        # Deserialize network weights to torch tensors
-        network_weights: Optional[Dict[str, torch.Tensor]] = None
+        # Build advantage network once for this worker, load weights
+        advantage_network: Optional[AdvantageNetwork] = None
         if network_weights_serialized is not None:
             try:
-                network_weights = {
+                input_dim = network_config.get("input_dim", INPUT_DIM)
+                hidden_dim = network_config.get("hidden_dim", 256)
+                output_dim = network_config.get("output_dim", NUM_ACTIONS)
+
+                advantage_network = AdvantageNetwork(
+                    input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim
+                )
+                weights_tensors = {
                     k: torch.tensor(v) if isinstance(v, np.ndarray) else v
                     for k, v in network_weights_serialized.items()
                 }
+                advantage_network.load_state_dict(weights_tensors)
+                advantage_network.eval()
             except Exception as e_deserialize:
                 if logger_instance:
                     logger_instance.warning(
-                        "W%d: Failed to deserialize network weights: %s. Using uniform strategy.",
+                        "W%d: Failed to build/load network: %s. Using uniform strategy.",
                         worker_id,
                         e_deserialize,
                     )
                 worker_stats.warning_count += 1
-                network_weights = None
+                advantage_network = None
 
         # Initialize game state
         try:
@@ -992,10 +988,9 @@ def run_deep_cfr_worker(
             game_state=game_state,
             agent_states=initial_agent_states,
             updating_player=updating_player,
-            network_weights=network_weights,
+            network=advantage_network,
             iteration=iteration,
             config=config,
-            network_config=network_config,
             advantage_samples=advantage_samples,
             strategy_samples=strategy_samples,
             depth=0,

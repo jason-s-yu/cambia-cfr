@@ -1,0 +1,31 @@
+services:
+  cfr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cambia-cfr
+    volumes:
+      # Project source — the only writable host path
+      - .:/workspace
+      # Claude Code auth (read-only from host)
+      - ${HOME}/.claude/.credentials.json:/auth/.credentials.json:ro
+      - ${HOME}/.claude/settings.json:/auth/settings.json:ro
+      # Persistent Claude Code state inside container
+      - claude-home:/home/trainer/.claude
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONUNBUFFERED=1
+      - CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+volumes:
+  claude-home:

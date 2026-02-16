@@ -1,0 +1,38 @@
+{
+  "name": "backward_pass",
+  "config": {
+    "batch_sizes": [
+      1024,
+      2048,
+      4096
+    ],
+    "num_warmup": 3,
+    "num_iters": 20,
+    "network": "AdvantageNetwork",
+    "includes": "forward + loss + backward + grad_clip + optimizer"
+  },
+  "timings": {
+    "batch_1024_avg_s": 6.10620084874995,
+    "batch_1024_std_s": 0.203950228536717,
+    "batch_2048_avg_s": 6.16102864814984,
+    "batch_2048_std_s": 0.24366536840508118,
+    "batch_4096_avg_s": 6.085137553750064,
+    "batch_4096_std_s": 0.2338848216188989
+  },
+  "metrics": {
+    "batch_1024_throughput": 167.69838159018818,
+    "batch_1024_avg_ms": 6106.20084874995,
+    "batch_1024_std_ms": 203.950228536717,
+    "batch_2048_throughput": 332.41202353685134,
+    "batch_2048_avg_ms": 6161.028648149841,
+    "batch_2048_std_ms": 243.66536840508118,
+    "batch_4096_throughput": 673.1154331056615,
+    "batch_4096_avg_ms": 6085.137553750064,
+    "batch_4096_std_ms": 233.8848216188989
+  },
+  "metadata": {
+    "device": "cpu",
+    "network_params": 174610
+  },
+  "timestamp": "2026-02-16T10:54:07.591777"
+}

@@ -1,0 +1,51 @@
+{
+  "name": "gpu_vs_cpu",
+  "config": {
+    "batch_sizes": [
+      512,
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "num_iters": 100
+  },
+  "timings": {},
+  "metrics": {
+    "batch_512_forward_speedup": 337.5557519999656,
+    "batch_512_backward_speedup": 289.71606517099593,
+    "batch_512_cpu_forward_ms": 1694.2371196900012,
+    "batch_512_gpu_forward_ms": 5.019132720008201,
+    "batch_512_cpu_backward_ms": 8331.438865119944,
+    "batch_512_gpu_backward_ms": 28.757255350001287,
+    "batch_1024_forward_speedup": 1605.8837466848486,
+    "batch_1024_backward_speedup": 184.5604197176075,
+    "batch_1024_cpu_forward_ms": 1532.7180290999968,
+    "batch_1024_gpu_forward_ms": 0.9544389699840394,
+    "batch_1024_cpu_backward_ms": 6033.8386243999685,
+    "batch_1024_gpu_backward_ms": 32.69302613004584,
+    "batch_2048_forward_speedup": 2243.7841093096285,
+    "batch_2048_backward_speedup": 615.0856415733116,
+    "batch_2048_cpu_forward_ms": 1583.3960160299648,
+    "batch_2048_gpu_forward_ms": 0.705681090021244,
+    "batch_2048_cpu_backward_ms": 5903.079018659964,
+    "batch_2048_gpu_backward_ms": 9.597166019939323,
+    "batch_4096_forward_speedup": 399.67137756455594,
+    "batch_4096_backward_speedup": 351.9389872929342,
+    "batch_4096_cpu_forward_ms": 1625.7573948899517,
+    "batch_4096_gpu_forward_ms": 4.067735359976723,
+    "batch_4096_cpu_backward_ms": 5796.878986169986,
+    "batch_4096_gpu_backward_ms": 16.471261200013032,
+    "batch_8192_forward_speedup": 355.77123619813955,
+    "batch_8192_backward_speedup": 612.1397080037922,
+    "batch_8192_cpu_forward_ms": 1697.881349069985,
+    "batch_8192_gpu_forward_ms": 4.772396350008421,
+    "batch_8192_cpu_backward_ms": 5854.839448510011,
+    "batch_8192_gpu_backward_ms": 9.564547720001428
+  },
+  "metadata": {
+    "cuda_available": true,
+    "cuda_device_name": "NVIDIA GeForce RTX 3090"
+  },
+  "timestamp": "2026-02-16T11:26:43.677837"
+}
