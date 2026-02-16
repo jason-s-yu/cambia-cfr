@@ -475,16 +475,16 @@ Human weaknesses the agent exploits:
 
 ```
 ┌──────────────────────────────────────────┐
-│           cambia-engine (Go)              │
+│           cambia-engine (Go)             │
 │                                          │
 │  GameState  AgentState  Encoding         │
 │  LegalActions  ApplyAction  Undo         │
 │  InfosetKey  CardBucket  Observation     │
 │                                          │
 ├──────────┬───────────────────────────────┤
-│  C API   │    Native Go API             │
-│  (cgo)   │                              │
-└────┬─────┴──────────┬───────────────────┘
+│  C API   │    Native Go API              │
+│  (cgo)   │                               │
+└────┬─────┴──────────┬───────────────────-┘
      │                │
      ▼                ▼
 ┌─────────┐    ┌──────────────┐
