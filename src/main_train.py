@@ -11,6 +11,7 @@ import multiprocessing
 import multiprocessing.managers
 import queue
 import traceback
+from dataclasses import dataclass
 
 from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 
@@ -18,11 +19,12 @@ from rich.console import Console
 
 from .serial_rotating_handler import SerialRotatingFileHandler
 from .config import Config, load_config
-from .cfr.exceptions import GracefulShutdownException
+from .cfr.exceptions import GracefulShutdownException, ConfigParseError, ConfigValidationError
 from .live_display import LiveDisplayManager
 from .live_log_handler import LiveLogHandler
 from .log_archiver import LogArchiver
 from .cfr.trainer import CFRTrainer
+from .cfr.deep_trainer import DeepCFRTrainer, DeepCFRConfig
 from .utils import LogQueue as ProgressQueue
 
 # Use TYPE_CHECKING for imports only needed for type hints
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
     from .live_display import LiveDisplayManager
     from .log_archiver import LogArchiver
     from .cfr.trainer import CFRTrainer
+    from .cfr.deep_trainer import DeepCFRTrainer
 
 
 # Global logger instance
@@ -78,6 +81,18 @@ def handle_sigint(sig, frame):
         print(
             "\nMultiple SIGINT received. Shutdown already in progress.", file=sys.stderr
         )
+
+
+@dataclass
+class TrainingInfrastructure:
+    """Container for training infrastructure components."""
+    live_display_manager: LiveDisplayManager
+    progress_queue: Optional[ProgressQueue]
+    archive_queue: Optional[Union[queue.Queue, "multiprocessing.Queue"]]
+    manager: Optional[multiprocessing.managers.SyncManager]
+    log_archiver: Optional[LogArchiver]
+    run_log_dir: str
+    run_timestamp: str
 
 
 def setup_logging(
@@ -146,8 +161,8 @@ def setup_logging(
                 root_logger.removeHandler(handler)
                 if hasattr(handler, "close"):
                     handler.close()
-            except Exception:
-                pass  # Ignore errors closing old handlers
+            except Exception:  # JUSTIFIED: Cleaning up old handlers during reconfiguration; errors don't affect new setup
+                logger.debug("Error closing old handler during cleanup")  # Use logger if available, else silent
         # Set level and add new handlers
         root_logger.setLevel(logging.DEBUG)  # Set root low, handlers control output
         for handler in handlers:
@@ -192,7 +207,7 @@ def setup_logging(
                 logging.info("Updated latest_run symlink -> %s", absolute_run_log_dir)
         except OSError as e_link:
             logging.error("Could not create/update latest_run link/marker: %s", e_link)
-        except Exception as e_link_other:  # Catch other potential errors
+        except Exception as e_link_other:  # JUSTIFIED: Symlink creation is convenience feature; must not crash logging setup
             logging.error(
                 "Unexpected error updating latest_run link/marker: %s",
                 e_link_other,
@@ -212,7 +227,7 @@ def setup_logging(
         print(f"FATAL: Logging setup failed: {e_setup}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return None
-    except Exception as e_setup_other:  # Catch any other unexpected errors
+    except Exception as e_setup_other:  # JUSTIFIED: Top-level setup handler; logging not yet functional; print to stderr
         print(
             f"FATAL: Unexpected error during logging setup: {e_setup_other}",
             file=sys.stderr,
@@ -221,9 +236,485 @@ def setup_logging(
         return None
 
 
-def main():
+def create_infrastructure(
+    config: Config,
+    total_iterations: int,
+    console_log_level: Optional[int] = None,
+) -> TrainingInfrastructure:
+    """
+    Create all training infrastructure: display, queues, archiver, logging.
+
+    Args:
+        config: Configuration object
+        total_iterations: Total iterations for progress display
+        console_log_level: Optional override for console log level
+
+    Returns:
+        TrainingInfrastructure with all components initialized
+    """
     global live_display_manager_global, log_archiver_global, archive_queue_global
 
+    # Initialize Rich Console and Display Manager
+    rich_console = Console(stderr=True, record=False)
+    console_log_level_str = getattr(config.logging, "log_level_console", "ERROR").upper()
+    console_log_level_value = console_log_level or getattr(
+        logging, console_log_level_str, logging.ERROR
+    )
+
+    # Get num_workers from config
+    num_workers = getattr(config.cfr_training, "num_workers", 1)
+    if not isinstance(num_workers, int) or num_workers < 0:
+        raise ValueError(f"Invalid num_workers configured: {num_workers}")
+
+    # Create LiveDisplayManager
+    live_display_manager = LiveDisplayManager(
+        num_workers=num_workers,
+        total_iterations=total_iterations,
+        console=rich_console,
+        console_log_level_value=console_log_level_value,
+    )
+    live_display_manager_global = live_display_manager
+
+    # Create queues and manager based on configuration
+    manager: Optional[multiprocessing.managers.SyncManager] = None
+    progress_queue: Optional[ProgressQueue] = None
+    archive_queue: Optional[Union[queue.Queue, "multiprocessing.Queue"]] = None
+
+    needs_manager_for_queues = num_workers > 1
+    is_archiving_enabled = getattr(config.logging, "log_archive_enabled", False)
+
+    if needs_manager_for_queues:
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue(-1)
+        if is_archiving_enabled:
+            archive_queue = manager.Queue(-1)
+    else:
+        progress_queue = None
+        if is_archiving_enabled:
+            archive_queue = queue.Queue(-1)
+
+    archive_queue_global = archive_queue
+
+    # Start LogArchiver thread if enabled
+    log_archiver: Optional[LogArchiver] = None
+    if is_archiving_enabled:
+        if archive_queue is None:
+            raise RuntimeError("Log archiving enabled but archive queue is None")
+        log_archiver = LogArchiver(config, archive_queue, "")
+        log_archiver.start()
+
+    log_archiver_global = log_archiver
+
+    # Setup logging
+    setup_result = setup_logging(config, False, live_display_manager, archive_queue)
+    if not setup_result:
+        raise RuntimeError("Failed to set up logging")
+
+    run_log_dir, run_timestamp = setup_result
+
+    # Update LogArchiver with the actual run_log_dir
+    if log_archiver:
+        log_archiver.run_log_dir = run_log_dir
+        logging.info("LogArchiver run_log_dir updated to: %s", run_log_dir)
+
+    return TrainingInfrastructure(
+        live_display_manager=live_display_manager,
+        progress_queue=progress_queue,
+        archive_queue=archive_queue,
+        manager=manager,
+        log_archiver=log_archiver,
+        run_log_dir=run_log_dir,
+        run_timestamp=run_timestamp,
+    )
+
+
+def shutdown_infrastructure(
+    infra: TrainingInfrastructure,
+    trainer: Optional[Union[CFRTrainer, DeepCFRTrainer]],
+    training_completed_normally: bool,
+):
+    """
+    Shutdown infrastructure components and perform final cleanup.
+
+    Args:
+        infra: TrainingInfrastructure instance
+        trainer: Trainer instance (CFRTrainer or DeepCFRTrainer)
+        training_completed_normally: True if training completed without errors
+    """
+    rich_console = Console(stderr=True, record=False)
+    is_shutting_down_gracefully = shutdown_event.is_set() or training_completed_normally
+    shutdown_reason = (
+        "Normal Completion"
+        if training_completed_normally
+        else ("Graceful Shutdown" if is_shutting_down_gracefully else "Error/Exception")
+    )
+    rich_console.print(
+        f"\n--- Initiating Final Shutdown Sequence ({shutdown_reason}) ---"
+    )
+
+    # Final log size update attempt
+    if infra.log_archiver and infra.live_display_manager:
+        try:
+            current_size, archived_size = infra.log_archiver.get_total_log_size_info()
+            if hasattr(infra.live_display_manager, "update_log_summary_display"):
+                infra.live_display_manager.update_log_summary_display(
+                    current_size, archived_size
+                )
+            if getattr(infra.live_display_manager, "live", None):
+                if hasattr(infra.live_display_manager, "refresh"):
+                    infra.live_display_manager.refresh()
+        except Exception as final_log_size_e:
+            rich_console.print(
+                f"[yellow]Could not perform final log size update: {final_log_size_e}[/yellow]"
+            )
+
+    # Ensure Rich Live display is stopped
+    if infra.live_display_manager and getattr(infra.live_display_manager, "live", None):
+        rich_console.print("Ensuring Rich Live display is stopped...")
+        try:
+            if hasattr(infra.live_display_manager, "stop"):
+                infra.live_display_manager.stop()
+        except Exception as e_stop_rich_final:
+            rich_console.print(
+                f"[red]Error stopping Rich display in finally: {e_stop_rich_final}[/red]"
+            )
+
+    # Perform final save/summary via trainer if needed
+    if trainer and training_completed_normally:
+        if not shutdown_event.is_set():
+            rich_console.print("Performing final save and summary...")
+            try:
+                if hasattr(trainer, "save_data") and callable(trainer.save_data):
+                    trainer.save_data()
+                if hasattr(trainer, "_write_run_summary") and callable(
+                    trainer._write_run_summary
+                ):
+                    trainer._write_run_summary()
+            except Exception as e_final_save:
+                rich_console.print(
+                    f"[red]Error during final save/summary: {e_final_save}[/red]"
+                )
+        else:
+            rich_console.print(
+                "Shutdown occurred during final steps. Skipping final save/summary."
+            )
+    elif not training_completed_normally and trainer:
+        rich_console.print(
+            "Shutdown/Error occurred, final summary likely written by emergency handler."
+        )
+    elif not trainer:
+        rich_console.print(
+            "Trainer object not initialized. Cannot perform final save/summary."
+        )
+
+    # Stop LogArchiver
+    if infra.log_archiver:
+        rich_console.print("Stopping LogArchiver...")
+        try:
+            if hasattr(infra.log_archiver, "stop"):
+                infra.log_archiver.stop(timeout=10.0)
+                rich_console.print("LogArchiver stopped.")
+            else:
+                rich_console.print("[yellow]LogArchiver missing stop method.[/yellow]")
+        except Exception as e_stop_archiver:
+            rich_console.print(
+                f"[red]Error stopping LogArchiver: {e_stop_archiver}[/red]"
+            )
+
+    # Shutdown multiprocessing manager
+    if infra.manager:
+        rich_console.print("Shutting down multiprocessing manager...")
+        try:
+            infra.manager.shutdown()
+        except Exception as mgr_e:
+            rich_console.print(f"[red]Error shutting down manager:[/red] {mgr_e}")
+        else:
+            rich_console.print("Manager shut down.")
+
+    rich_console.print("--- Cambia CFR+ Training Finished ---")
+    logging.shutdown()
+
+
+def run_tabular_training(
+    config: Config,
+    infra: TrainingInfrastructure,
+    iterations: Optional[int] = None,
+    load: bool = False,
+    save_path: Optional[str] = None,
+) -> int:
+    """
+    Run tabular CFR+ training.
+
+    Args:
+        config: Configuration object
+        infra: TrainingInfrastructure instance
+        iterations: Override number of iterations (None = use config)
+        load: Load existing agent data before training
+        save_path: Override save path for agent data
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    exit_code = 0
+    trainer: Optional[CFRTrainer] = None
+    training_completed_normally = False
+
+    try:
+        logging.info("--- Starting Cambia CFR+ Training ---")
+
+        # Apply CLI overrides
+        if iterations is not None:
+            config.cfr_training.num_iterations = iterations
+        if save_path is not None:
+            config.persistence.agent_data_save_path = save_path
+        if iterations is not None or save_path is not None:
+            logging.info(
+                "Applied command-line overrides (Iterations: %s, Save Path: %s)",
+                iterations,
+                save_path,
+            )
+
+        # Set recursion limit
+        if getattr(config.system, "recursion_limit", 0) > 0:
+            try:
+                sys.setrecursionlimit(config.system.recursion_limit)
+                logging.info("System recursion limit set to: %d", sys.getrecursionlimit())
+            except (ValueError, RecursionError) as e_recur:
+                logging.error(
+                    "Failed to set recursion limit to %d: %s",
+                    config.system.recursion_limit,
+                    e_recur,
+                )
+
+        # Initialize Trainer
+        trainer = CFRTrainer(
+            config=config,
+            run_log_dir=infra.run_log_dir,
+            run_timestamp=infra.run_timestamp,
+            shutdown_event=shutdown_event,
+            progress_queue=infra.progress_queue,
+            live_display_manager=infra.live_display_manager,
+            archive_queue=infra.archive_queue,
+        )
+        if trainer and infra.log_archiver:
+            trainer.log_archiver_global_ref = infra.log_archiver
+
+        # Load data if requested
+        if load:
+            logger.info(
+                "Attempting to load agent data from: %s",
+                config.persistence.agent_data_save_path,
+            )
+            if hasattr(trainer, "load_data") and callable(trainer.load_data):
+                trainer.load_data()
+                if infra.live_display_manager:
+                    infra.live_display_manager.update_overall_progress(
+                        trainer.current_iteration
+                    )
+                    infra.live_display_manager.update_stats(
+                        iteration=trainer.current_iteration,
+                        infosets=trainer._total_infosets_str,
+                        exploitability=trainer._last_exploit_str,
+                    )
+            else:
+                logger.error("Trainer object missing load_data method.")
+        else:
+            logger.info("Starting training from scratch.")
+
+        # Initial log size update
+        if infra.log_archiver and infra.live_display_manager:
+            try:
+                current_size, archived_size = infra.log_archiver.get_total_log_size_info()
+                infra.live_display_manager.update_log_summary_display(
+                    current_size, archived_size
+                )
+            except Exception as e_log_size_init:
+                logger.debug("Error during initial log size display: %s", e_log_size_init)
+
+        # Main Training Execution
+        if infra.live_display_manager:
+            infra.live_display_manager.run(trainer.train)
+        else:
+            if hasattr(trainer, "train") and callable(trainer.train):
+                trainer.train()
+            else:
+                logger.error("Trainer object missing train method.")
+                raise RuntimeError("Trainer cannot be executed.")
+
+        training_completed_normally = True
+        logger.info("Training completed successfully.")
+
+    except GracefulShutdownException as shutdown_exc:
+        logger.warning("Training interrupted by shutdown signal: %s.", shutdown_exc)
+        exit_code = 0
+    except KeyboardInterrupt:
+        logger.warning("KeyboardInterrupt caught directly in training.")
+        if not shutdown_event.is_set():
+            shutdown_event.set()
+        exit_code = 0
+    except Exception as train_exc:
+        logger.exception("An unexpected error occurred during training:")
+        exit_code = 1
+    finally:
+        shutdown_infrastructure(infra, trainer, training_completed_normally)
+
+    return exit_code
+
+
+def run_deep_training(
+    config: Config,
+    dcfr_config: DeepCFRConfig,
+    infra: TrainingInfrastructure,
+    steps: Optional[int] = None,
+    checkpoint: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> int:
+    """
+    Run Deep CFR training.
+
+    Args:
+        config: Configuration object
+        dcfr_config: DeepCFRConfig instance
+        infra: TrainingInfrastructure instance
+        steps: Number of training steps (None = use config default)
+        checkpoint: Path to checkpoint to resume from
+        save_path: Override save path for checkpoints
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    exit_code = 0
+    trainer: Optional[DeepCFRTrainer] = None
+    training_completed_normally = False
+
+    try:
+        logging.info("--- Starting Cambia Deep CFR Training ---")
+
+        # Apply CLI overrides
+        if save_path is not None:
+            config.persistence.agent_data_save_path = save_path
+            logging.info("Applied command-line override: Save Path = %s", save_path)
+
+        # Set recursion limit
+        if getattr(config.system, "recursion_limit", 0) > 0:
+            try:
+                sys.setrecursionlimit(config.system.recursion_limit)
+                logging.info("System recursion limit set to: %d", sys.getrecursionlimit())
+            except (ValueError, RecursionError) as e_recur:
+                logging.error(
+                    "Failed to set recursion limit to %d: %s",
+                    config.system.recursion_limit,
+                    e_recur,
+                )
+
+        # Initialize DeepCFRTrainer
+        trainer = DeepCFRTrainer(
+            config=config,
+            deep_cfr_config=dcfr_config,
+            run_log_dir=infra.run_log_dir,
+            run_timestamp=infra.run_timestamp,
+            shutdown_event=shutdown_event,
+            progress_queue=infra.progress_queue,
+            live_display_manager=infra.live_display_manager,
+            archive_queue=infra.archive_queue,
+        )
+        if trainer and infra.log_archiver:
+            trainer.log_archiver_global_ref = infra.log_archiver
+
+        # Load checkpoint if requested
+        if checkpoint:
+            logger.info("Attempting to load checkpoint from: %s", checkpoint)
+            trainer.load_checkpoint(checkpoint)
+        else:
+            logger.info("Starting training from scratch.")
+
+        # Initial log size update
+        if infra.log_archiver and infra.live_display_manager:
+            try:
+                current_size, archived_size = infra.log_archiver.get_total_log_size_info()
+                infra.live_display_manager.update_log_summary_display(
+                    current_size, archived_size
+                )
+            except Exception as e_log_size_init:
+                logger.debug("Error during initial log size display: %s", e_log_size_init)
+
+        # Main Training Execution
+        if infra.live_display_manager:
+            infra.live_display_manager.run(
+                lambda: trainer.train(num_training_steps=steps)
+            )
+        else:
+            if hasattr(trainer, "train") and callable(trainer.train):
+                trainer.train(num_training_steps=steps)
+            else:
+                logger.error("Trainer object missing train method.")
+                raise RuntimeError("Trainer cannot be executed.")
+
+        training_completed_normally = True
+        logger.info("Deep CFR training completed successfully.")
+
+    except GracefulShutdownException as shutdown_exc:
+        logger.warning("Training interrupted by shutdown signal: %s.", shutdown_exc)
+        exit_code = 0
+    except KeyboardInterrupt:
+        logger.warning("KeyboardInterrupt caught directly in deep training.")
+        if not shutdown_event.is_set():
+            shutdown_event.set()
+        exit_code = 0
+    except Exception as train_exc:
+        logger.exception("An unexpected error occurred during deep training:")
+        exit_code = 1
+    finally:
+        shutdown_infrastructure(infra, trainer, training_completed_normally)
+
+    return exit_code
+
+
+def get_checkpoint_info(filepath: str) -> dict:
+    """
+    Load and return checkpoint metadata.
+
+    Args:
+        filepath: Path to checkpoint file (.pt for Deep CFR, .joblib for tabular)
+
+    Returns:
+        Dictionary with checkpoint metadata
+    """
+    import torch
+
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
+
+    if filepath.endswith(".pt"):
+        # Deep CFR checkpoint
+        checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+        return {
+            "type": "deep_cfr",
+            "training_step": checkpoint.get("training_step", 0),
+            "total_traversals": checkpoint.get("total_traversals", 0),
+            "current_iteration": checkpoint.get("current_iteration", 0),
+            "advantage_buffer_path": checkpoint.get("advantage_buffer_path", ""),
+            "strategy_buffer_path": checkpoint.get("strategy_buffer_path", ""),
+            "advantage_loss_history": checkpoint.get("advantage_loss_history", []),
+            "strategy_loss_history": checkpoint.get("strategy_loss_history", []),
+            "config": checkpoint.get("dcfr_config", {}),
+        }
+    elif filepath.endswith(".joblib"):
+        # Tabular CFR checkpoint
+        from .cfr import persistence
+        data = persistence.load_agent_data(filepath)
+        return {
+            "type": "tabular_cfr",
+            "iteration": data.get("iteration", 0),
+            "num_infosets": len(data.get("regret_sum", {})),
+            "exploitability_history": data.get("exploitability_history", []),
+        }
+    else:
+        raise ValueError(f"Unknown checkpoint format: {filepath}")
+
+
+def main():
+    """Main entry point for backward compatibility."""
     parser = argparse.ArgumentParser(description="Run CFR+ Training for Cambia")
     parser.add_argument(
         "--config",
@@ -248,371 +739,36 @@ def main():
     # Set up signal handler early
     signal.signal(signal.SIGINT, handle_sigint)
 
-    # Load config first, needed for logging setup
+    # Load config
     config = load_config(args.config)
     if not config:
         print("ERROR: Failed to load configuration. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    # Initialize Rich Console and Display Manager (needed for logging handler)
-    rich_console = Console(stderr=True, record=False)
-    total_iterations_for_display = (
+    logging.info("Configuration loaded from: %s", args.config)
+
+    # Determine total iterations for display
+    total_iterations = (
         args.iterations
         if args.iterations is not None
         else getattr(config.cfr_training, "num_iterations", 0)
     )
-    console_log_level_str = getattr(config.logging, "log_level_console", "ERROR").upper()
-    console_log_level_value_for_display = getattr(
-        logging, console_log_level_str, logging.ERROR
-    )
-
-    # Basic check on num_workers before creating display manager
-    num_workers_for_display = getattr(config.cfr_training, "num_workers", 1)
-    if not isinstance(num_workers_for_display, int) or num_workers_for_display < 0:
-        print(
-            f"ERROR: Invalid num_workers configured: {num_workers_for_display}. Exiting.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    live_display_manager_global = LiveDisplayManager(
-        num_workers=num_workers_for_display,
-        total_iterations=total_iterations_for_display,
-        console=rich_console,
-        console_log_level_value=console_log_level_value_for_display,
-    )
-
-    exit_code = 0
-    manager: Optional[multiprocessing.managers.SyncManager] = None
-    progress_queue: Optional[ProgressQueue] = None
-    trainer: Optional[CFRTrainer] = None
-    # Target iterations respects command-line override
-    target_iterations = (
-        args.iterations
-        if args.iterations is not None
-        else getattr(config.cfr_training, "num_iterations", 0)
-    )
-
-    # --- Simplified Queue Initialization ---
-    # Use manager ONLY if necessary (MP workers > 1 AND archiving enabled)
-    # Otherwise, use standard queue or None.
-    needs_manager_for_queues = num_workers_for_display > 1
-    is_archiving_enabled = getattr(config.logging, "log_archive_enabled", False)
 
     try:
-        if needs_manager_for_queues:
-            manager = multiprocessing.Manager()
-            progress_queue = manager.Queue(-1)
-            # Use Manager Queue for archiver ONLY if MP workers AND archiving enabled
-            if is_archiving_enabled:
-                archive_queue_global = manager.Queue(-1)
-                print("Using Manager Queue for Archiver", file=sys.stderr)  # Debug
-            else:
-                archive_queue_global = None  # No archiving needed
-                print(
-                    "Using None Queue for Archiver (Archiving Disabled)", file=sys.stderr
-                )  # Debug
-        else:  # Single worker or no MP needed
-            progress_queue = None
-            # Use threading queue for archiver if archiving is enabled (runs in main thread)
-            if is_archiving_enabled:
-                archive_queue_global = queue.Queue(-1)
-                print("Using Threading Queue for Archiver", file=sys.stderr)  # Debug
-            else:
-                archive_queue_global = None  # No archiving needed
-                print(
-                    "Using None Queue for Archiver (Archiving Disabled / Single Worker)",
-                    file=sys.stderr,
-                )  # Debug
+        # Create infrastructure
+        infra = create_infrastructure(config, total_iterations)
 
-        # Start LogArchiver thread if enabled
-        if is_archiving_enabled:
-            if archive_queue_global is None:  # Should only happen if logic above failed
-                print(
-                    "ERROR: Log archiving enabled but archive queue is None.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            # LogArchiver needs run_log_dir, set later
-            log_archiver_global = LogArchiver(config, archive_queue_global, "")
-            log_archiver_global.start()
-        else:
-            log_archiver_global = None  # Ensure it's None if disabled
-
-        # Setup logging (requires config, display manager, archive queue)
-        # Pass False for verbose flag, let config control levels
-        setup_result = setup_logging(
-            config, False, live_display_manager_global, archive_queue_global
-        )
-        if not setup_result:
-            print("ERROR: Failed to set up logging. Exiting.", file=sys.stderr)
-            exit_code = 1
-            raise SystemExit(exit_code)  # Use SystemExit for controlled exit
-        run_log_dir, run_timestamp = setup_result
-
-        # Update LogArchiver with the actual run_log_dir
-        if log_archiver_global:
-            log_archiver_global.run_log_dir = run_log_dir
-            logging.info("LogArchiver run_log_dir updated to: %s", run_log_dir)
-
-        logging.info("--- Starting Cambia CFR+ Training ---")
-        logging.info("Configuration loaded from: %s", args.config)
-
-        # Override config based on command line args AFTER initial logging setup
-        if args.iterations is not None:
-            config.cfr_training.num_iterations = args.iterations
-        if args.save_path is not None:
-            config.persistence.agent_data_save_path = args.save_path
-        if args.iterations is not None or args.save_path is not None:
-            logging.info(
-                "Applied command-line overrides (Iterations: %s, Save Path: %s)",
-                args.iterations,
-                args.save_path,
-            )
-
-        # Set recursion limit
-        if getattr(config.system, "recursion_limit", 0) > 0:
-            try:
-                sys.setrecursionlimit(config.system.recursion_limit)
-                logging.info("System recursion limit set to: %d", sys.getrecursionlimit())
-            except (ValueError, RecursionError) as e_recur:  # Catch specific errors
-                logging.error(
-                    "Failed to set recursion limit to %d: %s",
-                    config.system.recursion_limit,
-                    e_recur,
-                )
-
-        # Initialize Trainer
-        try:
-            trainer = CFRTrainer(
-                config=config,
-                run_log_dir=run_log_dir,
-                run_timestamp=run_timestamp,
-                shutdown_event=shutdown_event,
-                progress_queue=progress_queue,
-                live_display_manager=live_display_manager_global,
-                archive_queue=archive_queue_global,
-            )
-            # Pass global archiver ref to trainer if it exists
-            if trainer and log_archiver_global:
-                trainer.log_archiver_global_ref = log_archiver_global
-        except Exception as trainer_init_e:  # Catch specific init errors if possible
-            # Log exception before raising
-            logging.exception(
-                "FATAL: Failed to initialize CFRTrainer: %s", trainer_init_e
-            )
-            # Print to stderr as logging might be compromised
-            print(
-                f"FATAL: Failed to initialize CFRTrainer: {trainer_init_e}",
-                file=sys.stderr,
-            )
-            exit_code = 1
-            raise  # Re-raise after logging
-
-        # Load data if requested
-        if args.load:
-            logger.info(
-                "Attempting to load agent data from: %s",
-                config.persistence.agent_data_save_path,
-            )
-            if hasattr(trainer, "load_data") and callable(trainer.load_data):
-                trainer.load_data()
-                if live_display_manager_global:  # Update display with loaded state
-                    live_display_manager_global.update_overall_progress(
-                        trainer.current_iteration
-                    )
-                    live_display_manager_global.update_stats(
-                        iteration=trainer.current_iteration,
-                        infosets=trainer._total_infosets_str,
-                        exploitability=trainer._last_exploit_str,
-                    )
-            else:
-                logger.error("Trainer object missing load_data method.")
-        else:
-            logger.info("Starting training from scratch.")
-
-        # Initial log size update
-        if log_archiver_global and live_display_manager_global:
-            try:
-                current_size, archived_size = (
-                    log_archiver_global.get_total_log_size_info()
-                )
-                live_display_manager_global.update_log_summary_display(
-                    current_size, archived_size
-                )
-            except Exception as e_log_size_init:
-                logger.error("Error during initial log size display: %s", e_log_size_init)
-
-        # --- Main Training Execution ---
-        training_completed_normally = False
-        try:
-            if live_display_manager_global:
-                # Run the trainer's train method within the Live context
-                live_display_manager_global.run(trainer.train)
-            else:
-                # Run directly if no display manager
-                print(
-                    "WARN: Live display not available, running train directly.",
-                    file=sys.stderr,
-                )
-                if hasattr(trainer, "train") and callable(trainer.train):
-                    trainer.train()  # Blocking call
-                else:
-                    logger.error("Trainer object missing train method.")
-                    raise RuntimeError("Trainer cannot be executed.")
-            # If train completes without exception, mark as normal completion
-            training_completed_normally = True
-            logger.info("Training completed successfully.")
-
-        except (
-            GracefulShutdownException
-        ) as shutdown_exc:  # Catch specific shutdown signal
-            logger.warning("Training interrupted by shutdown signal: %s.", shutdown_exc)
-            # Emergency save handled by trainer's internal logic or finally block
-            exit_code = 0  # Indicate graceful exit
-        except KeyboardInterrupt:  # Should be caught by signal handler, but as fallback
-            logger.warning(
-                "KeyboardInterrupt caught directly in main. Requesting shutdown."
-            )
-            if not shutdown_event.is_set():
-                shutdown_event.set()
-            # Emergency save handled by finally block
-            exit_code = 0
-        except Exception as train_exc:  # Catch other unexpected training errors
-            logger.exception("An unexpected error occurred during training:")
-            # Emergency save handled by finally block
-            exit_code = 1  # Indicate error exit
-
-    except SystemExit as sys_exit:  # Catch explicit sys.exit calls
-        exit_code = sys_exit.code if isinstance(sys_exit.code, int) else 1
-        # Log only if logger is still functional
-        if logging.getLogger().hasHandlers():
-            logger.error("System exit called with code %s.", exit_code)
-        else:
-            print(f"System exit called with code {exit_code}.", file=sys.stderr)
-    except (
-        Exception
-    ) as setup_exc:  # Catch errors during setup phase (before main training try block)
-        # Use print as logging might not be set up
-        print(f"\n--- FATAL ERROR during setup ---", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        rich_console.print(f"[bold red]FATAL ERROR during setup:[/bold red] {setup_exc}")
-        # Log if possible
-        if logging.getLogger().hasHandlers():
-            logger.exception("FATAL ERROR during setup:")
-        exit_code = 1
-
-    # --- Final Shutdown Sequence ---
-    finally:
-        is_shutting_down_gracefully = (
-            shutdown_event.is_set() or training_completed_normally
-        )
-        shutdown_reason = (
-            "Normal Completion"
-            if training_completed_normally
-            else (
-                "Graceful Shutdown" if is_shutting_down_gracefully else "Error/Exception"
-            )
-        )
-        rich_console.print(
-            f"\n--- Initiating Final Shutdown Sequence ({shutdown_reason}) ---"
+        # Run tabular training
+        exit_code = run_tabular_training(
+            config, infra, iterations=args.iterations, load=args.load, save_path=args.save_path
         )
 
-        # Final log size update attempt
-        if log_archiver_global and live_display_manager_global:
-            try:
-                current_size, archived_size = (
-                    log_archiver_global.get_total_log_size_info()
-                )
-                # Check methods exist before calling
-                if hasattr(live_display_manager_global, "update_log_summary_display"):
-                    live_display_manager_global.update_log_summary_display(
-                        current_size, archived_size
-                    )
-                # Refresh if live display might still be active
-                if getattr(live_display_manager_global, "live", None):
-                    if hasattr(live_display_manager_global, "refresh"):
-                        live_display_manager_global.refresh()
-            except Exception as final_log_size_e:
-                rich_console.print(
-                    f"[yellow]Could not perform final log size update: {final_log_size_e}[/yellow]"
-                )
-
-        # Ensure Rich Live display is stopped
-        if live_display_manager_global and getattr(
-            live_display_manager_global, "live", None
-        ):
-            rich_console.print("Ensuring Rich Live display is stopped...")
-            try:
-                if hasattr(live_display_manager_global, "stop"):
-                    live_display_manager_global.stop()
-            except Exception as e_stop_rich_final:
-                rich_console.print(
-                    f"[red]Error stopping Rich display in finally: {e_stop_rich_final}[/red]"
-                )
-
-        # Perform final save/summary via trainer if needed (e.g., normal exit)
-        # Emergency save should have been handled in exception blocks or by trainer internally
-        if trainer and training_completed_normally:
-            # Ensure shutdown wasn't signalled *just* as training completed normally
-            if not shutdown_event.is_set():
-                rich_console.print("Performing final save and summary...")
-                try:
-                    if hasattr(trainer, "save_data") and callable(trainer.save_data):
-                        trainer.save_data()
-                    if hasattr(trainer, "_write_run_summary") and callable(
-                        trainer._write_run_summary
-                    ):
-                        trainer._write_run_summary()
-                except Exception as e_final_save:
-                    rich_console.print(
-                        f"[red]Error during final save/summary: {e_final_save}[/red]"
-                    )
-            else:
-                rich_console.print(
-                    "Shutdown occurred during final steps. Skipping final save/summary (emergency save should have run)."
-                )
-        elif not training_completed_normally and trainer:
-            # If exited due to error/shutdown, summary should have been written by _perform_emergency_save
-            rich_console.print(
-                "Shutdown/Error occurred, final summary likely written by emergency handler."
-            )
-        elif not trainer:
-            rich_console.print(
-                "Trainer object not initialized. Cannot perform final save/summary."
-            )
-
-        # Stop LogArchiver (allow time to process queue)
-        if log_archiver_global:
-            rich_console.print("Stopping LogArchiver...")
-            try:
-                if hasattr(log_archiver_global, "stop"):
-                    log_archiver_global.stop(timeout=10.0)
-                    rich_console.print("LogArchiver stopped.")
-                else:
-                    rich_console.print(
-                        "[yellow]LogArchiver missing stop method.[/yellow]"
-                    )
-            except Exception as e_stop_archiver:
-                rich_console.print(
-                    f"[red]Error stopping LogArchiver: {e_stop_archiver}[/red]"
-                )
-
-        # Shutdown multiprocessing manager (if used)
-        if manager:
-            rich_console.print("Shutting down multiprocessing manager...")
-            try:
-                manager.shutdown()
-            except Exception as mgr_e:
-                rich_console.print(f"[red]Error shutting down manager:[/red] {mgr_e}")
-            else:
-                rich_console.print("Manager shut down.")
-
-        rich_console.print("--- Cambia CFR+ Training Finished ---")
-
-        # Final logging shutdown
-        logging.shutdown()
         sys.exit(exit_code)
+
+    except Exception as e:
+        print(f"FATAL: Error during setup or training: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -651,10 +807,10 @@ if __name__ == "__main__":
                 "ERROR: No suitable multiprocessing start method found!", file=sys.stderr
             )
 
-    except RuntimeError:  # Context already set
+    except RuntimeError:  # JUSTIFIED: Context already set is expected condition; silent is appropriate
         # print("DEBUG: Multiprocessing context already set.", file=sys.stderr)
-        pass
-    except Exception as e_mp_start:
+        logger.debug("Multiprocessing context already set")
+    except Exception as e_mp_start:  # JUSTIFIED: Multiprocessing setup before logging; must print to stderr
         print(
             f"ERROR: Setting multiprocessing start method failed: {e_mp_start}",
             file=sys.stderr,

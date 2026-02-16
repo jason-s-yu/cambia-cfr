@@ -31,6 +31,7 @@ from ..constants import (
     ActionAbilityKingSwapDecision,
     ActionSnapOpponentMove,
 )
+from src.cfr.exceptions import ActionApplicationError
 
 # Use TYPE_CHECKING for CambiaGameState hint to avoid circular import
 if TYPE_CHECKING:
@@ -228,14 +229,16 @@ class AbilityMixin:
                     type(action_type).__name__,
                 )
 
-        except IndexError as e_idx:
+        except (IndexError, KeyError) as e_idx:
+            # JUSTIFIED: Index/key errors during legal action generation indicate state corruption
             logger.error(
-                "Index error generating legal pending actions for %s: %s",
+                "Index/key error generating legal pending actions for %s: %s",
                 type(action_type).__name__,
                 e_idx,
                 exc_info=True,
             )
         except Exception as e_legal:
+            # JUSTIFIED: Catch all other errors to prevent legal action calculation from crashing
             logger.error(
                 "Unexpected error generating legal pending actions for %s: %s",
                 type(action_type).__name__,
@@ -767,7 +770,7 @@ class AbilityMixin:
                     original_pending_tuple = (  # Keep using tuple for undo state capture
                         self.pending_action,
                         self.pending_action_player,
-                        copy.deepcopy(self.pending_action_data),
+                        dict(self.pending_action_data),
                     )
                     # Store actual cards and indices for decision phase
                     new_pending_data = {
@@ -1158,6 +1161,9 @@ class AbilityMixin:
                 )
                 return None
 
+        except ActionApplicationError:
+            # Re-raise action application errors
+            raise
         except Exception as e_handle:
             logger.exception(
                 "Error handling pending action %s for P%d: %s",
@@ -1166,7 +1172,7 @@ class AbilityMixin:
                 e_handle,
             )
             self._clear_pending_action(undo_stack, delta_list)  # Attempt recovery
-            return None
+            raise ActionApplicationError(f"Pending action handling failed for {action}") from e_handle
 
         return card_just_discarded_for_snap_check  # Return card discarded this step (for snap check) or None
 
@@ -1233,7 +1239,7 @@ class AbilityMixin:
             # Store original state *before* setting pending action
             original_pending_action = self.pending_action
             original_pending_player = self.pending_action_player
-            original_pending_data = copy.deepcopy(self.pending_action_data)
+            original_pending_data = dict(self.pending_action_data)
             new_pending_data = {"ability_card": discarded_card}  # Store card for context
 
             def change_ability_pending():
@@ -1313,7 +1319,7 @@ class AbilityMixin:
 
         original_pending_action = self.pending_action
         original_pending_player = self.pending_action_player
-        original_pending_data = copy.deepcopy(self.pending_action_data)
+        original_pending_data = dict(self.pending_action_data)
 
         def change_clear():
             self.pending_action = None

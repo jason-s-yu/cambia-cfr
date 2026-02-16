@@ -34,7 +34,12 @@ from .config import Config
 from .utils import InfosetKey, PolicyDict, normalize_probabilities, SimulationTrace
 from .game.helpers import serialize_card
 
-from .cfr.exceptions import GracefulShutdownException
+from .cfr.exceptions import (
+    GracefulShutdownException,
+    GameStateError,
+    AgentStateError,
+    ObservationUpdateError,
+)
 
 
 # Conditional imports for type hinting
@@ -107,7 +112,25 @@ def _br_action_worker(
         )
         # No undo needed as we work on copies
         return action_value
-    except Exception as e:
+    except GameStateError as e:
+        logger.error(
+            "BR ActionWorker(D%d, P%d): Game state error processing action %s: %s",
+            depth,
+            br_player,
+            action,
+            e,
+        )
+        return -float("inf")  # Indicate failure
+    except (AgentStateError, ObservationUpdateError) as e:
+        logger.error(
+            "BR ActionWorker(D%d, P%d): Agent state error processing action %s: %s",
+            depth,
+            br_player,
+            action,
+            e,
+        )
+        return -float("inf")  # Indicate failure
+    except Exception as e:  # JUSTIFIED: BR calculation resilience
         # Log error from within the worker process
         logger.error(
             "BR ActionWorker(D%d, P%d): Error processing action %s: %s\n%s",
@@ -236,7 +259,35 @@ def _run_br_calculation_process(
         # Put result on the queue
         result_queue.put((br_player, br_value))
 
-    except Exception as e:
+    except GameStateError as e:
+        logger.error(
+            "!!! BR Process P%d: Game state error during calculation: %s",
+            br_player,
+            e,
+        )
+        try:
+            result_queue.put((br_player, float("inf")))
+        except Exception as q_err:  # JUSTIFIED: BR calculation resilience
+            logger.error(
+                "BR Process P%d: Failed to put error signal on queue: %s",
+                br_player,
+                q_err,
+            )
+    except (AgentStateError, ObservationUpdateError) as e:
+        logger.error(
+            "!!! BR Process P%d: Agent state error during calculation: %s",
+            br_player,
+            e,
+        )
+        try:
+            result_queue.put((br_player, float("inf")))
+        except Exception as q_err:  # JUSTIFIED: BR calculation resilience
+            logger.error(
+                "BR Process P%d: Failed to put error signal on queue: %s",
+                br_player,
+                q_err,
+            )
+    except Exception as e:  # JUSTIFIED: BR calculation resilience
         # Log the error from within the BR process
         logger.error(
             "!!! BR Process P%d: Unhandled exception during calculation: %s\n%s",
@@ -248,7 +299,7 @@ def _run_br_calculation_process(
         try:
             # Attempt to put failure signal on queue
             result_queue.put((br_player, float("inf")))
-        except Exception as q_err:
+        except Exception as q_err:  # JUSTIFIED: BR calculation resilience
             logger.error(
                 "BR Process P%d: Failed to put error signal on queue: %s",
                 br_player,
@@ -262,7 +313,7 @@ def _run_br_calculation_process(
                 pool.close()
                 pool.join()
                 logger.debug("BR Process P%d: Worker pool closed and joined.", br_player)
-            except Exception as e_pool_close:
+            except Exception as e_pool_close:  # JUSTIFIED: BR calculation resilience
                 logger.error(
                     "BR Process P%d: Error closing pool: %s", br_player, e_pool_close
                 )
@@ -504,13 +555,25 @@ class AnalysisTools:
                 if p.is_alive():
                     try:
                         p.terminate()
-                    except Exception:
-                        pass
+                    except Exception as e:  # JUSTIFIED: BR calculation resilience
+                        logger.debug("Error terminating BR process during cleanup: %s", e)
                     try:
                         p.join(0.5)
-                    except Exception:
-                        pass
-        except Exception as e_exploit:
+                    except Exception as e:  # JUSTIFIED: BR calculation resilience
+                        logger.debug("Error joining BR process during cleanup: %s", e)
+        except GameStateError as e_exploit:
+            logger.error(
+                "Game state error during exploitability calculation: %s",
+                e_exploit,
+            )
+            exploitability = float("inf")  # Indicate error
+        except (AgentStateError, ObservationUpdateError) as e_exploit:
+            logger.error(
+                "Agent state error during exploitability calculation: %s",
+                e_exploit,
+            )
+            exploitability = float("inf")  # Indicate error
+        except Exception as e_exploit:  # JUSTIFIED: BR calculation resilience
             logger.exception(
                 "Error during parallel exploitability calculation setup/coordination: %s",
                 e_exploit,
@@ -651,8 +714,12 @@ class AnalysisTools:
                     if obs_after_action is None:
                         try:
                             undo_info()
-                        except Exception:
-                            pass
+                        except GameStateError as e:
+                            logger.debug(
+                                "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                depth,
+                                e,
+                            )
                         continue
 
                     next_br_agent_state = br_agent_state.clone()
@@ -666,7 +733,23 @@ class AnalysisTools:
                             obs_after_action, opponent_player
                         )
                         next_opp_view_agent_state.update(opp_obs_filtered)
-                    except Exception as e_update:
+                    except (AgentStateError, ObservationUpdateError) as e_update:
+                        logger.error(
+                            "BR NodeLogic(D%d): Agent state error updating after BR action %s: %s",
+                            depth,
+                            action,
+                            e_update,
+                        )
+                        try:
+                            undo_info()
+                        except GameStateError as e:
+                            logger.debug(
+                                "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                depth,
+                                e,
+                            )
+                        continue
+                    except Exception as e_update:  # JUSTIFIED: BR calculation resilience
                         logger.error(
                             "BR NodeLogic(D%d): Error updating agent states after BR action %s: %s",
                             depth,
@@ -676,8 +759,12 @@ class AnalysisTools:
                         )
                         try:
                             undo_info()
-                        except Exception:
-                            pass
+                        except GameStateError as e:
+                            logger.debug(
+                                "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                depth,
+                                e,
+                            )
                         continue
 
                     action_value = AnalysisTools._best_response_node_logic(
@@ -691,9 +778,9 @@ class AnalysisTools:
                     )
                     try:
                         undo_info()  # Restore state
-                    except Exception as e_undo:
+                    except GameStateError as e_undo:
                         logger.error(
-                            "BR NodeLogic(D%d): Error undoing BR action %s: %s",
+                            "BR NodeLogic(D%d): Game state error undoing BR action %s: %s",
                             depth,
                             action,
                             e_undo,
@@ -716,7 +803,15 @@ class AnalysisTools:
                     if not isinstance(base_infoset_tuple, tuple):
                         raise TypeError("Infoset key not tuple")
                     infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
-                except Exception as e_key:
+                except AgentStateError as e_key:
+                    logger.error(
+                        "BR NodeLogic(D%d): Agent state error getting Opponent P%d infoset key: %s",
+                        depth,
+                        acting_player,
+                        e_key,
+                    )
+                    return 0.0
+                except Exception as e_key:  # JUSTIFIED: BR calculation resilience
                     logger.error(
                         "BR NodeLogic(D%d): Error getting Opponent P%d infoset key: %s. OppView State: %s",
                         depth,
@@ -804,8 +899,12 @@ class AnalysisTools:
                         if obs_after_action is None:
                             try:
                                 undo_info()
-                            except Exception:
-                                pass
+                            except GameStateError as e:
+                                logger.debug(
+                                    "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                    depth,
+                                    e,
+                                )
                             continue
 
                         next_br_agent_state = br_agent_state.clone()
@@ -819,7 +918,25 @@ class AnalysisTools:
                                 obs_after_action, opponent_player
                             )
                             next_opp_view_agent_state.update(opp_obs_filtered)
-                        except Exception as e_update:
+                        except (AgentStateError, ObservationUpdateError) as e_update:
+                            logger.error(
+                                "BR NodeLogic(D%d): Agent state error updating after Opp action %s: %s",
+                                depth,
+                                action,
+                                e_update,
+                            )
+                            try:
+                                undo_info()
+                            except GameStateError as e:
+                                logger.debug(
+                                    "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                    depth,
+                                    e,
+                                )
+                            continue
+                        except (
+                            Exception
+                        ) as e_update:  # JUSTIFIED: BR calculation resilience
                             logger.error(
                                 "BR NodeLogic(D%d): Error updating agent states after Opp action %s: %s",
                                 depth,
@@ -829,8 +946,12 @@ class AnalysisTools:
                             )
                             try:
                                 undo_info()
-                            except Exception:
-                                pass
+                            except GameStateError as e:
+                                logger.debug(
+                                    "BR NodeLogic(D%d): Game state error undoing action: %s",
+                                    depth,
+                                    e,
+                                )
                             continue
 
                         recursive_value = AnalysisTools._best_response_node_logic(
@@ -844,9 +965,9 @@ class AnalysisTools:
                         )
                         try:
                             undo_info()
-                        except Exception as e_undo:
+                        except GameStateError as e_undo:
                             logger.error(
-                                "BR NodeLogic(D%d): Error undoing Opp action %s: %s",
+                                "BR NodeLogic(D%d): Game state error undoing Opp action %s: %s",
                                 depth,
                                 action,
                                 e_undo,
@@ -865,7 +986,21 @@ class AnalysisTools:
 
                 return expected_value
 
-        except Exception as e_br_rec:
+        except GameStateError as e_br_rec:
+            logger.error(
+                "BR NodeLogic(D%d): Game state error in recursion: %s",
+                depth,
+                e_br_rec,
+            )
+            return 0.0
+        except (AgentStateError, ObservationUpdateError) as e_br_rec:
+            logger.error(
+                "BR NodeLogic(D%d): Agent state error in recursion: %s",
+                depth,
+                e_br_rec,
+            )
+            return 0.0
+        except Exception as e_br_rec:  # JUSTIFIED: BR calculation resilience
             logger.exception(
                 "BR NodeLogic(D%d): Unhandled error in recursion: %s. State: %s",
                 depth,
@@ -876,13 +1011,13 @@ class AnalysisTools:
 
     @staticmethod
     def _get_decision_context(game_state: CambiaGameState) -> Optional[DecisionContext]:
-        """Helper to determine DecisionContext robustly."""
+        """Determine DecisionContext from game state."""
         try:
             if game_state.snap_phase_active:
                 return DecisionContext.SNAP_DECISION
             pending = game_state.pending_action
             if pending:
-                # Use isinstance for robust type checking
+                # Use isinstance for type checking
                 if isinstance(pending, ActionDiscard):
                     return DecisionContext.POST_DRAW
                 if isinstance(
@@ -963,7 +1098,10 @@ class AnalysisTools:
                 current_turn=game_state.get_turn_number(),
             )
             return obs
-        except Exception as e_obs:
+        except GameStateError as e_obs:
+            logger.error("Game state error creating observation for BR: %s", e_obs)
+            return None
+        except Exception as e_obs:  # JUSTIFIED: BR calculation resilience
             logger.error("Error creating observation for BR: %s", e_obs, exc_info=True)
             return None
 
@@ -1030,9 +1168,9 @@ class AnalysisTools:
                 }
                 problematic_part["history_len"] = len(trace_data.get("history", []))
                 logger.debug("Problematic trace data (repr): %s", problematic_part)
-            except Exception:
-                pass
-        except Exception as e_log:
+            except Exception as e:  # JUSTIFIED: BR calculation resilience
+                logger.debug("Error creating debug trace data: %s", e)
+        except Exception as e_log:  # JUSTIFIED: BR calculation resilience
             logger.error(
                 "Unexpected error logging simulation trace: %s", e_log, exc_info=True
             )

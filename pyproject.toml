@@ -1,3 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cambia-cfr"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.scripts]
+cambia = "src.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
 [tool.black]
 target-version = ['py313']
 line-length = 90

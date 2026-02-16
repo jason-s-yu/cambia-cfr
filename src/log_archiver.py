@@ -1,269 +1,229 @@
 """
 src/log_archiver.py
 
-This module defines the LogArchiver, a background process responsible for managing log files.
-It periodically scans for completed log files, compresses them into .tar.gz archives,
-and cleans up old archives to ensure disk space usage remains within configured limits.
+Background thread that processes log archive requests from SerialRotatingFileHandler.
+
+When a rotating handler reaches its backup count, it sends a
+("BATCH_ARCHIVE", log_dir, base_pattern) tuple to the archive queue.
+This thread consumes those messages, compresses the rotated log files
+into tar.gz archives, and manages old archive cleanup.
 """
 
+import glob
 import logging
-import multiprocessing
 import os
-import shutil
+import queue
 import tarfile
+import threading
 import time
-import traceback
-from pathlib import Path
-from typing import List
+from typing import Tuple, Union
 
 from .config import Config
-from .utils import parse_size_to_bytes
 
-# Use a dedicated logger for the archiver itself
 logger = logging.getLogger(__name__)
 
 
-class LogArchiver:
+class LogArchiver(threading.Thread):
     """
-    Manages log file archiving and cleanup in a separate process.
+    Background thread that compresses rotated log files into tar.gz archives.
+
+    Expected interface (used by main_train.py):
+        archiver = LogArchiver(config, archive_queue, run_log_dir)
+        archiver.start()
+        archiver.run_log_dir = actual_log_dir   # update after logging setup
+        current, archived = archiver.get_total_log_size_info()
+        archiver.stop(timeout=10.0)
     """
 
-    def __init__(self, config: Config, shutdown_event: multiprocessing.Event):
-        """
-        Initializes the LogArchiver.
+    def __init__(
+        self,
+        config: Config,
+        archive_queue: Union[queue.Queue, "multiprocessing.Queue"],
+        run_log_dir: str = "",
+    ):
+        super().__init__(daemon=True, name="LogArchiver")
+        self.config = config
+        self.logging_config = config.logging
+        self.archive_queue = archive_queue
+        self.run_log_dir = run_log_dir
+        self._stop_event = threading.Event()
 
-        Args:
-            config: The main configuration object.
-            shutdown_event: A multiprocessing event to signal shutdown.
+        # Config-driven settings
+        self.max_archives = getattr(self.logging_config, "log_archive_max_archives", 10)
+        self.archive_subdir = getattr(self.logging_config, "log_archive_dir", "")
+
+        # Cached size info for display
+        self._current_log_bytes: int = 0
+        self._archived_bytes: int = 0
+        self._size_lock = threading.Lock()
+
+    def stop(self, timeout: float = 10.0):
+        """Signal the thread to stop and wait for it to finish."""
+        self._stop_event.set()
+        self.join(timeout=timeout)
+        if self.is_alive():
+            logger.warning("LogArchiver thread did not stop within %.1fs.", timeout)
+
+    def get_total_log_size_info(self) -> Tuple[int, int]:
         """
-        self.config = config.archiver
-        self.log_dir = Path(config.logging.directory)
-        self.log_file_basename = config.logging.filename.split(".")[0]
-        self.shutdown_event = shutdown_event
-        self.archive_interval_seconds = self.config.archive_interval_seconds
-        self.archive_delay_seconds = self.config.archive_delay_seconds
-        self.max_archive_bytes = parse_size_to_bytes(self.config.max_archive_size)
+        Returns (current_log_bytes, archived_bytes).
+
+        Scans the run log directory for current .log files and .tar.gz archives.
+        """
+        self._update_size_info()
+        with self._size_lock:
+            return self._current_log_bytes, self._archived_bytes
 
     def run(self):
-        """Main loop for the archiver process."""
-        logger.info(
-            "LogArchiver process started. PID: %d. Watching directory: %s",
-            os.getpid(),
-            self.log_dir,
-        )
-        while not self.shutdown_event.is_set():
+        """Main thread loop: drain archive queue and process batch archive requests."""
+        logger.info("LogArchiver thread started.")
+        while not self._stop_event.is_set():
             try:
-                self._archive_and_clean()
-            except Exception as e:
-                logger.error(
-                    "LogArchiver: Unhandled error in main loop: %s\n%s",
-                    e,
-                    traceback.format_exc(),
-                )
-
-            # Wait for the next interval or until shutdown is triggered
-            self.shutdown_event.wait(self.archive_interval_seconds)
-
-        logger.info("LogArchiver process shutting down.")
-
-    def _archive_and_clean(self):
-        """Core logic to find, archive, and clean log files."""
-        logger.debug("LogArchiver: Starting new archive and clean cycle.")
-
-        # --- Step 1: Find and safely claim files to be archived ---
-        files_to_archive = self._claim_files_for_archiving()
-        if not files_to_archive:
-            logger.debug("LogArchiver: No new log files to archive.")
-        else:
-            logger.info(
-                "LogArchiver: Found %d log file(s) to archive.", len(files_to_archive)
-            )
-
-        # --- Step 2: Archive each claimed file ---
-        for original_path in files_to_archive:
-            try:
-                # The file has already been renamed to .archiving, so it's safe
-                self._create_archive(original_path)
-                # After successful archival, the original (.log.N) is deleted
-                # by the _create_archive method.
-            except Exception as e:
-                logger.error(
-                    "LogArchiver: Failed to create archive for %s: %s",
-                    original_path.name,
-                    e,
-                    exc_info=True,
-                )
-                # If archival fails, rename it back so we can try again later
-                try:
-                    archiving_path = original_path.with_suffix(
-                        original_path.suffix + ".archiving"
-                    )
-                    if archiving_path.exists():
-                        archiving_path.rename(original_path)
-                        logger.warning(
-                            "LogArchiver: Rolled back failed archive for %s.",
-                            original_path.name,
-                        )
-                except Exception as rename_err:
-                    logger.error(
-                        "LogArchiver: CRITICAL - Failed to roll back renaming of %s. Manual intervention may be needed. Error: %s",
-                        archiving_path.name,
-                        rename_err,
-                    )
-
-        # --- Step 3: Clean up old archives if total size exceeds the limit ---
-        if self.max_archive_bytes > 0:
-            self._cleanup_old_archives()
-
-        logger.debug("LogArchiver: Archive and clean cycle finished.")
-
-    def _claim_files_for_archiving(self) -> List[Path]:
-        """
-        Identifies completed log files and claims them using an atomic rename.
-        This is the corrected, race-condition-free method.
-
-        Returns:
-            A list of Path objects for the original file paths that were successfully claimed.
-        """
-        claimed_files = []
-        try:
-            candidate_files = [
-                p
-                for p in self.log_dir.iterdir()
-                if p.is_file()
-                and p.name.startswith(self.log_file_basename)
-                and not p.name.endswith((".gz", ".archiving", ".lock"))
-            ]
-        except FileNotFoundError:
-            logger.warning(
-                "LogArchiver: Log directory not found: %s. Skipping scan.", self.log_dir
-            )
-            return []
-
-        for path in sorted(candidate_files):
-            # Ignore the primary, active log file
-            if path.name == self.log_file_basename:
+                item = self.archive_queue.get(timeout=1.0)
+            except (queue.Empty, EOFError):
+                continue
+            except Exception as e:  # JUSTIFIED: archiver thread must not crash from queue errors
+                logger.debug("LogArchiver queue error: %s", e)
                 continue
 
             try:
-                # Check if the file is old enough to be considered for archiving
-                mtime = path.stat().st_mtime
-                if (time.time() - mtime) < self.archive_delay_seconds:
-                    continue  # Not old enough yet
+                self._process_item(item)
+            except Exception as e:  # JUSTIFIED: archiver thread must not crash; errors are logged and skipped
+                logger.error("LogArchiver error processing item: %s", e, exc_info=True)
 
-                # **ATOMIC LOCKING STEP**
-                # Try to rename the file. If this succeeds, we have "claimed" it.
-                archiving_path = path.with_suffix(path.suffix + ".archiving")
-                path.rename(archiving_path)
+        # Drain remaining items on shutdown
+        self._drain_queue()
+        logger.info("LogArchiver thread stopped.")
 
-                logger.info("LogArchiver: Claimed %s for archival.", path.name)
-                claimed_files.append(path)  # Return the original path for reference
+    def _drain_queue(self):
+        """Process any remaining items in the queue during shutdown."""
+        drained = 0
+        while True:
+            try:
+                item = self.archive_queue.get_nowait()
+                self._process_item(item)
+                drained += 1
+            except (queue.Empty, EOFError):
+                break
+            except Exception as e:  # JUSTIFIED: draining on shutdown; best-effort
+                logger.debug("LogArchiver drain error: %s", e)
+                break
+        if drained > 0:
+            logger.info("LogArchiver drained %d items on shutdown.", drained)
 
-            except FileNotFoundError:
-                # File was removed by another process between listing and renaming, which is fine.
-                continue
-            except Exception as e:
-                logger.error(
-                    "LogArchiver: Error while trying to claim file %s: %s", path.name, e
-                )
-
-        return claimed_files
-
-    def _create_archive(self, original_path: Path):
-        """
-        Compresses a claimed log file and deletes the original.
-        The input file is expected to have been renamed to .archiving already.
-        """
-        archiving_path = original_path.with_suffix(original_path.suffix + ".archiving")
-        archive_path = original_path.with_suffix(original_path.suffix + ".tar.gz")
-
-        if not archiving_path.exists():
-            logger.warning(
-                "LogArchiver: File %s disappeared before it could be archived.",
-                archiving_path.name,
-            )
+    def _process_item(self, item):
+        """Process a single archive queue item."""
+        if not isinstance(item, tuple) or len(item) < 3:
+            logger.warning("LogArchiver: unexpected queue item: %s", item)
             return
 
-        logger.debug(
-            "LogArchiver: Compressing %s to %s", archiving_path.name, archive_path.name
-        )
+        command, log_dir, base_pattern = item[0], item[1], item[2]
+
+        if command == "BATCH_ARCHIVE":
+            self._batch_archive(log_dir, base_pattern)
+        else:
+            logger.warning("LogArchiver: unknown command '%s'", command)
+
+    def _batch_archive(self, log_dir: str, base_pattern: str):
+        """
+        Compress all completed log files matching the base pattern into a single tar.gz.
+
+        Args:
+            log_dir: Directory containing log files.
+            base_pattern: Base pattern for log files (e.g., "logs/run_dir/cambia_run_2025-main").
+        """
+        base_name = os.path.basename(base_pattern)
+        glob_pattern = os.path.join(log_dir, f"{base_name}_*.log")
+        log_files = sorted(glob.glob(glob_pattern))
+
+        if not log_files:
+            logger.debug("LogArchiver: no files to archive for pattern %s", base_pattern)
+            return
+
+        # Determine archive directory
+        if self.archive_subdir:
+            archive_dir = os.path.join(log_dir, self.archive_subdir)
+        else:
+            archive_dir = log_dir
+
+        os.makedirs(archive_dir, exist_ok=True)
+
+        # Create archive filename with timestamp
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        archive_name = f"{base_name}_archive_{timestamp}.tar.gz"
+        archive_path = os.path.join(archive_dir, archive_name)
 
         try:
-            # Create a tar.gz file
             with tarfile.open(archive_path, "w:gz") as tar:
-                tar.add(
-                    archiving_path, arcname=original_path.name
-                )  # Use original name in archive
+                for log_file in log_files:
+                    tar.add(log_file, arcname=os.path.basename(log_file))
 
-            # On success, remove the .archiving file
-            archiving_path.unlink()
-            logger.info("LogArchiver: Successfully archived %s.", original_path.name)
-        except Exception as e:
-            logger.error(
-                "LogArchiver: Failed during tarfile creation for %s: %s",
-                archiving_path.name,
-                e,
-            )
-            # Re-raise the exception to be handled by the calling loop
-            raise
-
-    def _cleanup_old_archives(self):
-        """Deletes the oldest archives if the total size exceeds the configured limit."""
-        try:
-            archives = [
-                p
-                for p in self.log_dir.glob(f"{self.log_file_basename}*.tar.gz")
-                if p.is_file()
-            ]
-
-            if not archives:
-                return
-
-            # Sort archives by modification time, oldest first
-            archives.sort(key=lambda p: p.stat().st_mtime)
-
-            total_size = sum(p.stat().st_size for p in archives)
-
-            if total_size > self.max_archive_bytes:
-                logger.info(
-                    "LogArchiver: Total archive size (%.2f GB) exceeds limit (%.2f GB). Cleaning up...",
-                    total_size / (1024**3),
-                    self.max_archive_bytes / (1024**3),
-                )
-
-            while total_size > self.max_archive_bytes and archives:
-                oldest_archive = archives.pop(0)
+            # Remove archived files
+            for log_file in log_files:
                 try:
-                    size_to_free = oldest_archive.stat().st_size
-                    logger.warning(
-                        "LogArchiver: Deleting old archive %s to free up space.",
-                        oldest_archive.name,
-                    )
-                    oldest_archive.unlink()
-                    total_size -= size_to_free
-                except FileNotFoundError:
-                    # It was already deleted, which is fine.
-                    continue
-                except Exception as e:
-                    logger.error(
-                        "LogArchiver: Could not delete old archive %s: %s",
-                        oldest_archive.name,
-                        e,
-                    )
-                    # Stop trying to clean this cycle to avoid a loop of failures
-                    break
+                    os.remove(log_file)
+                except OSError as e:
+                    logger.warning("LogArchiver: could not remove %s: %s", log_file, e)
 
-        except Exception as e:
-            logger.error("LogArchiver: Error during cleanup of old archives: %s", e)
+            logger.info(
+                "LogArchiver: archived %d files into %s", len(log_files), archive_name
+            )
 
+        except (OSError, tarfile.TarError) as e:
+            logger.error("LogArchiver: failed to create archive %s: %s", archive_path, e)
+            # Clean up partial archive
+            if os.path.exists(archive_path):
+                try:
+                    os.remove(archive_path)
+                except OSError:
+                    pass
 
-def start_log_archiver_process(
-    config: Config, shutdown_event: multiprocessing.Event
-) -> multiprocessing.Process:
-    """Creates and starts the LogArchiver process."""
-    archiver = LogArchiver(config, shutdown_event)
-    process = multiprocessing.Process(
-        target=archiver.run, name="LogArchiver", daemon=True
-    )
-    process.start()
-    return process
+        # Cleanup old archives if max_archives is set
+        if self.max_archives > 0:
+            self._cleanup_old_archives(archive_dir, base_name)
+
+    def _cleanup_old_archives(self, archive_dir: str, base_name: str):
+        """Remove oldest archives if count exceeds max_archives."""
+        pattern = os.path.join(archive_dir, f"{base_name}_archive_*.tar.gz")
+        archives = sorted(glob.glob(pattern), key=os.path.getmtime)
+
+        while len(archives) > self.max_archives:
+            oldest = archives.pop(0)
+            try:
+                os.remove(oldest)
+                logger.info("LogArchiver: removed old archive %s", os.path.basename(oldest))
+            except OSError as e:
+                logger.warning("LogArchiver: could not remove old archive %s: %s", oldest, e)
+                break
+
+    def _update_size_info(self):
+        """Scan run_log_dir for current and archived file sizes."""
+        if not self.run_log_dir or not os.path.isdir(self.run_log_dir):
+            return
+
+        current_bytes = 0
+        archived_bytes = 0
+
+        try:
+            for entry in os.scandir(self.run_log_dir):
+                if entry.is_file():
+                    size = entry.stat().st_size
+                    if entry.name.endswith(".tar.gz"):
+                        archived_bytes += size
+                    elif entry.name.endswith(".log"):
+                        current_bytes += size
+
+            # Also check archive subdirectory
+            if self.archive_subdir:
+                archive_path = os.path.join(self.run_log_dir, self.archive_subdir)
+                if os.path.isdir(archive_path):
+                    for entry in os.scandir(archive_path):
+                        if entry.is_file() and entry.name.endswith(".tar.gz"):
+                            archived_bytes += entry.stat().st_size
+
+        except OSError as e:
+            logger.debug("LogArchiver: error scanning log dir: %s", e)
+
+        with self._size_lock:
+            self._current_log_bytes = current_bytes
+            self._archived_bytes = archived_bytes

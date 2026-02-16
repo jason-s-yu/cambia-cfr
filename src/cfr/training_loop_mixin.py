@@ -97,7 +97,9 @@ class CFRTrainingLoopMixin:
                     logger.warning(
                         "Attempted to terminate/join an already closed pool state."
                     )
-                except Exception as e_pool_shutdown:
+                except (
+                    Exception
+                ) as e_pool_shutdown:  # JUSTIFIED: Pool shutdown errors during cleanup; log and continue
                     logger.error(
                         "Exception during pool shutdown: %s",
                         e_pool_shutdown,
@@ -143,7 +145,9 @@ class CFRTrainingLoopMixin:
                 logger.debug(
                     "Skipping log size update due to missing attribute: %s", e_attr
                 )
-            except Exception as e_log_size:
+            except (
+                Exception
+            ) as e_log_size:  # JUSTIFIED: Non-critical display update; must not crash training
                 logger.error(
                     "Error updating log size display periodically: %s",
                     e_log_size,
@@ -214,7 +218,9 @@ class CFRTrainingLoopMixin:
                     GracefulShutdownException
                 ):  # Catch if raised internally by calculate_exploitability
                     raise  # Re-raise to be caught by main loop handler
-                except Exception:
+                except (
+                    Exception
+                ):  # JUSTIFIED: Exploitability is diagnostic only; must not crash training
                     logger.exception(
                         "Error calculating exploitability at iter %d.", iteration
                     )
@@ -234,7 +240,9 @@ class CFRTrainingLoopMixin:
 
         except GracefulShutdownException:  # Catch if raised during avg strategy calc
             raise  # Re-raise to be caught by main loop handler
-        except Exception as e_avg_strat:
+        except (
+            Exception
+        ) as e_avg_strat:  # JUSTIFIED: Exploitability is diagnostic only; must not crash training
             logger.exception(
                 "Error computing average strategy for exploitability: %s", e_avg_strat
             )
@@ -245,7 +253,7 @@ class CFRTrainingLoopMixin:
     def train(self, num_iterations: Optional[int] = None):
         """Runs the main CFR+ training loop, potentially in parallel."""
 
-        # Robustly access config attributes
+        # Safely access config attributes
         cfr_config = getattr(self.config, "cfr_training", None)
         if not cfr_config:
             logger.critical("CFRTrainingConfig not found in main config. Cannot train.")
@@ -463,7 +471,9 @@ class CFRTrainingLoopMixin:
                             sim_failed_count += 1
                     except GracefulShutdownException:  # Catch shutdown during run
                         raise  # Re-raise
-                    except Exception as e_seq:
+                    except (
+                        Exception
+                    ) as e_seq:  # JUSTIFIED: Worker failures are tracked; training can continue with failed worker count
                         logger.exception(
                             "Sequential simulation worker failed iter %d: %s", t, e_seq
                         )
@@ -537,8 +547,10 @@ class CFRTrainingLoopMixin:
 
                                     except queue.Empty:
                                         break  # No more updates currently
-                                    except Exception as pqe:
-                                        logger.error(
+                                    except (
+                                        Exception
+                                    ) as pqe:  # JUSTIFIED: Progress queue errors are display-only; must not crash training
+                                        logger.debug(
                                             "Error processing progress queue: %s", pqe
                                         )
                         # Get final results ONLY if shutdown wasn't triggered
@@ -615,7 +627,9 @@ class CFRTrainingLoopMixin:
                         self._shutdown_pool(pool)
                         pool = None
                         raise  # Re-raise
-                    except Exception as e_pool:
+                    except (
+                        Exception
+                    ) as e_pool:  # JUSTIFIED: Pool errors are critical infrastructure failures; re-raised after cleanup
                         logger.exception(
                             "Error during worker pool execution iter %d: %s", t, e_pool
                         )
@@ -697,7 +711,9 @@ class CFRTrainingLoopMixin:
                             logger.error(
                                 "Merge required but _merge_local_updates method missing!"
                             )
-                    except Exception:
+                    except (
+                        Exception
+                    ):  # JUSTIFIED: Merge errors are critical but recoverable; skip iteration and continue
                         logger.exception("Error merging results iter %d.", t)
                         if display and hasattr(display, "update_stats"):
                             display.update_stats(
@@ -933,7 +949,9 @@ class CFRTrainingLoopMixin:
                 )
             else:
                 logger.error("Emergency save failed: save_data method not found.")
-        except Exception as e_save:
+        except (
+            Exception
+        ) as e_save:  # JUSTIFIED: Emergency save is last-ditch effort; log failure and continue cleanup
             logger.exception("Emergency save failed: %s", e_save)
         finally:
             # Restore actual current iteration number (might be inaccurate if interrupt mid-iter)
@@ -945,7 +963,7 @@ class CFRTrainingLoopMixin:
 
     def _write_run_summary(self):
         """Writes a summary log at the end of a training run."""
-        # Robust access to attributes
+        # Safe access to attributes
         run_log_dir = getattr(self, "run_log_dir", None)
         run_timestamp = getattr(self, "run_timestamp", None)
         config = getattr(self, "config", None)
@@ -1061,5 +1079,7 @@ class CFRTrainingLoopMixin:
             logger.error(
                 "Failed to write run summary file %s: %s", summary_file_path, e_io
             )
-        except Exception as e_summary:
+        except (
+            Exception
+        ) as e_summary:  # JUSTIFIED: Summary write is post-training cleanup; must not crash shutdown
             logger.exception("Unexpected error writing run summary: %s", e_summary)

@@ -5,6 +5,7 @@ Custom logging handler to integrate with Rich Live display.
 """
 
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -45,9 +46,10 @@ class LiveLogHandler(logging.Handler):
             ):
                 # If it matches, simply return and do not forward to the display manager.
                 return
-        except Exception:
+        except Exception as e:  # JUSTIFIED: logging handler resilience
             # Handle potential errors during getMessage() or filtering
-            # Log this error using the standard error handling mechanism
+            # Use stderr to avoid recursion in logging
+            print(f"LiveLogHandler filter error: {e}", file=sys.stderr)
             self.handleError(record)
             # Decide whether to proceed or return based on the error
             # For safety, let's return to avoid potentially crashing the display loop
@@ -60,5 +62,6 @@ class LiveLogHandler(logging.Handler):
                 self.display_manager.add_log_record(record)
             else:
                 pass  # Fallback or error if manager not set (shouldn't happen)
-        except Exception:
+        except Exception as e:  # JUSTIFIED: logging handler resilience
+            print(f"LiveLogHandler emit error: {e}", file=sys.stderr)
             self.handleError(record)

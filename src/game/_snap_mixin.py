@@ -19,6 +19,7 @@ from ..constants import (
     ActionSnapOpponent,
     ActionSnapOpponentMove,
 )
+from src.cfr.exceptions import ActionApplicationError
 
 # Use TYPE_CHECKING for CambiaGameState hint to avoid circular import
 if TYPE_CHECKING:
@@ -571,6 +572,9 @@ class SnapLogicMixin:
             if isinstance(action, ActionSnapOpponent) and snap_success:
                 return True  # Move action is now pending
 
+        except ActionApplicationError:
+            # Re-raise action application errors
+            raise
         except Exception as e_snap_handle:
             logger.exception(
                 "Error handling snap action %s for P%d: %s",
@@ -578,6 +582,7 @@ class SnapLogicMixin:
                 acting_player,
                 e_snap_handle,
             )
+            raise ActionApplicationError(f"Snap action handling failed for {action}") from e_snap_handle
 
         # --- Advance Snap Turn or End Phase ---
         # (Do not advance if ActionSnapOpponent succeeded and set a pending move)
@@ -610,7 +615,10 @@ class SnapLogicMixin:
                 if next_snap_idx >= len(self.snap_potential_snappers):
                     self._end_snap_phase(undo_stack, delta_list)
                 # else: Next snapper's turn
+            except ActionApplicationError:
+                raise
             except Exception as e_advance_snap:
+                # JUSTIFIED: Catch errors advancing snap turn to attempt cleanup
                 logger.exception("Error advancing snap turn index: %s", e_advance_snap)
                 self._end_snap_phase(undo_stack, delta_list)  # Attempt cleanup
 

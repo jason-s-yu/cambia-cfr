@@ -251,7 +251,8 @@ class LiveDisplayManager:
                             if isinstance(render_result, Text)
                             else str(render_result)
                         )
-                except Exception:
+                except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
+                    logger.debug("Log format error in live display: %s", e)
                     log_texts_plain.append(f"Log Format Error: {record.getMessage()}\n")
         return "".join(log_texts_plain)
 
@@ -278,8 +279,9 @@ class LiveDisplayManager:
                         ) and not render_result.plain.endswith("\n"):
                             render_result.append("\n")
                         log_texts.append(render_result)
-                except Exception as fmt_exc:
+                except Exception as fmt_exc:  # JUSTIFIED: display resilience - display errors must not crash training
                     if record.levelno >= handler.level:
+                        logger.debug("Log format error in live display panel: %s", fmt_exc)
                         log_texts.append(
                             Text(f"Log Format Error: {fmt_exc}\n", style="red")
                         )
@@ -368,7 +370,7 @@ class LiveDisplayManager:
                 logging.error(
                     "Critical: Layout region 'progress_bar' not found during update processing."
                 )
-        except Exception as e_pb_update:
+        except Exception as e_pb_update:  # JUSTIFIED: display resilience - display errors must not crash training
             logging.error(
                 "Error accessing/updating 'progress_bar' layout region: %s",
                 e_pb_update,
@@ -386,8 +388,7 @@ class LiveDisplayManager:
                 content_changed = self._update_layout_if_changed()
                 if content_changed:
                     self.live.update(self.layout, refresh=True)
-            except Exception as e:
-                # Log error but allow program to continue if possible
+            except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
                 logging.error(
                     "Error explicitly refreshing Live display: %s", e, exc_info=True
                 )
@@ -454,7 +455,7 @@ class LiveDisplayManager:
             self.progress.update(self.iteration_task_id, completed=completed)
             if needs_refresh_for_header:
                 self.refresh()
-        except Exception as e:
+        except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
             logging.error("Error updating progress bar completion: %s", e, exc_info=True)
 
     def update_stats(
@@ -490,7 +491,7 @@ class LiveDisplayManager:
             )
             if needs_refresh_for_header:
                 self.refresh()
-        except Exception as e:
+        except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
             logging.error("Error updating progress bar stats field: %s", e, exc_info=True)
 
     def update_log_summary_display(
@@ -536,7 +537,7 @@ class LiveDisplayManager:
                 )
                 self.live.start(refresh=True)
                 logging.debug("Rich Live display started.")
-            except Exception as e:
+            except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
                 logging.error("Failed to start Rich Live display: %s", e, exc_info=True)
                 self.live = None
 
@@ -546,7 +547,7 @@ class LiveDisplayManager:
             try:
                 self.live.stop()
                 logging.debug("Rich Live display stopped.")
-            except Exception as e:
+            except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
                 logging.error("Error stopping Rich Live display: %s", e, exc_info=True)
             finally:
                 self.live = None
@@ -558,7 +559,7 @@ class LiveDisplayManager:
             self.live = None
             try:
                 current_live_instance.stop()
-            except Exception as e:
+            except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
                 logging.warning("Error stopping existing live instance in run(): %s", e)
 
         try:
@@ -584,8 +585,8 @@ class LiveDisplayManager:
             if self.live:
                 try:
                     self.live.stop()
-                except Exception:
-                    pass  # Ignore errors stopping display during shutdown
+                except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
+                    logger.debug("Error stopping display during shutdown: %s", e)
                 finally:
                     self.live = None
             # Re-raise the caught shutdown exception for main_train.py to handle
@@ -595,8 +596,8 @@ class LiveDisplayManager:
             if self.live:
                 try:
                     self.live.stop()
-                except Exception:
-                    pass
+                except Exception as e:  # JUSTIFIED: display resilience - display errors must not crash training
+                    logger.debug("Error stopping display on exception: %s", e)
                 finally:
                     self.live = None
             # Log these unexpected errors

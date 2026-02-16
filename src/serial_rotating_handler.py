@@ -149,9 +149,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                     serial = int(match.group(1))
                     if serial > max_serial:
                         max_serial = serial
-                except ValueError:
+                except ValueError as e:  # JUSTIFIED: logging handler resilience
                     # Should not happen if regex is correct
-                    pass  # Ignore non-integer serials
+                    self._internal_logger.debug("Non-integer serial in log filename %s: %s", f_name, e)
         self.current_serial = max_serial + 1
         if max_serial == 0:  # If no files found, start at 1
             self.current_serial = 1
@@ -166,7 +166,7 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
         if self.stream:
             try:
                 self.stream.close()
-            except Exception as e_close:
+            except Exception as e_close:  # JUSTIFIED: logging handler resilience
                 self._internal_logger.error(
                     "Error closing stream during rollover: %s", e_close
                 )
@@ -199,12 +199,12 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                         self.archive_queue.put_nowait(
                             ("BATCH_ARCHIVE", log_dir, self.base_pattern)
                         )  # type: ignore
-                    except queue.Full:
+                    except queue.Full:  # JUSTIFIED: logging handler resilience
                         self._internal_logger.error(
                             "Archive queue full. Could not queue BATCH ARCHIVE for %s.",
                             self.base_pattern,
                         )
-                    except Exception as q_err:
+                    except Exception as q_err:  # JUSTIFIED: logging handler resilience
                         self._internal_logger.error(
                             "Failed to queue BATCH_ARCHIVE for %s: %s",
                             self.base_pattern,
@@ -240,7 +240,7 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
             try:
                 self.stream = self._open()
                 self._write_current_log_marker()  # Update marker after opening new file
-            except Exception as e_open:
+            except Exception as e_open:  # JUSTIFIED: logging handler resilience
                 self._internal_logger.error(
                     "Failed to open new stream after rollover: %s", e_open
                 )
@@ -254,7 +254,7 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
             try:
                 self.stream = self._open()
                 self._write_current_log_marker()  # Write marker if stream just opened
-            except Exception as e_open:
+            except Exception as e_open:  # JUSTIFIED: logging handler resilience
                 # Use internal logger for critical handler errors
                 self._internal_logger.error(
                     "Failed to open stream in shouldRollover: %s", e_open
@@ -281,8 +281,9 @@ class SerialRotatingFileHandler(logging.handlers.BaseRotatingHandler):
                 msg_bytes = msg.encode(
                     self.encoding if self.encoding is not None else "utf-8", "replace"
                 )
-            except Exception:
+            except Exception as e:  # JUSTIFIED: logging handler resilience
                 # If encoding fails for any reason, try a safe fallback
+                self._internal_logger.debug("Error encoding log message, using fallback: %s", e)
                 msg_bytes = msg.encode("utf-8", "replace")
 
             if current_size + len(msg_bytes) >= self.maxBytes:

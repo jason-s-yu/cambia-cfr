@@ -18,14 +18,19 @@ logger = logging.getLogger(__name__)
 ReachProbDict: TypeAlias = Dict[Any, float]  # Use Any if InfosetKey not imported
 
 
-def save_agent_data(data_to_save: Dict[str, Any], filepath: str):
-    """Saves the agent's learned data to a file."""
+def save_agent_data(data_to_save: Dict[str, Any], filepath: str) -> bool:
+    """
+    Saves the agent's learned data to a file.
+
+    Returns:
+        bool: True if save succeeded, False otherwise.
+    """
     if not filepath or not isinstance(filepath, str):
         logger.error(
             "Cannot save agent data: Invalid filepath provided (received: %s).",
             filepath,
         )
-        return
+        return False
 
     try:
         # Ensure parent directory exists
@@ -39,9 +44,11 @@ def save_agent_data(data_to_save: Dict[str, Any], filepath: str):
 
         iteration = data_to_save.get("iteration", "N/A")
         logger.info("Agent data saved to %s at iteration %s", filepath, iteration)
+        return True
 
     except (OSError, pickle.PicklingError, TypeError) as e:
         logger.error("Error saving agent data to %s: %s", filepath, e)
+        return False
 
 
 def load_agent_data(filepath: str) -> Optional[Dict[str, Any]]:

@@ -23,6 +23,11 @@ from ..constants import (
     ActionDiscard,
 )
 from ..config import CambiaRulesConfig
+from src.cfr.exceptions import (
+    InvalidGameStateError,
+    ActionApplicationError,
+    UndoFailureError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,9 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
     pending_action_player: Optional[int] = None
     pending_action_data: Dict[str, Any] = field(default_factory=dict)
 
+    # --- Game-local RNG (for reproducibility) ---
+    _rng: random.Random = field(default_factory=random.Random)
+
     # --- Snap Phase State (Managed primarily by SnapLogicMixin) ---
     snap_phase_active: bool = False
     snap_discarded_card: Optional[Card] = None
@@ -68,16 +76,21 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
             self._utilities = [0.0] * self.num_players
 
     def _setup_game(self):
-        """Initializes the deck, shuffles, and deals cards."""
+        """
+        Initializes the deck, shuffles, and deals cards.
+
+        Raises:
+            InvalidGameStateError: If deck creation, shuffle, or deal fails.
+        """
         logger.debug("Setting up new game...")
         try:
             self.stockpile = create_standard_deck(
                 include_jokers=self.house_rules.use_jokers
             )
-            random.shuffle(self.stockpile)
+            self._rng.shuffle(self.stockpile)
         except Exception as e_deck:
             logger.critical("Failed to create or shuffle deck: %s", e_deck, exc_info=True)
-            raise RuntimeError("Deck creation/shuffle failed") from e_deck
+            raise InvalidGameStateError("Deck creation/shuffle failed") from e_deck
 
         initial_peek_count = self.house_rules.initial_view_count
         cards_per_player = self.house_rules.cards_per_player
@@ -91,7 +104,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
             logger.critical(
                 "Failed to initialize PlayerState: %s", e_player_state, exc_info=True
             )
-            raise RuntimeError("PlayerState initialization failed") from e_player_state
+            raise InvalidGameStateError("PlayerState initialization failed") from e_player_state
 
         # Deal cards
         try:
@@ -103,7 +116,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                             card_num + 1,
                             i,
                         )
-                        raise RuntimeError(
+                        raise InvalidGameStateError(
                             "Stockpile ran out during initial deal"
                         )  # Fail fast if deal incomplete
                     # Basic validation during setup
@@ -115,14 +128,14 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                         logger.error(
                             "Invalid PlayerState object %d detected during deal.", i
                         )
-                        raise RuntimeError(f"Invalid PlayerState {i} during deal")
+                        raise InvalidGameStateError(f"Invalid PlayerState {i} during deal")
                     self.players[i].hand.append(self.stockpile.pop())
         except Exception as e_deal:
             logger.critical("Error during card dealing: %s", e_deal, exc_info=True)
-            raise RuntimeError("Card dealing failed") from e_deal
+            raise InvalidGameStateError("Card dealing failed") from e_deal
 
         self.discard_pile = []
-        self.current_player_index = random.randint(0, self.num_players - 1)
+        self.current_player_index = self._rng.randint(0, self.num_players - 1)
         self.cambia_caller_id = None
         self.turns_after_cambia = 0
         self._game_over = False
@@ -151,6 +164,9 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
         """
         Applies the given action, modifying 'self' and returning deltas and undo info.
         Delegates logic to mixins based on game phase.
+
+        Raises:
+            ActionApplicationError: If action application fails critically.
         """
         if self._game_over:
             logger.warning("Attempted action %s on a finished game.", action)
@@ -191,7 +207,9 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                         getattr(undo_func, "__name__", repr(undo_func)),
                         e_undo,
                     )
-                    # Stop further undos on error? For now, let it continue trying.
+                    raise UndoFailureError(
+                        f"Undo operation failed: {getattr(undo_func, '__name__', repr(undo_func))}"
+                    ) from e_undo
 
         # Action Application Logic
         try:
@@ -298,7 +316,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                             original_pending = (
                                 self.pending_action,
                                 self.pending_action_player,
-                                copy.deepcopy(self.pending_action_data),
+                                dict(self.pending_action_data),
                             )
                             drawn_card_for_change = self.stockpile[-1]
 
@@ -375,7 +393,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                             original_pending = (
                                 self.pending_action,
                                 self.pending_action_player,
-                                copy.deepcopy(self.pending_action_data),
+                                dict(self.pending_action_data),
                             )
                             drawn_card_for_change = self.discard_pile[-1]
 
@@ -514,9 +532,8 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                         ),
                     )
 
-            # Final game end check (handles cases where action resolves but turn doesn't advance, or after turn advances)
-            if not self._game_over:
-                self._check_game_end(undo_stack, delta_list)
+            # _check_game_end is called by _advance_turn when the turn advances.
+            # No separate call needed here — game-end conditions only change on turn advancement.
 
             # --- Sanity Check ---
             # If no action was processed, but game isn't over and requires action, log potential stall
@@ -561,7 +578,8 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
                     "Exception during master undo after apply_action error: %s. Game state may be inconsistent!",
                     e_undo_master,
                 )
-            return [], lambda: None
+                raise UndoFailureError("Master undo failed after action application error") from e_undo_master
+            raise ActionApplicationError(f"Action application failed for {action}") from e_apply
 
         return delta_list, undo_action
 
@@ -610,7 +628,7 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
         top_card = original_discard[-1]
         cards_to_shuffle = original_discard[:-1]
         new_stockpile = list(cards_to_shuffle)
-        random.shuffle(new_stockpile)
+        self._rng.shuffle(new_stockpile)
 
         def change_reshuffle():
             self.discard_pile = [top_card]
@@ -664,10 +682,15 @@ class CambiaGameState(QueryMixin, SnapLogicMixin, AbilityMixin):
         original_discard_state = list(self.discard_pile)
         cards_actually_drawn_this_penalty: List[Card] = []
 
+        # Use a throwaway undo stack for reshuffles within penalty.
+        # The master undo (below) restores all state atomically, making
+        # individual reshuffle undos redundant and potentially harmful.
+        _discard_undo_stack: Deque[Callable[[], None]] = deque()
+
         try:
             for i in range(num_cards):
                 if not self.stockpile:
-                    reshuffle_outcome_deltas = self._attempt_reshuffle(undo_stack_main)
+                    reshuffle_outcome_deltas = self._attempt_reshuffle(_discard_undo_stack)
                     if reshuffle_outcome_deltas:
                         penalty_deltas.extend(reshuffle_outcome_deltas)
                         logger.debug(

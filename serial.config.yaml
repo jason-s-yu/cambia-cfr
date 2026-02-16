@@ -59,3 +59,17 @@ logging:
   # Simulation Trace Logging
   log_simulation_traces: false  # Set to true to enable detailed trace logging to .jsonl file
   simulation_trace_filename_prefix: "simulation_traces" # Base filename for the simulation trace file
+
+# Deep CFR Configuration
+deep_cfr:
+  hidden_dim: 256
+  dropout: 0.1
+  learning_rate: 0.001
+  batch_size: 2048
+  train_steps_per_iteration: 4000
+  alpha: 1.5
+  traversals_per_step: 1000
+  advantage_buffer_capacity: 2000000
+  strategy_buffer_capacity: 2000000
+  save_interval: 10
+  use_gpu: false

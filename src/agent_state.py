@@ -28,6 +28,7 @@ from .constants import (
 )
 from .config import Config
 from .abstraction import get_card_bucket, decay_bucket
+from src.cfr.exceptions import ObservationUpdateError
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ class AgentObservation:
     who_called_cambia: Optional[int] = None
     is_game_over: bool = False
     current_turn: int = 0
+    king_swap_indices: Optional[Tuple[int, int]] = (
+        None  # (own_idx, opp_idx) for king swap
+    )
 
 
 @dataclass
@@ -159,7 +163,12 @@ class AgentState:
         )
 
     def update(self, observation: AgentObservation):
-        """Updates belief state based on an observation tuple."""
+        """
+        Updates belief state based on an observation tuple.
+
+        Raises:
+            ObservationUpdateError: If belief update or reconciliation fails critically.
+        """
         if observation.current_turn < self._current_game_turn:
             logger.warning(
                 "Agent %d received stale observation for T%d (current: T%d). Skipping.",
@@ -226,9 +235,10 @@ class AgentState:
         num_penalty_cards = self.config.cambia_rules.penaltyDrawCount
 
         # Store pre-snap state for potential rollback or debugging
-        original_own_hand = copy.deepcopy(self.own_hand)
-        original_opponent_belief = copy.deepcopy(self.opponent_belief)
-        original_opponent_last_seen = copy.deepcopy(self.opponent_last_seen_turn)
+        # Shallow copies are safe: KnownCardInfo/enums are not mutated between copy and use
+        original_own_hand = dict(self.own_hand)
+        original_opponent_belief = dict(self.opponent_belief)
+        original_opponent_last_seen = dict(self.opponent_last_seen_turn)
 
         for snap_info in snap_results:
             try:
@@ -292,6 +302,7 @@ class AgentState:
                                     removed_idx,
                                 )
             except Exception as e_snap_proc:
+                # JUSTIFIED: Individual snap result processing error should not crash entire update
                 logger.error(
                     "Agent %d: Error processing snap_info %s: %s",
                     self.player_id,
@@ -399,9 +410,6 @@ class AgentState:
                 e_reconcile,
                 traceback.format_exc(),  # Log stack trace
             )
-            # If reconciliation fails critically, we cannot trust the state.
-            # Options: raise error, reset state (difficult), try to patch?
-            # For now, log critical and proceed, subsequent steps might fail.
             # Attempt to force counts to match observation to prevent index errors later.
             self.own_hand = {
                 i: KnownCardInfo(
@@ -414,6 +422,7 @@ class AgentState:
             }
             self.opponent_last_seen_turn = {}
             self.opponent_card_count = observed_opp_count
+            raise ObservationUpdateError("Belief reconciliation failed") from e_reconcile
 
         except Exception as e_reconcile_other:
             logger.exception(
@@ -434,6 +443,9 @@ class AgentState:
             }
             self.opponent_last_seen_turn = {}
             self.opponent_card_count = observed_opp_count
+            raise ObservationUpdateError(
+                "Unexpected reconciliation error"
+            ) from e_reconcile_other
 
         logger.debug(
             " Reconciled State: OH(%d): %s. OB(%d): %s",
@@ -613,17 +625,31 @@ class AgentState:
                         and action.perform_swap
                     ):
                         # We initiated the swap. Our card becomes unknown. Opponent card decays.
-                        # Requires indices from the Look step. Assume they might be accessible.
-                        # For now, just log, as indices aren't directly in this action type observation.
-                        # own_involved_idx = ... # Get from somewhere?
-                        # opp_involved_idx = ... # Get from somewhere?
-                        # if own_involved_idx in self.own_hand:
-                        #     self.own_hand[own_involved_idx] = KnownCardInfo(bucket=CardBucket.UNKNOWN, ...)
-                        # self._trigger_event_decay(opp_involved_idx, "swap (king, self initiated)", ...)
-                        logger.debug(
-                            " Agent %d observed self perform King Swap. Indices not available in obs - state update omitted.",
-                            self.player_id,
-                        )
+                        if observation.king_swap_indices is not None:
+                            own_involved_idx, opp_involved_idx = (
+                                observation.king_swap_indices
+                            )
+                            if own_involved_idx in self.own_hand:
+                                self.own_hand[own_involved_idx] = KnownCardInfo(
+                                    bucket=CardBucket.UNKNOWN,
+                                    last_seen_turn=self._current_game_turn,
+                                    card=None,
+                                )
+                                logger.debug(
+                                    " Agent %d (KingSwap self) updated own idx %d to UNKNOWN.",
+                                    self.player_id,
+                                    own_involved_idx,
+                                )
+                            self._trigger_event_decay(
+                                target_index=opp_involved_idx,
+                                trigger_event="swap (king, self initiated)",
+                                current_turn=self._current_game_turn,
+                            )
+                        else:
+                            logger.warning(
+                                " Agent %d observed self perform King Swap but king_swap_indices missing from observation.",
+                                self.player_id,
+                            )
 
                     # Snap actions affecting self (SnapOwn, SnapOpponentMove) handled by reconciliation
 
@@ -668,22 +694,46 @@ class AgentState:
                         and action.perform_swap
                     ):
                         # Opponent performed swap. Decay their involved card belief.
-                        # Update our card to UNKNOWN *if* it was involved.
-                        # Again, indices aren't directly available here.
-                        # opp_involved_idx = ... # Get from somewhere?
-                        # our_involved_idx = ... # Get from somewhere?
-                        # self._trigger_event_decay(opp_involved_idx, "swap (king, opponent initiated)", ...)
-                        # if our_involved_idx in self.own_hand: self.own_hand[our_involved_idx] = KnownCardInfo(...)
-                        logger.debug(
-                            " Agent %d observed opponent King Swap. Indices not available in obs - state update omitted.",
-                            self.player_id,
-                        )
+                        # Update our card to UNKNOWN if it was involved.
+                        if observation.king_swap_indices is not None:
+                            # Indices are from the actor's perspective (opponent):
+                            # king_swap_indices = (actor's own_idx, actor's opp_idx)
+                            # actor's opp_idx is OUR index
+                            opp_involved_idx, our_involved_idx = (
+                                observation.king_swap_indices
+                            )
+                            self._trigger_event_decay(
+                                target_index=opp_involved_idx,
+                                trigger_event="swap (king, opponent initiated)",
+                                current_turn=self._current_game_turn,
+                            )
+                            if our_involved_idx in self.own_hand:
+                                if (
+                                    self.own_hand[our_involved_idx].bucket
+                                    != CardBucket.UNKNOWN
+                                ):
+                                    logger.debug(
+                                        " Agent %d updating own idx %d to UNKNOWN due to opponent KingSwap.",
+                                        self.player_id,
+                                        our_involved_idx,
+                                    )
+                                self.own_hand[our_involved_idx] = KnownCardInfo(
+                                    bucket=CardBucket.UNKNOWN,
+                                    last_seen_turn=self._current_game_turn,
+                                    card=None,
+                                )
+                        else:
+                            logger.warning(
+                                " Agent %d observed opponent King Swap but king_swap_indices missing from observation.",
+                                self.player_id,
+                            )
 
                     # Snap actions affecting opponent (SnapOwn, SnapOpponentMove) handled by reconciliation
 
                     # Opponent discard/peek doesn't reveal info unless the card was already known to us.
 
             except Exception as e_action_proc:
+                # JUSTIFIED: Action processing error should not crash entire update
                 logger.error(
                     "Agent %d: Error processing action %s in update T%d: %s",
                     self.player_id,
@@ -803,7 +853,7 @@ class AgentState:
         placeholder_value: Union[CardBucket, DecayCategory],
     ) -> Tuple[Dict[int, Union[CardBucket, DecayCategory]], Dict[int, int]]:
         """Rebuilds opponent_belief and preserves/transfers last_seen timestamps, handling count mismatches."""
-        # Leverage the generic _rebuild_hand_state_new logic by wrapping/unwrapping
+        # Use the generic _rebuild_hand_state_new logic by wrapping/unwrapping
         # We need to preserve the original indices to map timestamps correctly
 
         # Create a temporary dict mapping original index to (belief, timestamp)
@@ -1080,6 +1130,7 @@ class AgentState:
             )
             return new_state
         except Exception as e_clone:
+            # JUSTIFIED: Clone failure is critical and should propagate
             logger.exception(
                 "Agent %d: Error cloning agent state: %s", self.player_id, e_clone
             )
@@ -1106,6 +1157,7 @@ class AgentState:
                 f"Disc:{self.known_discard_top_bucket.name}, Stock:{self.stockpile_estimate.name}, Cambia:{self.cambia_caller})"
             )
         except Exception as e_str:
+            # JUSTIFIED: String representation should not crash
             logger.error(
                 "Agent %d: Error generating string representation: %s",
                 self.player_id,

@@ -1,6 +1,6 @@
 # Monte Carlo CFR Sampling Methods
 
-This document outlines the different sampling strategies considered for accelerating Counterfactual Regret Minimization (CFR) training for the 2-player variant of Cambia. We focus on improving performance with parallel execution.
+Sampling strategies considered for accelerating CFR training for the 2-player variant of Cambia, with a focus on parallel execution.
 
 ## The Need for Sampling
 
@@ -8,7 +8,7 @@ Vanilla Counterfactual Regret Minimization (CFR) is guaranteed to converge to a 
 
 Monte Carlo CFR (MCCFR) methods address this by sampling only a portion of the game tree on each iteration. The goal is to obtain unbiased estimates of the regrets while significantly reducing the computational cost per iteration. This allows for faster training in terms of wall-clock time, even if more iterations might be needed compared to vanilla CFR due to the variance introduced by sampling.
 
-Our primary goal for using MCCFR in this project is to leverage multi-core processors via parallelization. Multiple workers can independently run sampled game simulations, and their results can be aggregated to update the agent's strategy.
+The primary goal for using MCCFR here is to take advantage of multi-core processors via parallelization. Multiple workers can independently run sampled game simulations, and their results can be aggregated to update the agent's strategy.
 
 ## Sampling Methods Considered
 
@@ -41,19 +41,19 @@ Two primary MCCFR sampling methods were considered:
   * Higher computational cost per iteration compared to OS, as it explores all branches at the acting player's nodes.
   * Traversal logic is slightly more complex than OS.
 
-| Feature                 | Outcome Sampling (OS)                                  | External Sampling (ES)                                        | Vanilla CFR (Full Tree)          |
-| :---------------------- | :----------------------------------------------------- | :------------------------------------------------------------ | :------------------------------- |
-| **Player Action** | Sample 1                                               | Explore All                                                   | Explore All                      |
-| **Opponent Action** | Sample 1                                               | Sample 1                                                      | Explore All                      |
-| **Chance Action** | Sample 1                                               | Sample 1                                                      | Explore All                      |
-| **Cost / Iteration** | Low                                                    | Medium                                                        | High                             |
-| **Variance** | High                                                   | Low                                                           | Zero (Deterministic)             |
-| **Convergence (Iters)** | Potentially Slower                                     | Potentially Faster                                            | Baseline                         |
-| **Convergence (Time)** | Potentially Fast (if low cost/iter >> more iters)     | Potentially Fast (good balance of cost/iter and variance)    | Slow                             |
+| Feature                 | Outcome Sampling (OS)                             | External Sampling (ES)                                    | Vanilla CFR (Full Tree) |
+| :---------------------- | :------------------------------------------------ | :-------------------------------------------------------- | :---------------------- |
+| **Player Action**       | Sample 1                                          | Explore All                                               | Explore All             |
+| **Opponent Action**     | Sample 1                                          | Sample 1                                                  | Explore All             |
+| **Chance Action**       | Sample 1                                          | Sample 1                                                  | Explore All             |
+| **Cost / Iteration**    | Low                                               | Medium                                                    | High                    |
+| **Variance**            | High                                              | Low                                                       | Zero (Deterministic)    |
+| **Convergence (Iters)** | Potentially Slower                                | Potentially Faster                                        | Baseline                |
+| **Convergence (Time)**  | Potentially Fast (if low cost/iter >> more iters) | Potentially Fast (good balance of cost/iter and variance) | Slow                    |
 
 ## Current Implementation
 
-We utilize outcome sampling for this agent due to:
+I use outcome sampling for this agent due to:
 
 * Performance improvements: OS drastically reduces the computation per simulation compared to the previous Parallel Vanilla CFR+ implementation (which explored all actions for *both* players recursively). This directly addresses the goal of reducing wall-clock time per iteration.
 * The single-path traversal logic is somewhat simpler to implement and debug compared to the mixed exploration/sampling logic of ES.

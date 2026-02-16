@@ -1,7 +1,7 @@
 """
 src/game/_query_mixin.py
 
-This module implements query methods and legal action calculation mixins for the game engine.
+Query methods and legal action calculation mixins for the game engine.
 """
 
 import logging
@@ -97,6 +97,7 @@ class QueryMixin:
                 try:
                     self._calculate_final_scores(set_attributes=True)
                 except Exception as e_score:
+                    # JUSTIFIED: Final score calculation should not crash utility getter
                     logger.error(
                         "Error calculating final scores in get_utility: %s",
                         e_score,
@@ -239,6 +240,7 @@ class QueryMixin:
                 )
 
         except Exception as e_get_legal:
+            # JUSTIFIED: Legal action calculation should not crash, return empty set for safety
             logger.exception(
                 "QueryMixin: Error calculating legal actions for P%d: %s. State: %s",
                 acting_player,
@@ -334,6 +336,7 @@ class QueryMixin:
             )
 
         except Exception as e_str:
+            # JUSTIFIED: String representation should not crash
             logger.error("Error generating GameState string representation: %s", e_str)
             return "GameState(Error)"
 

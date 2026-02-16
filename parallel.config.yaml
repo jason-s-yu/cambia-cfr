@@ -59,6 +59,20 @@ analysis:
   # 1 = sequential BR action eval. "auto" or 0 defaults based on cfr_training.num_workers.
   exploitability_num_workers: 0
 
+# Deep CFR Configuration
+deep_cfr:
+  hidden_dim: 256
+  dropout: 0.1
+  learning_rate: 0.001
+  batch_size: 2048
+  train_steps_per_iteration: 4000
+  alpha: 1.5
+  traversals_per_step: 1000
+  advantage_buffer_capacity: 2000000
+  strategy_buffer_capacity: 2000000
+  save_interval: 10
+  use_gpu: false
+
 # Logging Configuration
 logging:
   log_level_file: "DEBUG"            # Global fallback for main process, and for workers if worker_config missing/doesn't cover.

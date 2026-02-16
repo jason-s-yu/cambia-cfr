@@ -33,6 +33,7 @@ from src.constants import (
     ActionAbilityKingSwapDecision,
     ActionSnapOpponentMove,
 )
+from src.cfr.exceptions import GameStateError, AgentStateError, ObservationUpdateError
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -94,7 +95,14 @@ class CFRAgentWrapper(BaseAgent):
             filtered_obs = self._filter_observation(observation, self.player_id)
             try:
                 self.agent_state.update(filtered_obs)
-            except Exception as e_update:
+            except (AgentStateError, ObservationUpdateError) as e_update:
+                logger.error(
+                    "CFRAgent P%d agent state error updating state: %s",
+                    self.player_id,
+                    e_update,
+                )
+                # Continue with old state
+            except Exception as e_update:  # JUSTIFIED: evaluation resilience
                 logger.error(
                     "CFRAgent P%d failed to update state: %s. Obs: %s",
                     self.player_id,
@@ -155,7 +163,14 @@ class CFRAgentWrapper(BaseAgent):
                     f"get_infoset_key returned {type(base_infoset_tuple).__name__}, expected tuple"
                 )
             infoset_key = InfosetKey(*base_infoset_tuple, current_context.value)
-        except Exception as e_key:
+        except AgentStateError as e_key:
+            logger.error(
+                "CFRAgent P%d agent state error getting infoset key: %s",
+                self.player_id,
+                e_key,
+            )
+            return random.choice(list(legal_actions))
+        except Exception as e_key:  # JUSTIFIED: evaluation resilience
             logger.error(
                 "CFRAgent P%d Error getting infoset key: %s. State: %s",
                 self.player_id,
@@ -263,7 +278,14 @@ class CFRAgentWrapper(BaseAgent):
                 current_turn=game_state.get_turn_number(),
             )
             return obs
-        except Exception as e_obs:
+        except GameStateError as e_obs:
+            logger.error(
+                "CFRAgent P%d: Game state error creating observation: %s",
+                self.player_id,
+                e_obs,
+            )
+            return None
+        except Exception as e_obs:  # JUSTIFIED: evaluation resilience
             logger.error(
                 "CFRAgent P%d: Error creating observation: %s",
                 self.player_id,
@@ -352,7 +374,7 @@ def run_evaluation(
                 logger.error("Failed to compute average strategy from loaded data.")
                 sys.exit(1)
             logger.info("Average strategy computed (%d infosets).", len(average_strategy))
-        except Exception as e_load:
+        except Exception as e_load:  # JUSTIFIED: evaluation resilience
             logger.exception("Failed to load or process CFR strategy: %s", e_load)
             sys.exit(1)
 
@@ -453,7 +475,27 @@ def run_evaluation(
                             if isinstance(agent, CFRAgentWrapper):
                                 agent.update_state(observation)  # Uses internal filtering
 
-                except Exception as e_turn:
+                except GameStateError as e_turn:
+                    logger.error(
+                        "Game state error during game %d turn %d for P%d: %s",
+                        game_num,
+                        turn,
+                        acting_player_id,
+                        e_turn,
+                    )
+                    results["Errors"] += 1
+                    break  # End game on error
+                except (AgentStateError, ObservationUpdateError) as e_turn:
+                    logger.error(
+                        "Agent state error during game %d turn %d for P%d: %s",
+                        game_num,
+                        turn,
+                        acting_player_id,
+                        e_turn,
+                    )
+                    results["Errors"] += 1
+                    break  # End game on error
+                except Exception as e_turn:  # JUSTIFIED: evaluation resilience
                     logger.exception(
                         "Error during game %d turn %d for P%d: %s. State: %s",
                         game_num,
@@ -480,7 +522,21 @@ def run_evaluation(
                 )
                 results["MaxTurnTies"] += 1
 
-        except Exception as e_game_loop:
+        except GameStateError as e_game_loop:
+            logger.error(
+                "Game state error during game simulation %d: %s",
+                game_num,
+                e_game_loop,
+            )
+            results["Errors"] += 1
+        except (AgentStateError, ObservationUpdateError) as e_game_loop:
+            logger.error(
+                "Agent state error during game simulation %d: %s",
+                game_num,
+                e_game_loop,
+            )
+            results["Errors"] += 1
+        except Exception as e_game_loop:  # JUSTIFIED: evaluation resilience
             logger.exception(
                 "Critical error during game simulation %d setup or loop: %s",
                 game_num,
