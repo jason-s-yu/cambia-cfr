@@ -7,12 +7,14 @@ Worker scaling and end-to-end training benchmarks for Deep CFR were attempted bu
 ## Attempted Benchmarks
 
 ### Worker Scaling Benchmark
+
 - **Configuration**: 1, 2, 4 workers with 5 traversals per test
 - **Runtime**: 9+ hours without completion
 - **Status**: Still running on first test phase (1 worker, 5 traversals)
 - **Resource Usage**: ~200% CPU, ~650MB memory
 
 ### End-to-End Training Benchmark
+
 - **Planned Configuration**:
   - 1 training step
   - 2 workers
@@ -54,6 +56,7 @@ Worker scaling and end-to-end training benchmarks for Deep CFR were attempted bu
 ## Available Benchmark Results
 
 The following fast benchmarks completed successfully:
+
 - Network forward pass (CPU/GPU) - see `/workspace/benchmarks/2026-02-16_104447/network/`
 - GPU quick benchmark - see `/workspace/benchmarks/gpu_quick/results.json`
 
